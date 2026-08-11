@@ -1,0 +1,26 @@
+{
+  "summary_id": "ps-dns-first-seen",
+  "title": "First-seen and estate prevalence for cdn-telemetry-sync.net",
+  "source": "dns_resolver",
+  "host": "wks-4471",
+  "time_range": "2026-07-04T00:00:00Z/2026-08-03T12:00:00Z",
+  "description": "The second-level domain has no resolution history in the preceding 30 days of resolver telemetry and is queried by exactly one host in the estate. Label prevalence is one query per label: no label is ever queried twice, which is unusual for cached CDN traffic.",
+  "stats": {
+    "domain_first_seen": "2026-08-03T11:04:12Z",
+    "lookback_days": "30",
+    "prior_resolutions_in_lookback": "0",
+    "estate_hosts_querying": "1",
+    "estate_hosts_total": "412",
+    "label_reuse_ratio": "0.00",
+    "parent_domain_registrar_age_days": "9",
+    "query_template_id": "tmpl-dns-a-nx-0031"
+  },
+  "log_pointers": [
+    {
+      "file": "dns_resolver.log",
+      "start_line": 25,
+      "end_line": 38,
+      "why": "middle of the observation window, showing label uniqueness across consecutive queries"
+    }
+  ]
+}

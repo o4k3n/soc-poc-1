@@ -1,0 +1,53 @@
+Aug  3 10:58:41 resolver01 named[1182]: client @0x7f2a10 10.14.7.18#51204 (updates.corp.example.com): query: updates.corp.example.com IN A + (10.14.2.5)
+Aug  3 10:59:02 resolver01 named[1182]: client @0x7f2a11 10.14.7.31#49155 (www.example-news.com): query: www.example-news.com IN A + (10.14.2.5)
+Aug  3 10:59:03 resolver01 named[1182]: client @0x7f2a11 10.14.7.31#49155 (www.example-news.com): query: www.example-news.com IN AAAA + (10.14.2.5)
+Aug  3 10:59:44 resolver01 named[1182]: client @0x7f2a13 10.14.7.22#38810 (mail.corp.example.com): query: mail.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:00:12 resolver01 named[1182]: client @0x7f2a14 10.14.7.31#53412 (ntp.corp.example.com): query: ntp.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:01:37 resolver01 named[1182]: client @0x7f2a15 10.14.7.19#44012 (docs.corp.example.com): query: docs.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:04:12 resolver01 named[1182]: client @0x7f2a16 10.14.7.31#50881 (k7f2p9x4qm3vhb8ndt6rwz1csa5ylge0.cdn-telemetry-sync.net): query: k7f2p9x4qm3vhb8ndt6rwz1csa5ylge0.cdn-telemetry-sync.net IN A + (10.14.2.5)
+Aug  3 11:04:12 resolver01 named[1182]: response NXDOMAIN k7f2p9x4qm3vhb8ndt6rwz1csa5ylge0.cdn-telemetry-sync.net to 10.14.7.31#50881
+Aug  3 11:05:31 resolver01 named[1182]: client @0x7f2a17 10.14.7.44#33119 (intranet.corp.example.com): query: intranet.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:07:58 resolver01 named[1182]: client @0x7f2a18 10.14.7.22#38910 (mail.corp.example.com): query: mail.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:09:14 resolver01 named[1182]: client @0x7f2a19 10.14.7.31#50882 (b3nq8wcv2ktyj7l4hsx9umr0fpad61ze.cdn-telemetry-sync.net): query: b3nq8wcv2ktyj7l4hsx9umr0fpad61ze.cdn-telemetry-sync.net IN A + (10.14.2.5)
+Aug  3 11:09:14 resolver01 named[1182]: response NXDOMAIN b3nq8wcv2ktyj7l4hsx9umr0fpad61ze.cdn-telemetry-sync.net to 10.14.7.31#50882
+Aug  3 11:10:02 resolver01 named[1182]: client @0x7f2a1a 10.14.7.18#51288 (updates.corp.example.com): query: updates.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:11:45 resolver01 named[1182]: client @0x7f2a1b 10.14.7.31#49188 (www.example-news.com): query: www.example-news.com IN A + (10.14.2.5)
+Aug  3 11:14:16 resolver01 named[1182]: client @0x7f2a1c 10.14.7.31#50883 (t1md7ka9szx3q6vryb2wple8jc0nhu4g.cdn-telemetry-sync.net): query: t1md7ka9szx3q6vryb2wple8jc0nhu4g.cdn-telemetry-sync.net IN A + (10.14.2.5)
+Aug  3 11:14:16 resolver01 named[1182]: response NXDOMAIN t1md7ka9szx3q6vryb2wple8jc0nhu4g.cdn-telemetry-sync.net to 10.14.7.31#50883
+Aug  3 11:15:23 resolver01 named[1182]: client @0x7f2a1d 10.14.7.19#44090 (docs.corp.example.com): query: docs.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:17:01 resolver01 named[1182]: client @0x7f2a1e 10.14.7.55#61002 (printsrv.corp.example.com): query: printsrv.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:19:15 resolver01 named[1182]: client @0x7f2a1f 10.14.7.31#50884 (w9ce4yr7blx2ho5v1kgtqn3dsjm6zfpa.cdn-telemetry-sync.net): query: w9ce4yr7blx2ho5v1kgtqn3dsjm6zfpa.cdn-telemetry-sync.net IN A + (10.14.2.5)
+Aug  3 11:19:15 resolver01 named[1182]: response NXDOMAIN w9ce4yr7blx2ho5v1kgtqn3dsjm6zfpa.cdn-telemetry-sync.net to 10.14.7.31#50884
+Aug  3 11:20:44 resolver01 named[1182]: client @0x7f2a20 10.14.7.22#39004 (mail.corp.example.com): query: mail.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:22:19 resolver01 named[1182]: client @0x7f2a21 10.14.7.31#49233 (cdn.example-news.com): query: cdn.example-news.com IN A + (10.14.2.5)
+Aug  3 11:24:17 resolver01 named[1182]: client @0x7f2a22 10.14.7.31#50885 (g6zp1nvx8dqk4wc7ty0rlbs2mahj9euf.cdn-telemetry-sync.net): query: g6zp1nvx8dqk4wc7ty0rlbs2mahj9euf.cdn-telemetry-sync.net IN A + (10.14.2.5)
+Aug  3 11:24:17 resolver01 named[1182]: response NXDOMAIN g6zp1nvx8dqk4wc7ty0rlbs2mahj9euf.cdn-telemetry-sync.net to 10.14.7.31#50885
+Aug  3 11:25:55 resolver01 named[1182]: client @0x7f2a23 10.14.7.44#33208 (intranet.corp.example.com): query: intranet.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:27:33 resolver01 named[1182]: client @0x7f2a24 10.14.7.18#51344 (updates.corp.example.com): query: updates.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:29:16 resolver01 named[1182]: client @0x7f2a25 10.14.7.31#50886 (r4tj0slc9wgn5xz8fyqe1vk7bpmd3hua.cdn-telemetry-sync.net): query: r4tj0slc9wgn5xz8fyqe1vk7bpmd3hua.cdn-telemetry-sync.net IN A + (10.14.2.5)
+Aug  3 11:29:16 resolver01 named[1182]: response NXDOMAIN r4tj0slc9wgn5xz8fyqe1vk7bpmd3hua.cdn-telemetry-sync.net to 10.14.7.31#50886
+Aug  3 11:31:08 resolver01 named[1182]: client @0x7f2a26 10.14.7.19#44155 (docs.corp.example.com): query: docs.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:33:40 resolver01 named[1182]: client @0x7f2a27 10.14.7.22#39102 (mail.corp.example.com): query: mail.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:34:18 resolver01 named[1182]: client @0x7f2a28 10.14.7.31#50887 (n2hx5adf7ck9ptv3juq8ryw1megz046b.cdn-telemetry-sync.net): query: n2hx5adf7ck9ptv3juq8ryw1megz046b.cdn-telemetry-sync.net IN A + (10.14.2.5)
+Aug  3 11:34:18 resolver01 named[1182]: response NXDOMAIN n2hx5adf7ck9ptv3juq8ryw1megz046b.cdn-telemetry-sync.net to 10.14.7.31#50887
+Aug  3 11:36:02 resolver01 named[1182]: client @0x7f2a29 10.14.7.55#61077 (printsrv.corp.example.com): query: printsrv.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:38:29 resolver01 named[1182]: client @0x7f2a2a 10.14.7.31#49301 (www.example-news.com): query: www.example-news.com IN A + (10.14.2.5)
+Aug  3 11:39:17 resolver01 named[1182]: client @0x7f2a2b 10.14.7.31#50888 (v8kqm3zb1yhw6ln0cfax4rtd5gsj7pe9.cdn-telemetry-sync.net): query: v8kqm3zb1yhw6ln0cfax4rtd5gsj7pe9.cdn-telemetry-sync.net IN A + (10.14.2.5)
+Aug  3 11:39:17 resolver01 named[1182]: response NXDOMAIN v8kqm3zb1yhw6ln0cfax4rtd5gsj7pe9.cdn-telemetry-sync.net to 10.14.7.31#50888
+Aug  3 11:41:11 resolver01 named[1182]: client @0x7f2a2c 10.14.7.18#51402 (updates.corp.example.com): query: updates.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:43:50 resolver01 named[1182]: client @0x7f2a2d 10.14.7.44#33290 (intranet.corp.example.com): query: intranet.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:44:16 resolver01 named[1182]: client @0x7f2a2e 10.14.7.31#50889 (j5wr9ntb2xz7qkv4hd1muy8gcpa3e60f.cdn-telemetry-sync.net): query: j5wr9ntb2xz7qkv4hd1muy8gcpa3e60f.cdn-telemetry-sync.net IN A + (10.14.2.5)
+Aug  3 11:44:16 resolver01 named[1182]: response NXDOMAIN j5wr9ntb2xz7qkv4hd1muy8gcpa3e60f.cdn-telemetry-sync.net to 10.14.7.31#50889
+Aug  3 11:46:37 resolver01 named[1182]: client @0x7f2a2f 10.14.7.22#39188 (mail.corp.example.com): query: mail.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:49:18 resolver01 named[1182]: client @0x7f2a30 10.14.7.31#50890 (a0fpc6el3ur9sx2mkz7wtn4qhjy8v1bd.cdn-telemetry-sync.net): query: a0fpc6el3ur9sx2mkz7wtn4qhjy8v1bd.cdn-telemetry-sync.net IN A + (10.14.2.5)
+Aug  3 11:49:18 resolver01 named[1182]: response NXDOMAIN a0fpc6el3ur9sx2mkz7wtn4qhjy8v1bd.cdn-telemetry-sync.net to 10.14.7.31#50890
+Aug  3 11:51:24 resolver01 named[1182]: client @0x7f2a31 10.14.7.19#44233 (docs.corp.example.com): query: docs.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:53:09 resolver01 named[1182]: client @0x7f2a32 10.14.7.31#49366 (cdn.example-news.com): query: cdn.example-news.com IN A + (10.14.2.5)
+Aug  3 11:54:17 resolver01 named[1182]: client @0x7f2a33 10.14.7.31#50891 (d7ug2myk8v0lqz5tcn1xrsf3ejwb964p.cdn-telemetry-sync.net): query: d7ug2myk8v0lqz5tcn1xrsf3ejwb964p.cdn-telemetry-sync.net IN A + (10.14.2.5)
+Aug  3 11:54:17 resolver01 named[1182]: response NXDOMAIN d7ug2myk8v0lqz5tcn1xrsf3ejwb964p.cdn-telemetry-sync.net to 10.14.7.31#50891
+Aug  3 11:56:41 resolver01 named[1182]: client @0x7f2a34 10.14.7.55#61150 (printsrv.corp.example.com): query: printsrv.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:58:02 resolver01 named[1182]: client @0x7f2a35 10.14.7.18#51470 (updates.corp.example.com): query: updates.corp.example.com IN A + (10.14.2.5)
+Aug  3 11:59:16 resolver01 named[1182]: client @0x7f2a36 10.14.7.31#50892 (h3sv7bqx1nf9wkt6yzm2djr0ape85gcl.cdn-telemetry-sync.net): query: h3sv7bqx1nf9wkt6yzm2djr0ape85gcl.cdn-telemetry-sync.net IN A + (10.14.2.5)
+Aug  3 11:59:16 resolver01 named[1182]: response NXDOMAIN h3sv7bqx1nf9wkt6yzm2djr0ape85gcl.cdn-telemetry-sync.net to 10.14.7.31#50892
+Aug  3 12:00:33 resolver01 named[1182]: client @0x7f2a37 10.14.7.22#39255 (mail.corp.example.com): query: mail.corp.example.com IN A + (10.14.2.5)
+Aug  3 12:01:47 resolver01 named[1182]: client @0x7f2a38 10.14.7.44#33361 (intranet.corp.example.com): query: intranet.corp.example.com IN A + (10.14.2.5)

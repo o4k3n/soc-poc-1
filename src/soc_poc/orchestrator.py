@@ -1,0 +1,425 @@
+"""The orchestrator: an explicit state machine over an immutable context.
+
+Shape notes, because the shape is the deliverable:
+
+  * `InvestigationContext` is frozen. Every handler returns a *new* context. There is
+    no investigation state in a local variable of an async function, which is what
+    makes the transcript a complete account of the run.
+  * `run()` is a loop: look at the state, call its handler, assert the transition is
+    legal, log it, repeat until terminal. Adding a state means adding a handler and an
+    edge in states.py, not threading another flag through a call chain.
+  * `_registry` maps task_id -> asyncio.Task for in-flight work. It is the one piece of
+    mutable machinery, it is explicitly named, and it is empty outside a
+    DISPATCHED/COLLECTING window. In the Elixir port it is a `Registry`; the handlers
+    are `gen_statem` callbacks and the tasks are supervised under a Task.Supervisor.
+  * Failures are values. A grunt task that times out, dies, or cannot cite its slice
+    becomes a `GruntFailure` in `context.outcomes` and is shown to the commander as
+    unexamined ground. Nothing is silently dropped.
+
+Importing this module imports validation.no_verdict, which asserts at import time that
+no model-facing schema has grown a decision field.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from datetime import datetime, timezone
+
+from pydantic import BaseModel, ConfigDict
+
+from soc_poc import commander as commander_agent
+from soc_poc.config import AppConfig
+from soc_poc.grunt import run_grunt_task
+from soc_poc.llm.base import LLMClient
+from soc_poc.loader import all_known_refs
+from soc_poc.messages import GruntFailure, GruntOutcome, GruntTasking
+from soc_poc.schemas.alert import Alert
+from soc_poc.schemas.brief import (
+    AlertRef,
+    BriefBody,
+    InvestigationBrief,
+    TaskLedgerEntry,
+)
+from soc_poc.schemas.pattern_summary import PatternSummary
+from soc_poc.schemas.slice import LogSlice
+from soc_poc.states import (
+    TERMINAL_STATES,
+    InvestigationState,
+    assert_legal_transition,
+)
+from soc_poc.transcript import TranscriptLogger
+from soc_poc.validation import no_verdict  # noqa: F401  (import-time schema assertion)
+from soc_poc.validation.citations import unresolved_brief_citations
+from soc_poc.validation.injection import InjectionSignal
+
+# Backstop on top of the HTTP client's own timeout. The HTTP timeout should fire first;
+# this catches a task wedged somewhere else (parsing, a retry loop, a hung socket).
+TASK_TIMEOUT_MARGIN_S = 30.0
+
+
+class InvestigationContext(BaseModel):
+    """The whole investigation, in one immutable value."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    investigation_id: str
+    state: InvestigationState
+    iteration: int = 0
+    pending_taskings: tuple[GruntTasking, ...] = ()
+    outcomes: tuple[GruntOutcome, ...] = ()
+    request_followup: bool = False
+    iteration_cap_hit: bool = False
+    failure_reason: str = ""
+    body: BriefBody | None = None
+
+
+class RunResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    terminal_state: InvestigationState
+    brief: InvestigationBrief | None
+    failure_reason: str = ""
+
+
+class Orchestrator:
+    def __init__(
+        self,
+        *,
+        config: AppConfig,
+        commander_client: LLMClient,
+        grunt_client: LLMClient,
+        transcript: TranscriptLogger,  # required: an unlogged run is not constructible
+        alert: Alert,
+        summaries: list[PatternSummary],
+        catalog: dict[str, LogSlice],
+        injection_signals: list[InjectionSignal],
+        investigation_id: str | None = None,
+    ) -> None:
+        self._config = config
+        self._run = config.run
+        self._commander = commander_client
+        self._grunt = grunt_client
+        self._transcript = transcript
+        self._alert = alert
+        self._summaries = summaries
+        self._catalog = catalog
+        self._injection_signals = injection_signals
+        self._known_refs = all_known_refs(catalog)
+        self.investigation_id = investigation_id or f"inv-{uuid.uuid4().hex[:12]}"
+        # The Registry: in-flight work, addressable by task id.
+        self._registry: dict[str, asyncio.Task[GruntOutcome]] = {}
+
+    # -- driver -----------------------------------------------------------------------
+
+    async def run(self) -> RunResult:
+        context = InvestigationContext(
+            investigation_id=self.investigation_id, state=InvestigationState.RECEIVED
+        )
+        self._transcript.log_event(
+            "investigation_started",
+            {
+                "alert_id": self._alert.alert_id,
+                "detector": self._alert.detector,
+                "alert_status": self._alert.status,
+                "slices_available": sorted(self._catalog),
+                "max_iterations": self._run.max_iterations,
+            },
+        )
+
+        while context.state not in TERMINAL_STATES:
+            previous = context.state
+            context = await self._step(context)
+            assert_legal_transition(previous, context.state)
+            self._transcript.log_state_transition(
+                from_state=previous.value,
+                to_state=context.state.value,
+                iteration=context.iteration,
+                note=context.failure_reason,
+            )
+
+        brief = self._assemble_brief(context) if context.body is not None else None
+        self._transcript.log_event(
+            "investigation_finished",
+            {
+                "terminal_state": context.state.value,
+                "iterations_used": context.iteration,
+                "outcomes": len(context.outcomes),
+                "failures": sum(1 for o in context.outcomes if isinstance(o, GruntFailure)),
+                "failure_reason": context.failure_reason,
+            },
+        )
+        return RunResult(
+            terminal_state=context.state, brief=brief, failure_reason=context.failure_reason
+        )
+
+    async def _step(self, context: InvestigationContext) -> InvestigationContext:
+        handlers = {
+            InvestigationState.RECEIVED: self._on_received,
+            InvestigationState.PLANNING: self._on_planning,
+            InvestigationState.DISPATCHED: self._on_dispatched,
+            InvestigationState.COLLECTING: self._on_collecting,
+            InvestigationState.ABORTED_ITERATION_CAP: self._on_cap_reached,
+            InvestigationState.SYNTHESIZING: self._on_synthesizing,
+        }
+        return await handlers[context.state](context)
+
+    # -- handlers ---------------------------------------------------------------------
+
+    async def _on_received(self, context: InvestigationContext) -> InvestigationContext:
+        return context.model_copy(update={"state": InvestigationState.PLANNING})
+
+    async def _on_planning(self, context: InvestigationContext) -> InvestigationContext:
+        result = await commander_agent.plan_round(
+            client=self._commander,
+            transcript=self._transcript,
+            run_config=self._run,
+            alert=self._alert,
+            summaries=self._summaries,
+            catalog=self._catalog,
+            outcomes=list(context.outcomes),
+            iteration=context.iteration,
+        )
+
+        if not result.ok or result.plan is None:
+            # Planning failed. If workers already produced something, we still owe the
+            # operator a brief over it; if this was the first round, there is no
+            # investigation to write up and we stop with the reason recorded.
+            if context.outcomes:
+                return context.model_copy(
+                    update={
+                        "state": InvestigationState.SYNTHESIZING,
+                        "failure_reason": f"planning round {context.iteration + 1} failed: {result.error}",
+                    }
+                )
+            return context.model_copy(
+                update={
+                    "state": InvestigationState.FAILED_PLANNING,
+                    "failure_reason": result.error,
+                }
+            )
+
+        plan = result.plan
+        taskings = tuple(
+            GruntTasking(
+                task_id=f"{self.investigation_id}-i{context.iteration}-t{index}",
+                investigation_id=self.investigation_id,
+                iteration=context.iteration,
+                instruction=task.instruction,
+                commander_intent=task.commander_intent,
+                data_slice=self._catalog[task.slice_id],
+            )
+            for index, task in enumerate(plan.tasks)
+        )
+        self._transcript.log_event(
+            "plan_accepted",
+            {
+                "iteration": context.iteration,
+                "rationale": plan.planning_rationale,
+                "tasks": [
+                    {
+                        "task_id": t.task_id,
+                        "slice_id": t.data_slice.slice_id,
+                        "instruction": t.instruction,
+                        "commander_intent": t.commander_intent,
+                    }
+                    for t in taskings
+                ],
+                "request_followup": plan.request_followup,
+            },
+        )
+
+        if not taskings:
+            return context.model_copy(
+                update={"state": InvestigationState.SYNTHESIZING, "request_followup": False}
+            )
+        return context.model_copy(
+            update={
+                "state": InvestigationState.DISPATCHED,
+                "pending_taskings": taskings,
+                "request_followup": plan.request_followup,
+            }
+        )
+
+    async def _on_dispatched(self, context: InvestigationContext) -> InvestigationContext:
+        """Launch each task as its own isolated unit of work and register it.
+
+        Nothing is awaited here: dispatch and collection are separate states so the
+        transcript shows work leaving the commander before results come back, which is
+        the distinction that matters when reconstructing a run.
+        """
+        for tasking in context.pending_taskings:
+            self._registry[tasking.task_id] = asyncio.create_task(
+                run_grunt_task(tasking, self._grunt, self._run, self._transcript),
+                name=tasking.task_id,
+            )
+        self._transcript.log_event(
+            "tasks_dispatched",
+            {"iteration": context.iteration, "task_ids": list(self._registry)},
+        )
+        return context.model_copy(update={"state": InvestigationState.COLLECTING})
+
+    async def _on_collecting(self, context: InvestigationContext) -> InvestigationContext:
+        timeout = self._grunt.config.request_timeout_s + TASK_TIMEOUT_MARGIN_S
+        by_id = {tasking.task_id: tasking for tasking in context.pending_taskings}
+        collected: list[GruntOutcome] = []
+
+        for task_id, task in self._registry.items():
+            tasking = by_id[task_id]
+            try:
+                collected.append(await asyncio.wait_for(task, timeout=timeout))
+            except asyncio.TimeoutError:
+                task.cancel()
+                collected.append(
+                    self._task_failure(tasking, "timeout", f"exceeded {timeout:.0f}s")
+                )
+            except Exception as exc:  # noqa: BLE001 - the boundary is the point
+                # An exception must never propagate out of a worker into the
+                # orchestrator; it becomes a record the commander is shown.
+                collected.append(
+                    self._task_failure(tasking, "internal", f"{type(exc).__name__}: {exc}")
+                )
+        self._registry.clear()
+
+        outcomes = context.outcomes + tuple(collected)
+        self._transcript.log_event(
+            "tasks_collected",
+            {
+                "iteration": context.iteration,
+                "collected": len(collected),
+                "failed": sum(1 for o in collected if isinstance(o, GruntFailure)),
+            },
+        )
+
+        next_iteration = context.iteration + 1
+        if context.request_followup and next_iteration >= self._run.max_iterations:
+            return context.model_copy(
+                update={
+                    "state": InvestigationState.ABORTED_ITERATION_CAP,
+                    "outcomes": outcomes,
+                    "pending_taskings": (),
+                    "iteration": next_iteration,
+                    "iteration_cap_hit": True,
+                }
+            )
+        if context.request_followup:
+            return context.model_copy(
+                update={
+                    "state": InvestigationState.PLANNING,
+                    "outcomes": outcomes,
+                    "pending_taskings": (),
+                    "iteration": next_iteration,
+                }
+            )
+        return context.model_copy(
+            update={
+                "state": InvestigationState.SYNTHESIZING,
+                "outcomes": outcomes,
+                "pending_taskings": (),
+                "iteration": next_iteration,
+            }
+        )
+
+    async def _on_cap_reached(self, context: InvestigationContext) -> InvestigationContext:
+        """Hitting the cap is not an error; it is a coverage gap the brief must state."""
+        self._transcript.log_event(
+            "iteration_cap_reached",
+            {"max_iterations": self._run.max_iterations, "iterations_used": context.iteration},
+        )
+        return context.model_copy(update={"state": InvestigationState.SYNTHESIZING})
+
+    async def _on_synthesizing(self, context: InvestigationContext) -> InvestigationContext:
+        note = (
+            f"You used {context.iteration} of {self._run.max_iterations} allowed "
+            "investigation rounds."
+        )
+        if context.iteration_cap_hit:
+            note += (
+                " You requested a further round and the hard cap stopped you, so lines "
+                "you wanted read were not read. Say so in coverage_gaps."
+            )
+        body, error = await commander_agent.synthesize_brief(
+            client=self._commander,
+            transcript=self._transcript,
+            run_config=self._run,
+            alert=self._alert,
+            summaries=self._summaries,
+            outcomes=list(context.outcomes),
+            iteration_note=note,
+        )
+        if body is None:
+            return context.model_copy(
+                update={
+                    "state": InvestigationState.FAILED_SYNTHESIS,
+                    "failure_reason": error,
+                }
+            )
+        return context.model_copy(update={"state": InvestigationState.DONE, "body": body})
+
+    # -- helpers ----------------------------------------------------------------------
+
+    def _task_failure(self, tasking: GruntTasking, reason: str, detail: str) -> GruntFailure:
+        return GruntFailure(
+            task_id=tasking.task_id,
+            iteration=tasking.iteration,
+            slice_id=tasking.data_slice.slice_id,
+            instruction=tasking.instruction,
+            commander_intent=tasking.commander_intent,
+            reason=reason,  # type: ignore[arg-type]
+            detail=detail,
+            attempts=0,
+        )
+
+    def _assemble_brief(self, context: InvestigationContext) -> InvestigationBrief:
+        """Code owns the parts a model must not.
+
+        AlertRef is built here by copying the inbound alert. The status the operator
+        reads is the status the detector emitted -- it did not pass through a model on
+        the way to this file.
+        """
+        assert context.body is not None
+        body = context.body
+
+        cited: list[str] = []
+        for event in body.timeline:
+            cited.extend(event.raw_line_refs)
+        for hypothesis in body.hypotheses:
+            for evidence in (*hypothesis.supporting_evidence, *hypothesis.contradicting_evidence):
+                cited.extend(evidence.raw_line_refs)
+
+        ledger = [
+            TaskLedgerEntry(
+                task_id=outcome.task_id,
+                iteration=outcome.iteration,
+                slice_id=outcome.slice_id,
+                instruction=outcome.instruction,
+                commander_intent=outcome.commander_intent,
+                outcome=outcome.outcome,
+                detail=(
+                    f"{outcome.reason}: {outcome.detail}"
+                    if isinstance(outcome, GruntFailure)
+                    else f"{len(outcome.report.observations)} observation(s), "
+                    f"{len(outcome.report.negative_findings)} negative finding(s), "
+                    f"{outcome.attempts} attempt(s)"
+                ),
+            )
+            for outcome in context.outcomes
+        ]
+
+        return InvestigationBrief(
+            investigation_id=self.investigation_id,
+            generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            alert_ref=AlertRef(
+                alert_id=self._alert.alert_id,
+                detector=self._alert.detector,
+                rule_name=self._alert.rule_name,
+                status=self._alert.status,
+                severity=self._alert.severity,
+            ),
+            body=body,
+            task_ledger=ledger,
+            injection_signals=[signal.model_dump() for signal in self._injection_signals],
+            iterations_used=context.iteration,
+            terminal_state=context.state.value,
+            unresolved_citations=unresolved_brief_citations(cited, self._known_refs),
+        )

@@ -1,0 +1,143 @@
+"""Transcript logging. Not optional, by construction.
+
+The transcript corpus is the actual deliverable of this PoC -- a future eval set and
+distillation corpus -- so "we forgot to turn logging on for that run" must be an
+unreachable state, not a discipline problem.
+
+How that is enforced: `TranscriptLogger` is a *required positional* constructor
+argument of every LLM client and of the orchestrator. There is no default, no `None`
+branch, no `if logger:` guard, and no config key that disables it. A client that could
+make an unlogged call cannot be constructed. If you are tempted to add an
+`Optional[TranscriptLogger] = None` anywhere in this package, that is the change that
+breaks the PoC's premise.
+
+Every record is one JSON object on one line, appended and flushed immediately, so a
+crashed run still leaves a readable partial transcript.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+class TranscriptLogger:
+    """Append-only JSONL sink for one investigation."""
+
+    def __init__(self, path: Path, investigation_id: str) -> None:
+        self.path = Path(path)
+        self.investigation_id = investigation_id
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._event_counter = 0
+        self._handle = self.path.open("a", encoding="utf-8")
+        self.log_event("transcript_opened", {"schema_version": SCHEMA_VERSION})
+
+    # -- core ---------------------------------------------------------------------
+
+    def _write(self, record: dict[str, Any]) -> None:
+        with self._lock:
+            self._event_counter += 1
+            record = {
+                "event_id": self._event_counter,
+                "investigation_id": self.investigation_id,
+                "ts": _utc_now(),
+                **record,
+            }
+            self._handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            self._handle.flush()
+
+    def log_event(self, kind: str, payload: dict[str, Any]) -> None:
+        self._write({"kind": kind, "payload": payload})
+
+    def log_state_transition(
+        self, *, from_state: str, to_state: str, iteration: int, note: str = ""
+    ) -> None:
+        self._write(
+            {
+                "kind": "state_transition",
+                "from_state": from_state,
+                "to_state": to_state,
+                "iteration": iteration,
+                "note": note,
+            }
+        )
+
+    def log_llm_call(
+        self,
+        *,
+        role: str,
+        model: str,
+        endpoint: str,
+        task_id: str | None,
+        parent_task_id: str | None,
+        state: str,
+        attempt: int,
+        schema_name: str | None,
+        params: dict[str, Any],
+        request_messages: list[dict[str, str]],
+        response_text: str | None,
+        raw_response: dict[str, Any] | None,
+        finish_reason: str | None,
+        usage: dict[str, Any] | None,
+        latency_ms: float,
+        error: str | None = None,
+        validation_errors: list[str] | None = None,
+    ) -> None:
+        """One LLM interaction, in full. Prompts and responses are stored verbatim --
+        truncating them here would destroy the corpus this PoC exists to produce."""
+        self._write(
+            {
+                "kind": "llm_call",
+                "role": role,
+                "model": model,
+                "endpoint": endpoint,
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+                "state": state,
+                "attempt": attempt,
+                "schema_name": schema_name,
+                "params": params,
+                "request_messages": request_messages,
+                "response_text": response_text,
+                "raw_response": raw_response,
+                "finish_reason": finish_reason,
+                "usage": usage,
+                "latency_ms": round(latency_ms, 2),
+                "error": error,
+                "validation_errors": validation_errors or [],
+            }
+        )
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._handle.closed:
+                self._handle.flush()
+                self._handle.close()
+
+    def __enter__(self) -> TranscriptLogger:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+class Stopwatch:
+    """Millisecond timer used to stamp latency on every call."""
+
+    def __init__(self) -> None:
+        self._start = time.perf_counter()
+
+    @property
+    def elapsed_ms(self) -> float:
+        return (time.perf_counter() - self._start) * 1000.0

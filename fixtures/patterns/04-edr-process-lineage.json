@@ -1,0 +1,31 @@
+{
+  "summary_id": "ps-edr-lineage",
+  "title": "Unsigned binary in user temp directory with child interpreter and persistence write",
+  "source": "edr",
+  "host": "wks-4471",
+  "time_range": "2026-08-03T11:00:00Z/2026-08-03T12:00:00Z",
+  "description": "Endpoint telemetry for the alerting host over the same window. Multiline record format: each event spans several physical lines between === EDR EVENT === and === END EVENT === markers, and long command lines are wrapped across lines.",
+  "stats": {
+    "events_in_window": "6",
+    "process_create_events": "2",
+    "unsigned_images": "1",
+    "persistence_writes": "1",
+    "network_connect_attempts": "2",
+    "distinct_pids": "2",
+    "record_format": "multiline_wrapped"
+  },
+  "log_pointers": [
+    {
+      "file": "edr_process.log",
+      "start_line": 1,
+      "end_line": 37,
+      "why": "process creation, first outbound attempt, and the child interpreter invocation"
+    },
+    {
+      "file": "edr_process.log",
+      "start_line": 38,
+      "end_line": 64,
+      "why": "file write, registry persistence, and the later outbound attempt"
+    }
+  ]
+}

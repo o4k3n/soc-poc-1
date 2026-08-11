@@ -1,0 +1,106 @@
+# Two co-located vLLM instances on one DGX Spark (GB10, unified 128 GB).
+#
+# MEMORY SPLIT -- the number that matters:
+#   commander --gpu-memory-utilization 0.55   ~70 GB
+#   grunt     --gpu-memory-utilization 0.28   ~36 GB
+#                                     ------  ------
+#                                       0.83  ~106 GB, leaving ~21 GB for the OS, page
+#                                             cache, container runtime and orchestrator.
+#
+# `--gpu-memory-utilization` is a PER-INSTANCE fraction of TOTAL device memory, not of
+# free memory, which is exactly why two static fractions can coexist. Neither instance
+# is allowed to autodetect "all available memory": on a unified-memory box that would
+# starve the OS, and the second instance to start would lose.
+#
+# Startup order is not cosmetic. vLLM has a known memory-accounting issue when a second
+# instance starts while another is still profiling (vllm-project/vllm#10643), so the
+# grunt service waits on the commander's healthcheck. Start the big model first, always.
+#
+# VERIFY EVERYTHING BELOW against the image you actually pin. Flag names in this area
+# have churned across vLLM releases (`--structured-outputs-config.backend` was
+# `--guided-decoding-backend`; MXFP4 backend selection has moved between env vars and
+# CLI flags), and GB10/SM121 support is young. `make health` is the arbiter: if the
+# guided-JSON round trip passes on both ports, this file is right for your image.
+#
+# The ${...} values come from deploy/commander.env and deploy/grunt.env, which the
+# Makefile passes as --env-file so Compose can interpolate them here. Run this file
+# through the Makefile (`make up`), not with a bare `docker compose up`, or the
+# substitutions will be empty.
+
+name: soc-poc
+
+x-vllm-common: &vllm-common
+  # PIN THIS. `cu130-nightly` is the tested compatibility track for DGX Spark as of
+  # 2026-08, but a nightly tag moves under you. Once a run works, replace it with the
+  # image digest and keep that digest in the runbook.
+  image: vllm/vllm-openai:cu130-nightly
+  runtime: nvidia
+  ipc: host
+  shm_size: "8gb"
+  restart: unless-stopped
+  volumes:
+    # Model weights are large; share one cache between both services.
+    - ${HF_CACHE_DIR}:/root/.cache/huggingface
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  commander:
+    <<: *vllm-common
+    container_name: soc-poc-commander
+    env_file: commander.env
+    ports:
+      - "8000:8000"
+    command: >
+      --model ${COMMANDER_MODEL}
+      --served-model-name ${COMMANDER_SERVED_NAME}
+      --host 0.0.0.0
+      --port 8000
+      --gpu-memory-utilization ${COMMANDER_GPU_FRACTION}
+      --max-model-len ${COMMANDER_MAX_MODEL_LEN}
+      --max-num-seqs ${COMMANDER_MAX_NUM_SEQS}
+      --structured-outputs-config.backend ${COMMANDER_STRUCTURED_OUTPUT_BACKEND}
+      ${COMMANDER_EXTRA_ARGS}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 5s
+      # gpt-oss-120b is ~60 GB of weights over ~273 GB/s: first load is slow, and a
+      # cold HF download is slower still. Be generous or you will fight your own
+      # healthcheck instead of the model.
+      retries: 60
+      start_period: 600s
+
+  grunt:
+    <<: *vllm-common
+    container_name: soc-poc-grunt
+    env_file: grunt.env
+    ports:
+      - "8001:8001"
+    depends_on:
+      commander:
+        condition: service_healthy
+    # ONE instance serves the whole grunt fleet. Concurrent tasks are handled by
+    # continuous batching inside this server; spawning an instance per agent would
+    # duplicate the weights and shred the memory budget for no throughput gain.
+    command: >
+      --model ${GRUNT_MODEL}
+      --served-model-name ${GRUNT_SERVED_NAME}
+      --host 0.0.0.0
+      --port 8001
+      --gpu-memory-utilization ${GRUNT_GPU_FRACTION}
+      --max-model-len ${GRUNT_MAX_MODEL_LEN}
+      --max-num-seqs ${GRUNT_MAX_NUM_SEQS}
+      --structured-outputs-config.backend ${GRUNT_STRUCTURED_OUTPUT_BACKEND}
+      ${GRUNT_EXTRA_ARGS}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 300s

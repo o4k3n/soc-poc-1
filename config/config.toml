@@ -1,0 +1,96 @@
+# SOC PoC configuration.
+#
+# Everything the orchestrator needs to reach a model lives here. Swapping the
+# commander or grunt model is a config edit, never a code edit.
+#
+# NOTE: the *serving-side* memory fractions are NOT here on purpose -- they live in
+# deploy/commander.env and deploy/grunt.env, which are the single source of truth for
+# how the two vLLM instances carve up the Spark's unified pool. Duplicating them here
+# would create two places to be wrong. See README "Memory split".
+
+[run]
+output_dir = "out"
+# Hard cap on PLANNING -> DISPATCHED -> COLLECTING cycles. Reaching it is not an
+# error: the orchestrator still synthesizes a brief from what it collected.
+max_iterations = 3
+# Cap on grunt tasks the commander may request in a single planning round.
+max_tasks_per_iteration = 4
+# Grunts are re-prompted exactly once with the validation error, then give up and
+# return an explicit failure record.
+max_validation_retries = 1
+
+[models.commander]
+role = "commander"
+base_url = "http://127.0.0.1:8000/v1"
+# Must match --served-model-name in deploy/commander.env. health_check.py asserts this.
+model = "gpt-oss-120b"
+api_key = "EMPTY"          # vLLM ignores the value but the OpenAI client shape wants one
+temperature = 0.2
+top_p = 0.95
+max_tokens = 6144
+request_timeout_s = 900.0  # latency is explicitly a non-goal on this box
+# Extra body merged into every request to this model (vLLM-specific knobs).
+extra_body = {}
+
+# --- Fallback commander -------------------------------------------------------------
+# gpt-oss-120b MXFP4 has an open kernel bug on GB10/SM121 (vLLM issue #37030): the
+# Marlin fallback path can emit a wrong first Harmony token and return content: null.
+# `make health` catches that on the spot. If it fires, comment out [models.commander]
+# above, uncomment this block, and start the commander container with
+# COMMANDER_MODEL/COMMANDER_SERVED_NAME overridden in deploy/commander.env.
+#
+# [models.commander]
+# role = "commander"
+# base_url = "http://127.0.0.1:8000/v1"
+# model = "qwen3-32b-fp8"
+# api_key = "EMPTY"
+# temperature = 0.2
+# top_p = 0.95
+# max_tokens = 6144
+# request_timeout_s = 900.0
+# extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+[models.grunt]
+role = "grunt"
+base_url = "http://127.0.0.1:8001/v1"
+# Must match --served-model-name in deploy/grunt.env.
+model = "qwen3-8b"
+api_key = "EMPTY"
+temperature = 0.1
+top_p = 0.9
+max_tokens = 3072
+request_timeout_s = 600.0
+# Qwen3 is a hybrid-reasoning model. Thinking blocks fight with guided decoding, so we
+# turn them off at the request level. VERIFY against your pinned vLLM/Qwen chat
+# template: if the template ignores this kwarg, serve with
+# --structured-outputs-config.enable_in_reasoning instead.
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+# Stubbed seam for a future cloud frontier judge. Nothing reads this yet beyond the
+# config loader; it exists so the eval harness has a place to plug in without a
+# refactor. Never enable it against real customer logs without a data-egress review.
+[models.evaluator]
+role = "evaluator"
+enabled = false
+base_url = "https://api.example-frontier-judge.invalid/v1"
+model = "unset"
+api_key = "env:EVALUATOR_API_KEY"
+temperature = 0.0
+top_p = 1.0
+max_tokens = 4096
+request_timeout_s = 300.0
+extra_body = {}
+
+[structured_output]
+# How the JSON schema is attached to a request.
+#   "response_format"    -> OpenAI-compatible {"type": "json_schema", ...}   (portable)
+#   "structured_outputs" -> vLLM-native extra_body.structured_outputs.json  (native)
+# The deprecated `guided_json` spelling is deliberately not offered.
+mode = "response_format"
+# Ask vLLM to reject rather than silently truncate a schema it cannot compile.
+strict = true
+
+[fixtures]
+alert = "fixtures/alert.json"
+patterns_dir = "fixtures/patterns"
+logs_dir = "fixtures/logs"

@@ -1,0 +1,23 @@
+{
+  "summary_id": "ps-dhcp-attribution",
+  "title": "DHCP lease attribution for 10.14.7.31 across the observation window",
+  "source": "dhcp",
+  "host": "wks-4471",
+  "time_range": "2026-08-03T08:00:00Z/2026-08-03T12:30:00Z",
+  "description": "Lease records covering the alert window, included so the IP-to-hostname mapping the alert relies on can be checked against a primary source rather than assumed.",
+  "stats": {
+    "leases_in_window": "9",
+    "lease_changes_for_target_ip": "0",
+    "target_ip": "10.14.7.31",
+    "target_mac": "00:1b:44:11:41:2f",
+    "lease_seconds": "28800"
+  },
+  "log_pointers": [
+    {
+      "file": "dhcp_leases.log",
+      "start_line": 1,
+      "end_line": 9,
+      "why": "whole file: confirms the IP was held by one MAC for the entire window"
+    }
+  ]
+}

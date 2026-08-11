@@ -1,0 +1,22 @@
+{
+  "alert_id": "EXT-2026-08-03-004412",
+  "detector": "corp-netflow-analytics",
+  "rule_name": "Periodic DNS resolution to low-prevalence domain (possible tunnel/beacon)",
+  "status": "open",
+  "severity": "medium",
+  "first_seen": "2026-08-03T11:04:12Z",
+  "last_seen": "2026-08-03T11:59:16Z",
+  "summary": "Host 10.14.7.31 (wks-4471) issued 11 A-record queries for unique 32-character subdomains of cdn-telemetry-sync.net at a near-constant interval over 55 minutes. All queries returned NXDOMAIN. Domain first observed in the estate on 2026-08-03.",
+  "entities": [
+    { "kind": "ip", "value": "10.14.7.31", "note": "source host" },
+    { "kind": "host", "value": "wks-4471", "note": "resolved from DHCP lease" },
+    { "kind": "user", "value": "j.lindqvist", "note": "interactive session owner at time of alert" },
+    { "kind": "domain", "value": "cdn-telemetry-sync.net", "note": "queried second-level domain" }
+  ],
+  "raw_detector_fields": {
+    "detector_version": "2.14.1",
+    "observation_window": "2026-08-03T11:00:00Z/2026-08-03T12:00:00Z",
+    "triggering_metric": "interval_regularity",
+    "estate_prevalence": "1 host of 412"
+  }
+}

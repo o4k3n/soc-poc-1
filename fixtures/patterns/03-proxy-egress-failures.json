@@ -1,0 +1,31 @@
+{
+  "summary_id": "ps-proxy-egress",
+  "title": "Repeated CONNECT failures from 10.14.7.31 to the same uncategorized host",
+  "source": "proxy",
+  "host": "wks-4471",
+  "time_range": "2026-08-03T11:00:00Z/2026-08-03T12:00:00Z",
+  "description": "The proxy logged repeated CONNECT attempts from the alerting host to cdn-telemetry-sync.net, each terminated on DNS failure with zero bytes transferred. The same host also fetched a raw paste from an uncategorized developer-tools domain with a non-browser user agent, once, mid-window.",
+  "stats": {
+    "connect_attempts": "11",
+    "successful_sessions": "0",
+    "total_bytes_out": "0",
+    "total_bytes_in": "0",
+    "distinct_uncategorized_hosts": "2",
+    "non_browser_user_agent_requests": "1",
+    "block_reason_top": "block_dns_failure"
+  },
+  "log_pointers": [
+    {
+      "file": "proxy_events.jsonl",
+      "start_line": 1,
+      "end_line": 15,
+      "why": "first half of the window, including the paste fetch with a python-requests user agent"
+    },
+    {
+      "file": "proxy_events.jsonl",
+      "start_line": 16,
+      "end_line": 28,
+      "why": "second half of the window; note the security-feed request from the SIEM collector"
+    }
+  ]
+}
