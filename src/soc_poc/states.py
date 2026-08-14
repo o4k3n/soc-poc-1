@@ -9,15 +9,23 @@ investigation is.
     RECEIVED
        |
        v
-    PLANNING <-------------------+
+    TASKING          commander reads the ALERT ONLY -> a sweep directive
+       |
+       v
+    SWEEPING         every slice -> a grunt. Coverage is total; the commander does
+       |             not choose what gets read, so "not found" means something.
+       v
+    COLLECTING <-----------------+
        |  \                      |
-       |   \ (no tasks)          | (follow-up requested, under cap)
+       |   \                     | (drill-down requested, under cap)
        |    \                    |
-       v     \                   |
-    DISPATCHED                   |
-       |                         |
-       v                         |
-    COLLECTING ------------------+
+       |     +--> PLANNING ------+     commander names slice_ids it learned about
+       |            |                  from the sweep and asks for a closer read
+       |            v
+       |        DISPATCHED
+       |            |
+       |            v
+       |        COLLECTING
        |         \
        |          \ (cap reached)
        |           v
@@ -28,6 +36,12 @@ investigation is.
        |
        v
      DONE
+
+TASKING and PLANNING are both "the commander decides something", but they are separate
+states because they decide different things from different inputs. TASKING sees the alert
+and no log data at all; PLANNING sees what the sweep brought back. Collapsing them into
+one state would mean one prompt doing two jobs, and the transcript could no longer show
+which one it was doing.
 
 Failure states are terminal and carry a reason: FAILED_PLANNING (the first planning
 round produced nothing usable, so there is no investigation to write up),
@@ -61,6 +75,8 @@ from enum import Enum
 
 class InvestigationState(str, Enum):
     RECEIVED = "RECEIVED"
+    TASKING = "TASKING"
+    SWEEPING = "SWEEPING"
     PLANNING = "PLANNING"
     DISPATCHED = "DISPATCHED"
     COLLECTING = "COLLECTING"
@@ -90,11 +106,20 @@ TERMINAL_STATES: frozenset[InvestigationState] = frozenset(
 LEGAL_TRANSITIONS: dict[InvestigationState, frozenset[InvestigationState]] = {
     InvestigationState.RECEIVED: frozenset(
         {
-            InvestigationState.PLANNING,
+            InvestigationState.TASKING,
             InvestigationState.FAILED_PREFLIGHT,
             InvestigationState.ABORTED_BY_OPERATOR,
         }
     ),
+    InvestigationState.TASKING: frozenset(
+        {
+            InvestigationState.SWEEPING,
+            InvestigationState.FAILED_PLANNING,
+            InvestigationState.ABORTING,
+            InvestigationState.ABORTED_BY_OPERATOR,
+        }
+    ),
+    InvestigationState.SWEEPING: frozenset({InvestigationState.COLLECTING}),
     InvestigationState.PLANNING: frozenset(
         {
             InvestigationState.DISPATCHED,

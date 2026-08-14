@@ -14,6 +14,7 @@ from soc_poc.grunt import run_grunt_task
 from soc_poc.messages import GruntFailure, GruntTasking
 from soc_poc.runner import run_investigation
 from soc_poc.schemas.slice import LogLine, LogSlice
+from soc_poc.schemas.sweep import SweepDirective
 from soc_poc.states import InvestigationState
 from soc_poc.transcript import TranscriptLogger
 
@@ -31,12 +32,21 @@ SLICE = LogSlice(
     lines=[LogLine(ref="dns_resolver.log:L1", text="a line")],
 )
 
+DIRECTIVE = SweepDirective(
+    alert_restatement="a detector flagged something",
+    indicators=["example.net"],
+    relevance_criteria="anything involving the indicator",
+    explicitly_irrelevant=[],
+    time_window="",
+)
+
 TASKING = GruntTasking(
     task_id="t-1",
     investigation_id="inv-test",
     iteration=0,
     instruction="read it",
     commander_intent="testing the boundary",
+    directive=DIRECTIVE,
     data_slice=SLICE,
 )
 

@@ -44,8 +44,9 @@ from soc_poc.schemas.brief import (
     InvestigationBrief,
     TaskLedgerEntry,
 )
-from soc_poc.schemas.pattern_summary import PatternSummary
+from soc_poc.chunking import FileInventory
 from soc_poc.schemas.slice import LogSlice
+from soc_poc.schemas.sweep import SweepDirective
 from soc_poc.states import (
     TERMINAL_STATES,
     InvestigationState,
@@ -71,6 +72,8 @@ class InvestigationContext(BaseModel):
     iteration: int = 0
     pending_taskings: tuple[GruntTasking, ...] = ()
     outcomes: tuple[GruntOutcome, ...] = ()
+    directive: SweepDirective | None = None
+    swept_slices: int = 0
     request_followup: bool = False
     iteration_cap_hit: bool = False
     aborted_by_operator: bool = False
@@ -95,7 +98,7 @@ class Orchestrator:
         grunt_client: LLMClient,
         transcript: TranscriptLogger,  # required: an unlogged run is not constructible
         alert: Alert,
-        summaries: list[PatternSummary],
+        inventory: list[FileInventory],
         catalog: dict[str, LogSlice],
         injection_signals: list[InjectionSignal],
         investigation_id: str | None = None,
@@ -108,7 +111,7 @@ class Orchestrator:
         self._grunt = grunt_client
         self._transcript = transcript
         self._alert = alert
-        self._summaries = summaries
+        self._inventory = inventory
         self._catalog = catalog
         self._injection_signals = injection_signals
         self._progress = progress or NullProgress()
@@ -118,6 +121,11 @@ class Orchestrator:
         self.investigation_id = investigation_id or f"inv-{uuid.uuid4().hex[:12]}"
         # The Registry: in-flight work, addressable by task id.
         self._registry: dict[str, asyncio.Task[GruntOutcome]] = {}
+        # Backpressure. A sweep dispatches every slice, which on a large case is hundreds
+        # of tasks; without this they all open HTTP connections at once against a server
+        # doing max-num-seqs 8. It also gives a graceful abort a meaningful boundary --
+        # "let the running ones finish" means something when only N are running.
+        self._slots = asyncio.Semaphore(config.run.max_concurrent_grunts)
 
     # -- driver -----------------------------------------------------------------------
 
@@ -162,6 +170,7 @@ class Orchestrator:
                 "terminal_state": context.state.value,
                 "iterations_used": context.iteration,
                 "outcomes": len(context.outcomes),
+                "swept_slices": context.swept_slices,
                 "failures": sum(1 for o in context.outcomes if isinstance(o, GruntFailure)),
                 # Countable across the corpus later: which failure modes actually bite.
                 "failure_reasons": sorted(
@@ -180,7 +189,11 @@ class Orchestrator:
     # context and nothing leaks. DISPATCHED and COLLECTING own live asyncio tasks and
     # handle abort themselves in _on_collecting; SYNTHESIZING runs to completion.
     _ABORTABLE_AT_BOUNDARY = frozenset(
-        {InvestigationState.RECEIVED, InvestigationState.PLANNING}
+        {
+            InvestigationState.RECEIVED,
+            InvestigationState.TASKING,
+            InvestigationState.PLANNING,
+        }
     )
 
     def _check_abort(self, context: InvestigationContext) -> InvestigationContext | None:
@@ -236,6 +249,8 @@ class Orchestrator:
     async def _step(self, context: InvestigationContext) -> InvestigationContext:
         handlers = {
             InvestigationState.RECEIVED: self._on_received,
+            InvestigationState.TASKING: self._on_tasking,
+            InvestigationState.SWEEPING: self._on_sweeping,
             InvestigationState.PLANNING: self._on_planning,
             InvestigationState.DISPATCHED: self._on_dispatched,
             InvestigationState.COLLECTING: self._on_collecting,
@@ -248,15 +263,102 @@ class Orchestrator:
     # -- handlers ---------------------------------------------------------------------
 
     async def _on_received(self, context: InvestigationContext) -> InvestigationContext:
-        return context.model_copy(update={"state": InvestigationState.PLANNING})
+        return context.model_copy(update={"state": InvestigationState.TASKING})
 
-    async def _on_planning(self, context: InvestigationContext) -> InvestigationContext:
-        result = await commander_agent.plan_round(
+    async def _on_tasking(self, context: InvestigationContext) -> InvestigationContext:
+        """The commander reads the alert and says what would be relevant.
+
+        No log content reaches it here -- only the alert and a bare file inventory. This
+        is the whole of its influence over what the sweep looks for; it does not get to
+        choose what is read, because a negative finding is only worth something if
+        everything was read.
+        """
+        result = await commander_agent.write_directive(
             client=self._commander,
             transcript=self._transcript,
             run_config=self._run,
             alert=self._alert,
-            summaries=self._summaries,
+            inventory=self._inventory,
+            total_slices=len(self._catalog),
+            progress=self._progress,
+        )
+        if not result.ok or result.directive is None:
+            # Terminal: without a notion of relevance the workers cannot sweep, and a
+            # sweep that reports everything is the same as one that reports nothing.
+            return context.model_copy(
+                update={
+                    "state": InvestigationState.FAILED_PLANNING,
+                    "failure_reason": f"could not write a sweep directive: {result.error}",
+                }
+            )
+
+        directive = result.directive
+        self._transcript.log_event(
+            "directive_accepted",
+            {
+                "alert_restatement": directive.alert_restatement,
+                "indicators": directive.indicators,
+                "relevance_criteria": directive.relevance_criteria,
+                "explicitly_irrelevant": directive.explicitly_irrelevant,
+                "time_window": directive.time_window,
+                "slices_to_sweep": len(self._catalog),
+            },
+        )
+        self._progress.note(
+            f"directive: {len(directive.indicators)} indicator(s); sweeping "
+            f"{len(self._catalog)} slice(s)"
+        )
+        return context.model_copy(
+            update={"state": InvestigationState.SWEEPING, "directive": directive}
+        )
+
+    async def _on_sweeping(self, context: InvestigationContext) -> InvestigationContext:
+        """Build one task per slice. Every line in the case gets read by someone.
+
+        There is no selection step and no budget: the task list is the catalog. Cost is
+        bounded by the semaphore, not by dropping data on the floor.
+        """
+        assert context.directive is not None
+        taskings = tuple(
+            GruntTasking(
+                task_id=f"{self.investigation_id}-sweep-{index:04d}",
+                investigation_id=self.investigation_id,
+                iteration=context.iteration,
+                instruction=(
+                    "Sweep this slice: read every line and report which of them, if any, "
+                    "bear on the investigation described above."
+                ),
+                commander_intent=context.directive.alert_restatement,
+                directive=context.directive,
+                data_slice=log_slice,
+            )
+            for index, log_slice in enumerate(self._catalog.values(), start=1)
+        )
+        self._transcript.log_event(
+            "sweep_dispatched",
+            {"slices": len(taskings), "concurrency": self._run.max_concurrent_grunts},
+        )
+        self._launch(taskings)
+        return context.model_copy(
+            update={
+                "state": InvestigationState.COLLECTING,
+                "pending_taskings": taskings,
+                "swept_slices": context.swept_slices + len(taskings),
+                # The sweep is one pass. Whether to look closer is decided after it, in
+                # PLANNING, from what came back.
+                "request_followup": True,
+            }
+        )
+
+    async def _on_planning(self, context: InvestigationContext) -> InvestigationContext:
+        """Drill-down: the commander asks for closer reads of slices the sweep flagged."""
+        assert context.directive is not None
+        result = await commander_agent.plan_drilldown(
+            client=self._commander,
+            transcript=self._transcript,
+            run_config=self._run,
+            alert=self._alert,
+            directive=context.directive,
             catalog=self._catalog,
             outcomes=list(context.outcomes),
             iteration=context.iteration,
@@ -264,20 +366,14 @@ class Orchestrator:
         )
 
         if not result.ok or result.plan is None:
-            # Planning failed. If workers already produced something, we still owe the
-            # operator a brief over it; if this was the first round, there is no
-            # investigation to write up and we stop with the reason recorded.
-            if context.outcomes:
-                return context.model_copy(
-                    update={
-                        "state": InvestigationState.SYNTHESIZING,
-                        "failure_reason": f"planning round {context.iteration + 1} failed: {result.error}",
-                    }
-                )
+            # The sweep already produced everything the brief strictly needs, so a failed
+            # drill-down is a degraded round, not a failed investigation.
             return context.model_copy(
                 update={
-                    "state": InvestigationState.FAILED_PLANNING,
-                    "failure_reason": result.error,
+                    "state": InvestigationState.SYNTHESIZING,
+                    "failure_reason": (
+                        f"drill-down round {context.iteration} failed: {result.error}"
+                    ),
                 }
             )
 
@@ -289,6 +385,7 @@ class Orchestrator:
                 iteration=context.iteration,
                 instruction=task.instruction,
                 commander_intent=task.commander_intent,
+                directive=context.directive,
                 data_slice=self._catalog[task.slice_id],
             )
             for index, task in enumerate(plan.tasks)
@@ -323,20 +420,34 @@ class Orchestrator:
             }
         )
 
-    async def _on_dispatched(self, context: InvestigationContext) -> InvestigationContext:
-        """Launch each task as its own isolated unit of work and register it.
+    def _launch(self, taskings: tuple[GruntTasking, ...]) -> None:
+        """Register one asyncio task per tasking, each gated by the concurrency semaphore.
 
-        Nothing is awaited here: dispatch and collection are separate states so the
-        transcript shows work leaving the commander before results come back, which is
-        the distinction that matters when reconstructing a run.
+        Every task is created immediately -- the registry is the complete record of work
+        in flight for this round -- but only max_concurrent_grunts of them hold a slot and
+        talk to the server at a time. On a 500-slice sweep that is the difference between
+        backpressure and 500 open sockets.
         """
-        for tasking in context.pending_taskings:
-            self._registry[tasking.task_id] = asyncio.create_task(
-                run_grunt_task(
+
+        async def _bounded(tasking: GruntTasking) -> GruntOutcome:
+            async with self._slots:
+                return await run_grunt_task(
                     tasking, self._grunt, self._run, self._transcript, self._progress
-                ),
-                name=tasking.task_id,
+                )
+
+        for tasking in taskings:
+            self._registry[tasking.task_id] = asyncio.create_task(
+                _bounded(tasking), name=tasking.task_id
             )
+
+    async def _on_dispatched(self, context: InvestigationContext) -> InvestigationContext:
+        """Launch a drill-down round. The sweep launches from _on_sweeping instead.
+
+        Dispatch and collection are separate states so the transcript shows work leaving
+        the commander before results come back, which is the distinction that matters when
+        reconstructing a run.
+        """
+        self._launch(context.pending_taskings)
         self._transcript.log_event(
             "tasks_dispatched",
             {"iteration": context.iteration, "task_ids": list(self._registry)},
@@ -456,9 +567,13 @@ class Orchestrator:
         return context.model_copy(update={"state": InvestigationState.SYNTHESIZING})
 
     async def _on_synthesizing(self, context: InvestigationContext) -> InvestigationContext:
+        swept = context.swept_slices
         note = (
-            f"You used {context.iteration} of {self._run.max_iterations} allowed "
-            "investigation rounds."
+            f"COVERAGE: the sweep read all {swept} slice(s) of this case -- every line of "
+            f"every log file was examined by a worker. You then used {context.iteration} "
+            f"of {self._run.max_iterations} allowed drill-down round(s). Slices reported "
+            f"as finding nothing were genuinely read and genuinely empty; that is "
+            f"evidence, not a gap."
         )
         if context.iteration_cap_hit:
             note += (
@@ -476,9 +591,9 @@ class Orchestrator:
             transcript=self._transcript,
             run_config=self._run,
             alert=self._alert,
-            summaries=self._summaries,
+            directive=context.directive,
             outcomes=list(context.outcomes),
-            iteration_note=note,
+            coverage_note=note,
             progress=self._progress,
         )
         if body is None:
@@ -532,9 +647,13 @@ class Orchestrator:
                 detail=(
                     f"{outcome.reason}: {outcome.detail}"
                     if isinstance(outcome, GruntFailure)
-                    else f"{len(outcome.report.observations)} observation(s), "
-                    f"{len(outcome.report.negative_findings)} negative finding(s), "
-                    f"{outcome.attempts} attempt(s)"
+                    else (
+                        f"{sum(f.match_count for f in outcome.report.findings)} matching "
+                        f"line(s) in {len(outcome.report.findings)} finding(s)"
+                        if outcome.report.relevant
+                        else "swept, nothing relevant"
+                    )
+                    + f", {outcome.attempts} attempt(s)"
                 ),
             )
             for outcome in context.outcomes
@@ -554,6 +673,7 @@ class Orchestrator:
             task_ledger=ledger,
             injection_signals=[signal.model_dump() for signal in self._injection_signals],
             iterations_used=context.iteration,
+            slices_swept=context.swept_slices,
             terminal_state=context.state.value,
             aborted_by_operator=context.aborted_by_operator,
             unresolved_citations=unresolved_brief_citations(cited, self._known_refs),

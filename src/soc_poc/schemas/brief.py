@@ -151,6 +151,9 @@ class InvestigationBrief(BaseModel):
     # than quietly filtered.
     injection_signals: list[dict[str, str]] = Field(default_factory=list)
     iterations_used: int = 0
+    # How many slices the sweep read. With total coverage this is the number that makes
+    # "we found nothing else" a claim rather than a hope.
+    slices_swept: int = 0
     terminal_state: str = ""
     # Stamped by code, not written by the commander. A graceful abort ends in DONE --
     # synthesis really did complete -- so without this field the artifact looks like a

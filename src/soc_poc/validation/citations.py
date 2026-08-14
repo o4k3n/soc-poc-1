@@ -1,25 +1,28 @@
 """Citation enforcement: every claim must point at a line that actually exists.
 
 This is the check the grammar cannot make. Guided decoding guarantees that
-`raw_line_refs` is a list of strings; only Python can know whether
-`dns_resolver.log:L142` was in the slice this particular grunt was handed.
+`representative_refs` is a list of strings; only Python can know whether
+`dns.log:L142` was in the slice this particular grunt was handed.
 
-Two failure modes are caught here:
-  * an observation with no citation at all -- an assertion, not an observation;
-  * a citation that does not resolve inside the slice -- a fabricated reference, which
-    is the more interesting one, because it is exactly what a model does when it is
-    pattern-matching rather than reading.
+Three failure modes are caught here:
 
-Both are validation failures. The caller re-prompts once with the message below (the
-model is told precisely which reference did not resolve) and, failing that, records an
-explicit failure instead of accepting an uncheckable report.
+  * a finding with no citation at all -- an assertion, not an observation;
+  * a citation that does not resolve inside the slice -- a fabricated reference, the more
+    interesting one, because it is exactly what a model does when it is pattern-matching
+    rather than reading;
+  * more references than the contract allows -- the schema declares a cap, but a grammar
+    constrains shape and cannot count, so the cap is re-checked here.
+
+All are validation failures. The caller re-prompts once with the message below (the model
+is told precisely which reference did not resolve) and, failing that, records an explicit
+failure instead of accepting an uncheckable report.
 """
 
 from __future__ import annotations
 
 import re
 
-from soc_poc.schemas.grunt import GruntReport
+from soc_poc.schemas.grunt import MAX_REPRESENTATIVE_REFS, GruntReport
 from soc_poc.schemas.slice import LogSlice
 
 # "<file>:L<n>" -- the only citation form this system accepts.
@@ -30,48 +33,59 @@ class CitationError(ValueError):
     """Report references lines it was not shown, or claims things it did not cite."""
 
 
-def _malformed(refs: list[str]) -> list[str]:
-    return [ref for ref in refs if not LINE_REF_PATTERN.match(ref)]
+def _check_refs(
+    refs: list[str], label: str, log_slice: LogSlice, problems: list[str]
+) -> None:
+    for ref in refs:
+        if not LINE_REF_PATTERN.match(ref):
+            problems.append(
+                f"{label} citation {ref!r} is malformed; the required form is "
+                f"'{log_slice.file}:L<line-number>'."
+            )
+        elif ref not in log_slice.refs():
+            problems.append(
+                f"{label} cites {ref!r}, which is not in slice {log_slice.slice_id} "
+                f"(lines {log_slice.start_line}-{log_slice.end_line} of {log_slice.file}). "
+                f"Cite only lines you were shown."
+            )
 
 
 def validate_report_citations(report: GruntReport, log_slice: LogSlice) -> list[str]:
     """Return a list of human-readable problems; empty means the report is citable."""
-    available = log_slice.refs()
     problems: list[str] = []
 
-    for index, observation in enumerate(report.observations):
-        label = f"observations[{index}]"
-        if not observation.raw_line_refs:
+    if not report.relevant and report.findings:
+        problems.append(
+            "relevant is false but findings were returned. Set relevant to true if this "
+            "slice contains anything bearing on the alert, or remove the findings."
+        )
+
+    for index, finding in enumerate(report.findings):
+        label = f"findings[{index}]"
+        if not finding.representative_refs:
             problems.append(
-                f"{label} has no raw_line_refs. Every observation must cite at least "
+                f"{label} has no representative_refs. Every finding must cite at least "
                 f"one line from slice {log_slice.slice_id}."
             )
-            continue
-        for bad in _malformed(observation.raw_line_refs):
+        if len(finding.representative_refs) > MAX_REPRESENTATIVE_REFS:
             problems.append(
-                f"{label} citation {bad!r} is malformed; the required form is "
-                f"'{log_slice.file}:L<line-number>'."
+                f"{label} returned {len(finding.representative_refs)} representative_refs; "
+                f"the limit is {MAX_REPRESENTATIVE_REFS}. Report the count in match_count "
+                f"and cite only the most illustrative lines."
             )
-        for ref in observation.raw_line_refs:
-            if LINE_REF_PATTERN.match(ref) and ref not in available:
-                problems.append(
-                    f"{label} cites {ref!r}, which is not in slice "
-                    f"{log_slice.slice_id} (lines {log_slice.start_line}-"
-                    f"{log_slice.end_line} of {log_slice.file}). Cite only lines you "
-                    f"were shown."
-                )
-
-    # Anomalies are held to the same standard: flagging something unusual without
-    # showing the operator where it is wastes their time.
-    for index, anomaly in enumerate(report.anomalies_flagged):
-        label = f"anomalies_flagged[{index}]"
-        if not anomaly.raw_line_refs:
-            problems.append(f"{label} has no raw_line_refs; every flag must cite a line.")
-        for ref in anomaly.raw_line_refs:
-            if LINE_REF_PATTERN.match(ref) and ref not in available:
-                problems.append(
-                    f"{label} cites {ref!r}, which is not in slice {log_slice.slice_id}."
-                )
+        if finding.match_count < len(finding.representative_refs):
+            problems.append(
+                f"{label} has match_count {finding.match_count} but cites "
+                f"{len(finding.representative_refs)} lines; match_count must be the total "
+                f"number of matching lines in this slice."
+            )
+        _check_refs(finding.representative_refs, label, log_slice, problems)
+        _check_refs(
+            [r for r in (finding.first_ref, finding.last_ref) if r],
+            f"{label} endpoints",
+            log_slice,
+            problems,
+        )
 
     if report.slice_metadata.slice_id != log_slice.slice_id:
         problems.append(

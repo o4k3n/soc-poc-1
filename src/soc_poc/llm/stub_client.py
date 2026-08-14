@@ -34,7 +34,12 @@ from soc_poc.transcript import Stopwatch, TranscriptLogger
 _SLICE_REF_RE = re.compile(r"^([\w.\-]+:L\d+)\t", re.MULTILINE)
 # In a synthesis prompt there is no raw data, only the refs grunts cited.
 _CITED_REF_RE = re.compile(r"^\s*refs: (.+)$", re.MULTILINE)
-_SLICE_ID_RE = re.compile(r"slice_id:\s*(\S+)")
+# In a grunt prompt the slice is named in the header line; in a drill-down prompt the
+# only slice ids are the ones that reported findings.
+_SLICE_ID_RE = re.compile(r"^SLICE (\S+)", re.MULTILINE)
+_FINDING_SLICE_RE = re.compile(r"^- (\S+) \(", re.MULTILINE)
+_DOMAIN_RE = re.compile(r"\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|local)\b")
+_IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
 
 def _slice_refs(prompt: str) -> list[str]:
@@ -120,9 +125,10 @@ class StubClient:
                 "in the slice. Re-reading the fenced lines and citing only those."
             )
         return {
-            "commander_plan": "Looking at the summaries, the periodic resolver traffic is "
-            "the thread worth pulling. Dispatching against the slices that contain it, "
-            "and one that could disconfirm it.",
+            "sweep_directive": "Reading the alert. The detector names a domain and a "
+            "host, so those are the indicators; but I should tell the workers to flag "
+            "periodicity and encoding too, or they will just grep.",
+            "commander_plan": "The sweep came back. One slice looks worth a closer read.",
             "grunt_report": "Reading the slice line by line. Recording what is literally "
             "present, and noting what I checked for and did not find.",
             "investigation_brief": "Assembling the timeline from cited lines, then stating "
@@ -133,6 +139,8 @@ class StubClient:
     # -- canned bodies ---------------------------------------------------------------
 
     def _respond(self, schema_name: str, prompt: str, attempt: int) -> dict[str, Any]:
+        if schema_name == "sweep_directive":
+            return self._directive(prompt)
         if schema_name == "commander_plan":
             return self._plan(prompt)
         if schema_name == "grunt_report":
@@ -141,32 +149,40 @@ class StubClient:
             return self._brief(prompt)
         raise ValueError(f"stub client has no canned response for schema {schema_name!r}")
 
-    def _plan(self, prompt: str) -> dict[str, Any]:
-        slice_ids = list(dict.fromkeys(_SLICE_ID_RE.findall(prompt)))
-        # Follow-up rounds are recognisable by the presence of collected reports; the
-        # stub asks for one drill-down round and then stops, so the offline demo walks
-        # PLANNING -> DISPATCHED -> COLLECTING twice.
-        is_followup = "COLLECTED GRUNT REPORTS" in prompt
-        chosen = slice_ids[2:4] if is_followup else slice_ids[:2]
+    def _directive(self, prompt: str) -> dict[str, Any]:
+        """Pull indicators straight out of the fenced alert, as a real commander would."""
+        domains = list(dict.fromkeys(_DOMAIN_RE.findall(prompt)))[:4]
+        ips = list(dict.fromkeys(_IP_RE.findall(prompt)))[:4]
         return {
-            "planning_rationale": (
-                "Follow up on the periodic resolver traffic by checking egress and host "
-                "process context."
-                if is_followup
-                else "Establish whether the periodic DNS pattern is machine-generated and "
-                "whether the same host shows matching egress."
-            ),
+            "alert_restatement": "An external detector flagged suspicious traffic; find "
+            "lines that bear on it.",
+            "indicators": domains + ips,
+            "relevance_criteria": "Any line involving the named hosts or domains, plus "
+            "anything showing unusual periodicity, volume, encoding or record types even "
+            "if it matches none of the indicators.",
+            "explicitly_irrelevant": ["routine internal name resolution"],
+            "time_window": "",
+        }
+
+    def _plan(self, prompt: str) -> dict[str, Any]:
+        """After a sweep the stub asks for one drill-down, then stops."""
+        slice_ids = list(dict.fromkeys(_FINDING_SLICE_RE.findall(prompt)))
+        is_followup = "DRILL-DOWN ROUND 2" in prompt
+        chosen = [] if is_followup else slice_ids[:1]
+        return {
+            "planning_rationale": "Re-reading the slice with the densest findings."
+            if chosen
+            else "The sweep is sufficient; going to synthesis.",
             "tasks": [
                 {
-                    "instruction": f"Examine the lines in {slice_id} and report what is "
-                    "there, including anything you checked for and did not find.",
-                    "commander_intent": "Testing whether the query timing is consistent "
-                    "with automated beaconing rather than user-driven browsing.",
+                    "instruction": f"Re-read {slice_id} closely and report the detail "
+                    "behind the aggregate.",
+                    "commander_intent": "Confirming the pattern the sweep flagged.",
                     "slice_id": slice_id,
                 }
                 for slice_id in chosen
             ],
-            "request_followup": not is_followup,
+            "request_followup": False,
         }
 
     def _report(self, prompt: str, attempt: int) -> dict[str, Any]:
@@ -176,46 +192,55 @@ class StubClient:
         file_name = refs[0].split(":L")[0] if refs else "unknown.log"
 
         self._grunt_calls += 1
-        # First grunt call of the run, first attempt: cite a line that was never shown.
-        # This exercises validation/citations.py and the retry-with-feedback path on
-        # every single offline run, which is the only way that code stays honest.
-        fabricate = self._grunt_calls == 1 and attempt == 1
-        cited = [f"{file_name}:L999999"] if fabricate else refs[:2] or []
+        # Every third slice is "relevant", so an offline run exercises both the finding
+        # path and the negative-collapse path the way a real sweep would.
+        relevant = self._grunt_calls % 3 == 1 and bool(refs)
+        if not relevant:
+            return {
+                "slice_metadata": {
+                    "slice_id": slice_id,
+                    "file": file_name,
+                    "lines_examined": len(refs),
+                },
+                "relevant": False,
+                "findings": [],
+                "checked_for": [
+                    {
+                        "checked_for": "lines matching the directive's indicators",
+                        "result": "none present in this slice",
+                    }
+                ],
+            }
 
+        # First relevant slice, first attempt: cite a line that was never shown. This
+        # exercises the citation validator and the retry-with-feedback path on every
+        # offline run, which is the only way that code stays honest.
+        fabricate = self._grunt_calls == 1 and attempt == 1
+        cited = [f"{file_name}:L999999"] if fabricate else refs[:2]
         return {
             "slice_metadata": {
                 "slice_id": slice_id,
                 "file": file_name,
                 "lines_examined": len(refs),
             },
-            "observations": [
+            "relevant": True,
+            "findings": [
                 {
                     "description": "Repeated outbound resolution attempts for the same "
                     "second-level domain at a near-constant interval.",
-                    "raw_line_refs": cited,
+                    "match_count": max(len(cited), 3),
+                    "representative_refs": cited,
+                    "first_ref": cited[0] if cited else "",
+                    "last_ref": cited[-1] if cited else "",
                     "confidence": "medium",
                 }
             ],
-            "negative_findings": [
+            "checked_for": [
                 {
                     "checked_for": "successful A-record responses with routable answers",
-                    "scope": f"all lines of {slice_id}",
                     "result": "none present in this slice",
                 }
             ],
-            "anomalies_flagged": (
-                [
-                    {
-                        "description": "Label length and character mix are consistent "
-                        "with encoded data rather than a hostname.",
-                        "raw_line_refs": refs[:1],
-                        "why_unusual": "Human-facing domains rarely use 30+ character "
-                        "high-entropy labels.",
-                    }
-                ]
-                if refs
-                else []
-            ),
         }
 
     def _brief(self, prompt: str) -> dict[str, Any]:

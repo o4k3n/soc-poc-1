@@ -129,7 +129,7 @@ class _StaggeredStub(StubClient):
     """
 
     async def complete_json(self, **kwargs):  # type: ignore[override]
-        if str(kwargs.get("task_id", "")).endswith("t1"):
+        if str(kwargs.get("task_id", "")).endswith(("t1", "sweep-0002")):
             await asyncio.sleep(30)  # cancelled long before this elapses
         return await super().complete_json(**kwargs)
 
@@ -141,10 +141,11 @@ async def test_hard_abort_records_cancelled_work_as_aborted(tmp_path: Path) -> N
     paths.run_dir.mkdir(parents=True, exist_ok=True)
 
     transcript = TranscriptLogger(paths.transcript, "inv-abort-records")
-    alert, summaries, catalog = load_run_inputs(
+    alert, inventory, catalog = load_run_inputs(
         config.path(config.fixtures.alert),
-        config.path(config.fixtures.patterns_dir),
         config.path(config.fixtures.logs_dir),
+        slice_token_budget=config.run.slice_token_budget,
+        chars_per_token=config.run.chars_per_token,
     )
     orchestrator = Orchestrator(
         config=config,
@@ -152,7 +153,7 @@ async def test_hard_abort_records_cancelled_work_as_aborted(tmp_path: Path) -> N
         grunt_client=_StaggeredStub(config.grunt, transcript),
         transcript=transcript,
         alert=alert,
-        summaries=summaries,
+        inventory=inventory,
         catalog=catalog,
         injection_signals=scan_catalog_for_injection(catalog),
         investigation_id="inv-abort-records",
@@ -196,7 +197,9 @@ async def test_work_that_already_finished_is_not_relabelled_as_aborted(tmp_path:
     ][0]
     assert result.terminal_state is InvestigationState.ABORTED_BY_OPERATOR
     assert "aborted" not in finished["payload"]["failure_reasons"]
-    assert finished["payload"]["outcomes"] == 2
+    # The whole sweep completed before the abort was noticed, so every slice has a real
+    # report rather than a cancellation record.
+    assert finished["payload"]["outcomes"] == finished["payload"]["swept_slices"]
 
 
 # -- control files ---------------------------------------------------------------------

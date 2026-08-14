@@ -1,8 +1,8 @@
 """Data fencing: untrusted content never appears bare in a prompt.
 
-Every log line and every pattern summary is wrapped in a delimited envelope carrying
-its provenance -- source, host, time range, the reference prefix to cite with, and why
-this slice is being shown at all. The metadata is inside the fence with the data, not
+Every log line handed to a grunt is wrapped in a delimited envelope carrying its
+provenance -- source, file, time range, the reference prefix to cite with, and why this
+slice is being shown at all. The metadata is inside the fence with the data, not
 in the prose around it, so the model cannot confuse "what I was told about this data"
 with "what the data says".
 
@@ -16,7 +16,6 @@ can open, and that the alert's status never passes through a model.
 from __future__ import annotations
 
 from soc_poc.schemas.alert import Alert
-from soc_poc.schemas.pattern_summary import PatternSummary
 from soc_poc.schemas.slice import LogSlice
 
 FENCE_OPEN = "<<<UNTRUSTED_DATA"
@@ -51,36 +50,6 @@ def fence_log_slice(log_slice: LogSlice) -> str:
         }
     )
     body = "\n".join(f"{line.ref}\t{line.text}" for line in log_slice.lines)
-    return f"{FENCE_OPEN} {header}\n{body}\n{FENCE_CLOSE}"
-
-
-def fence_pattern_summary(summary: PatternSummary) -> str:
-    """Pattern summaries are untrusted too: their text is derived from log content."""
-    header = _attrs(
-        {
-            "kind": "pattern_summary",
-            "summary_id": summary.summary_id,
-            "source": summary.source,
-            "host": summary.host,
-            "time_range": summary.time_range,
-            "shown_because": "precomputed by the telemetry pipeline for this alert",
-        }
-    )
-    stats = "\n".join(f"  {key} = {value}" for key, value in sorted(summary.stats.items()))
-    pointers = "\n".join(
-        f"  {p.file} lines {p.start_line}-{p.end_line}" + (f" ({p.why})" if p.why else "")
-        for p in summary.log_pointers
-    )
-    body = "\n".join(
-        [
-            f"title: {summary.title}",
-            f"description: {summary.description}",
-            "precomputed_statistics (do not recompute, do not doubt the arithmetic):",
-            stats or "  (none)",
-            "linked_raw_log_windows:",
-            pointers or "  (none)",
-        ]
-    )
     return f"{FENCE_OPEN} {header}\n{body}\n{FENCE_CLOSE}"
 
 

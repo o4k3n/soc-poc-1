@@ -26,7 +26,10 @@ looks over-formal for Python.
 | `progress.ProgressSink` | a pid the machine `send`s events to, or `:telemetry` events | Already a protocol with two implementations and no I/O inside the state machine. |
 | `control.py` sentinel polling | `gen_statem.call/2` — a real message, checked between states | The file sentinel exists because a Python asyncio process has no mailbox. OTP does: abort becomes `{:abort, mode}` handled in whichever state is current, and the polling disappears. Keep the two-mode distinction and the "no outcomes means no brief" rule. |
 | `ABORTING` / `ABORTED_BY_OPERATOR` | two `gen_statem` states, same as here | Split for the same reason: one state that means both "stop and write up" and "stop dead" is a state that means nothing. |
-| `summarize.py` | a `GenServer` or plain module the pipeline later replaces | It is a stand-in either way; the contract (`PatternSummary` with `log_pointers`) is what ports. |
+| `chunking.py` | a plain module — pure functions over a file | No state, no processes. The one thing that must port intact is the packing rule: windows sized against the worker's context, not a fixed count. |
+| `SWEEPING` fan-out | `Task.async_stream/3` with `max_concurrency` | The semaphore in `_launch` is an asyncio stand-in for exactly that, and `max_concurrent_grunts` is the `max_concurrency` option. |
+| `TASKING` vs `PLANNING` | two `gen_statem` states | They decide different things from different inputs — the alert alone, versus what the sweep returned. One state doing both jobs would make the transcript ambiguous about which. |
+| aggregate `Finding` + negative collapse | same schema, same rendering | This is what keeps a sweep of any size inside a fixed context. It is not an optimisation to drop during the port. |
 
 ## Supervision tree the port should land on
 

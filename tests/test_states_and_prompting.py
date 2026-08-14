@@ -43,8 +43,8 @@ SLICE = LogSlice(
 def test_happy_path_transitions_are_legal() -> None:
     path = [
         InvestigationState.RECEIVED,
-        InvestigationState.PLANNING,
-        InvestigationState.DISPATCHED,
+        InvestigationState.TASKING,
+        InvestigationState.SWEEPING,
         InvestigationState.COLLECTING,
         InvestigationState.SYNTHESIZING,
         InvestigationState.DONE,
@@ -64,6 +64,18 @@ def test_skipping_states_is_rejected() -> None:
         assert_legal_transition(InvestigationState.PLANNING, InvestigationState.DONE)
     with pytest.raises(IllegalTransitionError):
         assert_legal_transition(InvestigationState.RECEIVED, InvestigationState.COLLECTING)
+    # The commander must not reach the data-reading states without first writing a
+    # directive from the alert.
+    with pytest.raises(IllegalTransitionError):
+        assert_legal_transition(InvestigationState.RECEIVED, InvestigationState.SWEEPING)
+
+
+def test_the_sweep_is_the_only_way_out_of_tasking() -> None:
+    """Coverage is not optional: TASKING cannot skip to synthesis or drill-down."""
+    for illegal in (InvestigationState.SYNTHESIZING, InvestigationState.PLANNING):
+        with pytest.raises(IllegalTransitionError):
+            assert_legal_transition(InvestigationState.TASKING, illegal)
+    assert_legal_transition(InvestigationState.TASKING, InvestigationState.SWEEPING)
 
 
 def test_terminal_states_have_no_outgoing_edges() -> None:

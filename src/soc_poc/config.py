@@ -48,9 +48,19 @@ class RunConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     output_dir: str = "out"
+    # Drill-down rounds AFTER the sweep. The sweep itself is not capped -- coverage is
+    # total by construction, so these govern how much closer reading follows it.
     max_iterations: int = Field(default=3, ge=1)
     max_tasks_per_iteration: int = Field(default=4, ge=1)
     max_validation_retries: int = Field(default=1, ge=0)
+    # In-flight grunt tasks. Match it to the grunt server's --max-num-seqs: higher just
+    # queues inside vLLM while holding sockets open, lower leaves the GPU idle.
+    max_concurrent_grunts: int = Field(default=8, ge=1)
+    # Tokens of a grunt's context available for the fenced slice itself, after prompt
+    # scaffolding and room for the report. See chunking.py.
+    slice_token_budget: int = Field(default=10_000, ge=500)
+    # Pessimistic chars-per-token for log content, measured against the real tokenizer.
+    chars_per_token: float = Field(default=1.4, gt=0.1)
 
 
 class StructuredOutputConfig(BaseModel):
@@ -64,7 +74,6 @@ class FixtureConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     alert: str
-    patterns_dir: str
     logs_dir: str
 
 

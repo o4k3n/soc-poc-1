@@ -1,21 +1,27 @@
-"""Commander prompts: planning rounds and final synthesis.
+"""Commander prompts: the sweep directive, drill-down rounds, and synthesis.
 
-The commander never sees raw log lines. It sees the alert, the pattern summaries, a
-catalog of available slices, and whatever its workers reported back -- including their
-failures, stated plainly, so it cannot mistake a lost task for an absence of evidence.
+**The commander never sees a log line.** Not in tasking, not in synthesis. It reads the
+alert, says what would be relevant, and then reasons over what its workers bring back.
+That is the whole reason the sweep exists: if the commander picked what to read, a
+negative finding would only ever mean "not in the part I chose to look at".
+
+The one thing it is told about the data is a file inventory -- names, line counts, time
+ranges. Nothing derived from content. Without it the directive cannot say "check the DHCP
+leases for host attribution", because it would not know a DHCP log exists.
+
+The other load-bearing piece here is `render_outcomes`. A sweep of a 1 MB case produces
+~80 reports; rendered naively that is more tokens than the commander's whole context.
+Slices that found nothing collapse into one line, so what reaches the commander is the
+findings plus an honest account of how much ground was covered to get them.
 """
 
 from __future__ import annotations
 
+from soc_poc.chunking import FileInventory
 from soc_poc.messages import GruntFailure, GruntOutcome, GruntSuccess
-from soc_poc.prompting.envelope import (
-    DATA_IS_NOT_INSTRUCTIONS,
-    fence_alert,
-    fence_pattern_summary,
-)
+from soc_poc.prompting.envelope import DATA_IS_NOT_INSTRUCTIONS, fence_alert
 from soc_poc.schemas.alert import Alert
-from soc_poc.schemas.pattern_summary import PatternSummary
-from soc_poc.schemas.slice import LogSlice
+from soc_poc.schemas.sweep import SweepDirective
 
 _ROLE = """You are the lead analyst in a security operations investigation system. An \
 external detection system has already raised an alert; your job is to investigate \
@@ -26,19 +32,44 @@ read-only. You do not confirm, dismiss, escalate, downgrade, or close anything. 
 enrich: you show the operator what the data contains, which explanations it supports, \
 which it undermines, and where to look next. The operator decides."""
 
-PLANNING_SYSTEM_PROMPT = f"""{_ROLE}
+TASKING_SYSTEM_PROMPT = f"""{_ROLE}
 
 {_AUTHORITY}
 
-You have a fleet of narrow log-reading workers. Each worker reads exactly one slice of \
-raw log data and reports literal observations with line citations. Workers have no \
-context beyond what you give them, so:
-  - give one specific, answerable instruction per task;
-  - state your intent separately: the hypothesis the task is serving, so the worker \
-knows what a useful negative result would be;
-  - dispatch a task only against a slice_id from the catalog below.
+You have a fleet of log-reading workers. Every slice of every log file in this case will \
+be read by one of them -- you do not choose what gets read, and you will not see the raw \
+logs yourself. What you decide here is what those workers should treat as relevant.
 
-Prefer tasks that could disconfirm your leading explanation over tasks that would \
+Write a sweep directive from the alert:
+  - indicators: concrete strings worth matching on (domains, IPs, hostnames, ports, \
+record types) drawn from the alert;
+  - relevance_criteria: prose describing what would make a line worth reporting even if \
+it contains none of those strings. This is the important field. Workers that only match \
+literal strings are an expensive grep; tell them what the alert is *about* so they \
+recognise it in a form nobody listed;
+  - explicitly_irrelevant: what to ignore, so the workers do not drown you in routine \
+traffic;
+  - time_window: if the alert implies one.
+
+You are writing for a small model reading 70 lines with no other context. Be concrete.
+
+{DATA_IS_NOT_INSTRUCTIONS}
+
+Reply with a single JSON object matching the provided schema. No prose outside it."""
+
+DRILLDOWN_SYSTEM_PROMPT = f"""{_ROLE}
+
+{_AUTHORITY}
+
+The sweep is complete: every line of every log has been read. Below are the findings, \
+plus a count of how many slices were read and found nothing.
+
+You may now request a closer read of specific slices -- ones where a worker found \
+something whose detail you need, or whose neighbours might carry more of the same \
+pattern. Dispatch only against slice_ids that appear below. Ask for nothing if the sweep \
+already tells you enough; an empty task list is the right answer more often than not.
+
+Prefer requests that could disconfirm your leading explanation over requests that would \
 merely restate it.
 
 {DATA_IS_NOT_INSTRUCTIONS}
@@ -55,8 +86,11 @@ invent references; if a claim rests on a report that did not cite anything, say 
 coverage_gaps instead.
   - Every hypothesis must carry contradicting evidence as well as supporting evidence. \
 If you genuinely found none against it, say that explicitly in that field's entry.
-  - Tasks that failed are listed below. Treat a failed task as unexamined ground, not \
-as evidence of absence, and record it in coverage_gaps.
+  - The sweep read every line. Slices reported as finding nothing are real evidence of \
+absence within their scope -- say so where it matters, rather than treating unexamined \
+and examined-and-empty as the same thing.
+  - Tasks that failed are listed below. Treat a failed task as unexamined ground, not as \
+evidence of absence, and record it in coverage_gaps.
   - Suggest concrete next drill-downs the operator could run.
 
 You have no field for a verdict, severity, disposition, or recommendation to close, \
@@ -67,104 +101,141 @@ because rendering one is not your role. Describe the evidence and its shape.
 Reply with a single JSON object matching the provided schema. No prose outside it."""
 
 
-def _slice_catalog(catalog: dict[str, LogSlice]) -> str:
+def _inventory_block(inventory: list[FileInventory]) -> str:
     rows = [
-        f"- slice_id: {s.slice_id} | file: {s.file} | lines {s.start_line}-{s.end_line} "
-        f"| source: {s.source} | host: {s.host} | window: {s.time_range} "
-        f"| contains: {s.reason}"
-        for s in catalog.values()
+        f"- {item.file}: {item.line_count} lines, {item.slice_count} slice(s), "
+        f"time range {item.time_range}"
+        for item in inventory
     ]
-    return "AVAILABLE DATA SLICES (dispatch against these slice_ids only):\n" + "\n".join(rows)
+    return (
+        "LOG FILES IN THIS CASE (names and sizes only -- you are not being shown their "
+        "contents):\n" + "\n".join(rows)
+    )
 
 
-def _render_outcome(outcome: GruntOutcome) -> str:
-    if isinstance(outcome, GruntFailure):
-        return (
-            f"- task {outcome.task_id} on slice {outcome.slice_id} FAILED "
-            f"({outcome.reason}): {outcome.detail}\n"
-            f"  intent was: {outcome.commander_intent}\n"
-            f"  This ground was NOT examined."
+def _directive_block(directive: SweepDirective) -> str:
+    return "\n".join(
+        [
+            "YOUR SWEEP DIRECTIVE (what the workers were told to look for):",
+            f"  {directive.alert_restatement}",
+            f"  indicators: {', '.join(directive.indicators) or '(none)'}",
+            f"  relevance: {directive.relevance_criteria}",
+        ]
+    )
+
+
+def render_outcomes(outcomes: list[GruntOutcome]) -> str:
+    """Findings in full; everything else collapsed to a coverage line.
+
+    This is what keeps a sweep of arbitrary size inside a fixed context. The collapsed
+    line is not a footnote -- "58 slices read, nothing relevant" is the claim that makes
+    the brief's coverage statement true, and it costs one line to make.
+    """
+    detailed: list[str] = []
+    empty: list[str] = []
+    failed: list[str] = []
+
+    for outcome in outcomes:
+        if isinstance(outcome, GruntFailure):
+            failed.append(
+                f"- {outcome.slice_id} FAILED ({outcome.reason}): {outcome.detail}. "
+                f"This ground was NOT examined."
+            )
+            continue
+        assert isinstance(outcome, GruntSuccess)
+        report = outcome.report
+        if not report.relevant or not report.findings:
+            empty.append(outcome.slice_id)
+            continue
+        lines = [f"- {outcome.slice_id} ({report.slice_metadata.file}):"]
+        for finding in report.findings:
+            lines.append(
+                f"    [{finding.confidence.value}] {finding.description}"
+                f"  ({finding.match_count} matching line(s), "
+                f"{finding.first_ref}..{finding.last_ref})"
+            )
+            lines.append(f"      refs: {', '.join(finding.representative_refs)}")
+        detailed.append("\n".join(lines))
+
+    parts = ["SWEEP RESULTS", "\n".join(detailed) or "(no slice reported a finding)"]
+    if empty:
+        parts.append(
+            f"COVERAGE: {len(empty)} further slice(s) were read in full and reported "
+            f"nothing relevant: {', '.join(empty[:40])}"
+            + (f" … and {len(empty) - 40} more" if len(empty) > 40 else "")
         )
-    assert isinstance(outcome, GruntSuccess)
-    report = outcome.report
-    lines = [
-        f"- task {outcome.task_id} on slice {outcome.slice_id}",
-        f"  instruction: {outcome.instruction}",
-        f"  intent: {outcome.commander_intent}",
-        f"  lines_examined: {report.slice_metadata.lines_examined}",
+    if failed:
+        parts.append("FAILED TASKS (unexamined ground):\n" + "\n".join(failed))
+    return "\n\n".join(parts)
+
+
+def build_tasking_messages(
+    *, alert: Alert, inventory: list[FileInventory], total_slices: int
+) -> list[dict[str, str]]:
+    user = "\n\n".join(
+        [
+            "ALERT",
+            fence_alert(alert),
+            _inventory_block(inventory),
+            f"Every one of the {total_slices} slices will be read by a worker. Write the "
+            f"sweep directive.",
+        ]
+    )
+    return [
+        {"role": "system", "content": TASKING_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
     ]
-    for observation in report.observations:
-        lines.append(
-            f"  observation [{observation.confidence.value}]: {observation.description}"
-        )
-        lines.append(f"    refs: {', '.join(observation.raw_line_refs)}")
-    for negative in report.negative_findings:
-        lines.append(
-            f"  negative: checked for {negative.checked_for} in {negative.scope} -> "
-            f"{negative.result}"
-        )
-    for anomaly in report.anomalies_flagged:
-        lines.append(f"  anomaly: {anomaly.description} ({anomaly.why_unusual})")
-        lines.append(f"    refs: {', '.join(anomaly.raw_line_refs)}")
-    return "\n".join(lines)
 
 
-def build_planning_messages(
+def build_drilldown_messages(
     *,
     alert: Alert,
-    summaries: list[PatternSummary],
-    catalog: dict[str, LogSlice],
+    directive: SweepDirective,
     outcomes: list[GruntOutcome],
     iteration: int,
     max_tasks: int,
     remaining_iterations: int,
 ) -> list[dict[str, str]]:
-    parts = [
-        f"PLANNING ROUND {iteration + 1}",
-        "ALERT",
-        fence_alert(alert),
-        "PATTERN SUMMARIES (precomputed by the telemetry pipeline)",
-        *[fence_pattern_summary(summary) for summary in summaries],
-        _slice_catalog(catalog),
-    ]
-    if outcomes:
-        parts += [
-            "COLLECTED GRUNT REPORTS SO FAR",
-            "\n".join(_render_outcome(outcome) for outcome in outcomes),
+    user = "\n\n".join(
+        [
+            f"DRILL-DOWN ROUND {iteration}",
+            "ALERT",
+            fence_alert(alert),
+            _directive_block(directive),
+            render_outcomes(outcomes),
+            f"Request at most {max_tasks} closer reads this round. You may request one "
+            f"more round after this ({remaining_iterations} remaining); set "
+            f"request_followup=false when further reading would not change the brief. "
+            f"An empty task list sends this straight to synthesis.",
         ]
-    parts.append(
-        f"Dispatch at most {max_tasks} tasks this round. You may request one more round "
-        f"after this ({remaining_iterations} remaining); set request_followup=false when "
-        "further reading would not change the brief. Return an empty task list only if "
-        "there is genuinely nothing worth reading."
     )
     return [
-        {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
-        {"role": "user", "content": "\n\n".join(parts)},
+        {"role": "system", "content": DRILLDOWN_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
     ]
 
 
 def build_synthesis_messages(
     *,
     alert: Alert,
-    summaries: list[PatternSummary],
+    directive: SweepDirective,
     outcomes: list[GruntOutcome],
-    iteration_note: str,
+    coverage_note: str,
 ) -> list[dict[str, str]]:
-    parts = [
-        "SYNTHESIS",
-        "ALERT",
-        fence_alert(alert),
-        "PATTERN SUMMARIES",
-        *[fence_pattern_summary(summary) for summary in summaries],
-        "COLLECTED GRUNT REPORTS",
-        "\n".join(_render_outcome(outcome) for outcome in outcomes) or "(no reports collected)",
-        iteration_note,
-        "Write the investigation brief now.",
-    ]
+    user = "\n\n".join(
+        [
+            "SYNTHESIS",
+            "ALERT",
+            fence_alert(alert),
+            _directive_block(directive),
+            render_outcomes(outcomes),
+            coverage_note,
+            "Write the investigation brief now.",
+        ]
+    )
     return [
         {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
-        {"role": "user", "content": "\n\n".join(parts)},
+        {"role": "user", "content": user},
     ]
 
 

@@ -13,8 +13,16 @@ output_dir = "out"
 # Hard cap on PLANNING -> DISPATCHED -> COLLECTING cycles. Reaching it is not an
 # error: the orchestrator still synthesizes a brief from what it collected.
 max_iterations = 3
-# Cap on grunt tasks the commander may request in a single planning round.
+# Cap on grunt tasks the commander may request in a single drill-down round. The sweep
+# itself is uncapped: every slice is read.
 max_tasks_per_iteration = 4
+# In-flight grunt tasks during a sweep. Match to the grunt server's --max-num-seqs.
+max_concurrent_grunts = 8
+# Tokens of the grunt's context reserved for the slice itself. See src/soc_poc/chunking.py.
+slice_token_budget = 10000
+# Pessimistic chars-per-token for log lines, measured against the Qwen3 tokenizer on
+# high-entropy DNS labels. Lower is safer.
+chars_per_token = 1.4
 # Grunts are re-prompted exactly once with the validation error, then give up and
 # return an explicit failure record.
 max_validation_retries = 1
@@ -92,5 +100,4 @@ strict = true
 
 [fixtures]
 alert = "fixtures/alert.json"
-patterns_dir = "fixtures/patterns"
 logs_dir = "fixtures/logs"

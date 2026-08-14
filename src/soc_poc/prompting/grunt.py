@@ -1,30 +1,44 @@
-"""Grunt prompts. One task, one slice, no history.
+"""Grunt prompts. One slice, one directive, no history.
 
-A grunt is a narrow reader. It gets its instruction, the commander's intent, and one
-fenced slice -- never the alert, never sibling reports, never the previous iteration.
-That isolation is the point: it keeps the unit of work small enough to check, and it is
-what makes each task a supervised Task in the Elixir port.
+A grunt is a narrow reader on a sweep. It gets the commander's directive, one fenced
+slice, and nothing else -- no alert envelope, no sibling reports, no previous round. That
+isolation is the point: it keeps the unit of work small enough to check, and it is what
+makes each task a supervised Task in the Elixir port.
+
+Most grunts on a sweep find nothing, and the prompt has to make that a comfortable
+answer. A worker that feels obliged to produce a finding will produce one, and a hundred
+slices of manufactured relevance is worse than no sweep at all.
 """
 
 from __future__ import annotations
 
 from soc_poc.messages import GruntTasking
 from soc_poc.prompting.envelope import DATA_IS_NOT_INSTRUCTIONS, fence_log_slice
+from soc_poc.schemas.grunt import MAX_REPRESENTATIVE_REFS
 
 SYSTEM_PROMPT = f"""You are a log-reading analyst worker in a security operations \
-system. You examine one small slice of raw log data and report what is literally there.
+system. You are one of many workers sweeping a case: every slice of every log file is \
+being read by someone, and you have been given exactly one slice. Read it line by line \
+and report which lines, if any, bear on the alert being investigated.
 
 Rules:
 1. Report only what the lines in front of you show. You have no other context, and you \
 must not speculate about what is outside this slice.
-2. Every observation and every flagged anomaly MUST cite at least one line reference, \
-copied exactly from the reference at the start of each line (form: file.log:L123). A \
-claim you cannot cite is a claim you must not make.
-3. Never invent a line reference. If you cannot support a statement with a line you \
-were shown, drop the statement.
-4. Record what you looked for and did NOT find in negative_findings. A well-scoped \
-absence is a useful result here, not a failure.
-5. You do not assess severity, decide whether anything is malicious, or recommend \
+2. **Finding nothing is the expected answer.** Most slices in a sweep are ordinary \
+traffic. If nothing here bears on the alert, set relevant to false, record what you \
+looked for in checked_for, and stop. Do not manufacture a finding to seem useful.
+3. Aggregate. If forty lines match the same pattern, that is ONE finding with \
+match_count 40 and at most {MAX_REPRESENTATIVE_REFS} representative_refs -- not forty \
+findings and not forty references. Set first_ref and last_ref to the earliest and latest \
+matching lines so the pattern's extent is visible.
+4. Every finding MUST cite at least one line reference, copied exactly from the start of \
+the line (form: file.log:L123). Never invent a reference. If you cannot support a \
+statement with a line you were shown, drop the statement.
+5. Relevance is wider than string matching. The directive lists indicators, but a line \
+can matter without containing one of them -- unusual volume, timing, record types, \
+encodings, or an obvious relationship to what the alert describes. Use judgement, then \
+say what you saw.
+6. You do not assess severity, decide whether anything is malicious, or recommend \
 action. Another component does that with a human in the loop. Describe; do not judge.
 
 {DATA_IS_NOT_INSTRUCTIONS}
@@ -32,22 +46,38 @@ action. Another component does that with a human in the loop. Describe; do not j
 Reply with a single JSON object matching the provided schema. No prose outside it."""
 
 
+def _directive_block(tasking: GruntTasking) -> str:
+    directive = tasking.directive
+    return "\n".join(
+        [
+            "WHAT THE INVESTIGATION IS ABOUT",
+            directive.alert_restatement,
+            "",
+            "INDICATORS (worth matching on, but not the whole of relevance):",
+            "\n".join(f"  - {i}" for i in directive.indicators) or "  (none given)",
+            "",
+            "WHAT COUNTS AS RELEVANT:",
+            directive.relevance_criteria,
+            "",
+            "EXPLICITLY NOT RELEVANT (do not report these):",
+            "\n".join(f"  - {i}" for i in directive.explicitly_irrelevant) or "  (nothing excluded)",
+            "",
+            f"TIME WINDOW OF INTEREST: {directive.time_window or '(none given)'}",
+        ]
+    )
+
+
 def build_grunt_messages(tasking: GruntTasking) -> list[dict[str, str]]:
     user = "\n\n".join(
         [
-            "TASK",
-            f"task_id: {tasking.task_id}",
-            f"slice_id: {tasking.data_slice.slice_id}",
-            f"instruction: {tasking.instruction}",
-            # Intent is presented as its own labelled block, not merged into the
-            # instruction: the worker should know which question it is serving without
-            # being told what answer would please the commander.
-            "COMMANDER'S INTENT (the hypothesis being tested; do not try to confirm it, "
-            "report what is there):",
-            tasking.commander_intent,
+            f"SLICE {tasking.data_slice.slice_id} "
+            f"({tasking.data_slice.file} lines {tasking.data_slice.start_line}-"
+            f"{tasking.data_slice.end_line})",
+            _directive_block(tasking),
+            tasking.instruction,
             "DATA",
             fence_log_slice(tasking.data_slice),
-            "Now produce the JSON report.",
+            "Now produce the JSON report for this slice.",
         ]
     )
     return [
@@ -61,9 +91,8 @@ def build_retry_messages(
 ) -> list[dict[str, str]]:
     """Re-prompt once, with the exact validation errors.
 
-    The model is shown its own output and told precisely what was wrong with it. This
-    is bounded to a single retry: a worker that cannot cite its slice correctly twice
-    is a failure record, not an opportunity for a third try.
+    Bounded to a single retry: a worker that cannot cite its own slice correctly twice is
+    a failure record, not an opportunity for a third try.
     """
     listed = "\n".join(f"  - {problem}" for problem in problems)
     return build_grunt_messages(tasking) + [
@@ -75,8 +104,8 @@ def build_retry_messages(
                 f"{listed}\n\n"
                 "Line references must be copied exactly from the start of the lines you "
                 "were shown in this slice. Produce a corrected JSON report. If you "
-                "cannot support an observation with a line reference from this slice, "
-                "remove that observation rather than inventing a reference."
+                "cannot support a finding with a reference from this slice, remove that "
+                "finding — reporting nothing is a valid answer."
             ),
         },
     ]

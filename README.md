@@ -2,9 +2,16 @@
 
 A lab proof of concept on a single NVIDIA DGX Spark (GB10, 128 GB unified memory,
 ~273 GB/s). An external detection system raises an alert; this system investigates
-around it. A **commander** model reads the alert plus precomputed pattern summaries and
-dispatches narrow tasks to **grunt** workers that read raw log slices; the commander
-synthesizes an investigation brief for a human SOC operator.
+around it.
+
+A **commander** model reads the alert — and only the alert — and writes a sweep
+directive saying what would be relevant. Every slice of every log file is then read by a
+**grunt** worker carrying that directive. The commander reasons over what they bring
+back and synthesizes an investigation brief for a human SOC operator.
+
+**The commander never sees a log line.** That is not a restriction, it is what makes the
+brief's coverage claim true: if the commander chose which slices to read, "we found
+nothing else" would only ever mean "nothing else in the part it picked".
 
 The brief supports the operator. **It never renders a verdict.**
 
@@ -23,32 +30,42 @@ that survives being ported to Elixir/OTP are.
     ┌──────────────────────────────────────────────────────────┐
     │  orchestrator  (explicit state machine, states.py)        │
     │                                                          │
-    │  RECEIVED → PLANNING → DISPATCHED → COLLECTING ─┐         │
-    │                 ▲                               │         │
-    │                 └──────── drill-down ───────────┘         │
-    │                              │ (iteration cap)            │
-    │                              ▼                            │
-    │                        SYNTHESIZING → DONE                │
-    │                              ▲                            │
-    │        ./abort.py ─► ABORTING┘   ABORTED_BY_OPERATOR      │
-    │                     (write up)   (--hard: stop dead)      │
+    │  RECEIVED → TASKING      alert in, sweep directive out    │
+    │                 │        (no log data reaches it here)    │
+    │                 ▼                                         │
+    │             SWEEPING     EVERY slice → a grunt            │
+    │                 │        bounded by concurrency, not      │
+    │                 ▼        by a coverage budget             │
+    │             COLLECTING ──┐                                │
+    │                 │        │ drill-down (commander names    │
+    │                 │        └─ slice_ids the sweep flagged)  │
+    │                 ▼                                         │
+    │             SYNTHESIZING → DONE                           │
+    │                 ▲                                         │
+    │  ./abort.py ─► ABORTING   ABORTED_BY_OPERATOR             │
+    │                (write up) (--hard: stop dead)             │
     └───────┬───────────────────────────────┬──────────────────┘
             │ typed messages only           │
             ▼                               ▼
    commander (port 8000)            grunt fleet (port 8001)
    gpt-oss-120b, MXFP4              Qwen3-8B-FP8, ONE instance
-   plan + synthesize                continuous batching
+   directive + synthesis            continuous batching, 8 at a time
             │                               │
             └──────► every call ────────────┘
                      transcript.jsonl (full prompt + response, always)
 ```
 
-**Commander** sees: the alert, pattern summaries, a catalog of available slices, and its
-workers' reports — including their failures. It never sees a raw log line.
+**Commander** sees: the alert, a bare file inventory (names, line counts, time ranges —
+never content), and its workers' reports, including their failures.
 
-**Each grunt** sees: one instruction, the commander's intent, and one fenced slice.
-Nothing else — no sibling reports, no alert, no history. Isolation is what makes each
-task checkable and what makes it a supervised Task in the Elixir port.
+**Each grunt** sees: the sweep directive and one fenced slice. Nothing else — no sibling
+reports, no alert envelope, no history. Isolation is what makes each task checkable and
+what makes it a supervised Task in the Elixir port.
+
+**Reports are aggregates.** A grunt that matches 400 lines returns a count, the first and
+last reference, and at most five representative citations — never 400 refs. Slices that
+found nothing collapse into a single coverage line. That is what lets a sweep of any size
+land inside the commander's fixed context: ~80 reports become ~5k tokens instead of ~24k.
 
 Read `PORTING.md` next; it explains why several things are shaped the way they are.
 
@@ -58,15 +75,15 @@ Read `PORTING.md` next; it explains why several things are shaped the way they a
 |---|---|
 | `analyze.py` / `abort.py` | the two entry points; everything else is library code |
 | `src/soc_poc/casedir.py` | case-folder discovery and validation, with fixable errors |
-| `src/soc_poc/summarize.py` | fallback summarizer, standing in for the telemetry pipeline |
+| `src/soc_poc/chunking.py` | token-aware chunking; every line lands in exactly one slice |
 | `src/soc_poc/control.py` | run markers and the abort sentinel |
 | `src/soc_poc/progress.py` | the live-output sink; keeps I/O out of the state machine |
 | `src/soc_poc/states.py` | the state machine: states, legal transitions, terminal set |
 | `src/soc_poc/orchestrator.py` | the loop over an immutable `InvestigationContext` |
 | `src/soc_poc/messages.py` | every message crossing an agent boundary, failures included |
 | `src/soc_poc/grunt.py` | one isolated unit of work; always returns, never raises |
-| `src/soc_poc/commander.py` | planning and synthesis calls |
-| `src/soc_poc/schemas/` | the contracts (alert, summaries, slices, grunt report, brief) |
+| `src/soc_poc/commander.py` | directive, drill-down and synthesis calls |
+| `src/soc_poc/schemas/` | the contracts (alert, sweep directive, slices, grunt report, brief) |
 | `src/soc_poc/validation/` | no-verdict guard, citation enforcement, injection post-pass |
 | `src/soc_poc/prompting/` | prompt construction; all untrusted content goes through `envelope.py` |
 | `src/soc_poc/llm/` | `LLMClient` protocol, vLLM client, offline stub |
@@ -86,12 +103,13 @@ Prompts are a courtesy. These four are structural, and they hold when the prompt
    a decision-shaped field — so "just a severity hint, six months from now" fails the
    build rather than the review.
 2. **Every claim carries a citation, and citations are checked.** Guided decoding
-   guarantees `raw_line_refs` is a list of strings; only Python can know whether
-   `dns_resolver.log:L142` was in the slice *that particular grunt* was handed.
-   `validation/citations.py` checks exactly that. An observation with no citation, or
-   with a fabricated one, is a validation failure — the worker is re-prompted once with
-   the specific error and then recorded as a failure. Uncheckable claims do not reach
-   the operator.
+   guarantees `representative_refs` is a list of strings; only Python can know whether
+   `dns.log:L142` was in the slice *that particular grunt* was handed.
+   `validation/citations.py` checks exactly that, plus the reference cap and that
+   `match_count` is consistent with what was cited — a grammar constrains shape and
+   cannot count. A finding with no citation, or a fabricated one, is a validation failure:
+   the worker is re-prompted once with the specific error and then recorded as a failure.
+   Uncheckable claims do not reach the operator.
 3. **The alert's status never round-trips through a model.** `AlertRef` in the finished
    brief is built by `orchestrator._assemble_brief` copying the inbound alert. No model
    sees it as an output field.
@@ -223,26 +241,26 @@ A **case folder** is the whole input format:
 cases/my-case/
     alert.json      the alert an external detector already raised — required
     logs/           your raw logs, any text format — required
-    patterns/       optional; hand-written summaries override the generated ones
 ```
 
-`fixtures/` is itself a case folder, so `./analyze.py fixtures` runs the bundled demo —
-that is all `make demo` and `make demo-offline` do now.
+That is it. There is nothing to hand-author and nothing to configure: every line of every
+file in `logs/` is read. `fixtures/` is itself a case folder, so `./analyze.py fixtures`
+runs the bundled demo — that is all `make demo` and `make demo-offline` do now.
 
-**How logs become visible.** The commander never reads a log file; it dispatches workers
-against *slices*, and slices come from pattern summaries. If a case has no `patterns/`,
-`summarize.py` generates summaries by chunking each log into windows and computing
-generic statistics (line counts, detected time range, repeated-template counts). Those
-are honest but weak, and the prompt says so — there is no cross-host prevalence, no
-baseline, no real first-seen, because that is the telemetry pipeline's job and the
-pipeline is out of scope. Generated summaries are saved to
-`out/<id>/generated_patterns/` so a good one can be promoted into the case's own
-`patterns/`, which then wins.
+**How logs become visible.** `chunking.py` packs every file into slices sized against
+the grunt's context, and each slice is read by one worker. Windows are variable-length,
+packed greedily by estimated tokens rather than a fixed line count: log files mix short
+routine lines with dense bursts, and a fixed window landing on a burst overflows the
+model's context even when the file's average is comfortable. That failure is total — an
+oversized slice is rejected by the server, so every grunt in the sweep fails.
 
-`analyze.py` prints the slice count against the read budget
-(`max_tasks_per_iteration × max_iterations`) before it starts. If there are more slices
-than the commander can read, some data goes unread — raise `--max-tasks` /
-`--max-iterations`, or narrow the case.
+Token estimation is deliberately pessimistic (1.4 chars/token, measured against the real
+tokenizer on high-entropy DNS labels). Cheaper log formats simply get smaller slices than
+they strictly need, which costs a few extra calls; erring the other way costs the run.
+
+`analyze.py` prints the slice count and an estimated wall-clock before starting, and asks
+to proceed. Nothing is skipped and nothing is sampled, so a large case is slow rather
+than partial — `./abort.py` is there when you change your mind.
 
 Output, one directory per run:
 
@@ -251,7 +269,6 @@ out/<investigation_id>/
     transcript.jsonl        every LLM call, every state transition, every validation
     brief.json              the artifact for the operator (absent if the run failed)
     run_meta.json           config snapshot, model ids, git sha, terminal state
-    generated_patterns/     the summaries used, when they were generated
 ```
 
 ### Watching a run
@@ -351,11 +368,11 @@ and are rejected by 0.24.0). Everything in `deploy/` was verified against
 
 Explicitly not in this build, with the seam each one will land on:
 
-- **Telemetry pipeline.** `summarize.py` is a deliberate stand-in: it chunks and counts,
-  and computes none of the statistics that make summaries valuable (cross-host
-  prevalence, baselines, interval regularity scored against a population, real
-  first-seen). The pipeline replaces that module and touches nothing else — everything
-  downstream depends on the `PatternSummary` contract, not on where summaries came from.
+- **Telemetry pipeline.** Precomputed pattern summaries were in the original design and
+  have been **deliberately removed**: the commander must not read data, and summaries are
+  data. What a pipeline would still buy is prioritisation (sweep the interesting slices
+  first) and enrichment for the brief — not deciding what gets read, because that is the
+  choice this architecture exists to take away.
 - **Eval harness.** Seam: the `LLMClient` protocol (`llm/base.py`) plus the
   `[models.evaluator]` config entry. The transcript corpus is the eval set.
 - **Synthetic scenario generation.** Seam: a case folder is just `alert.json` + `logs/`,

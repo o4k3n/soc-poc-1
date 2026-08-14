@@ -1,13 +1,12 @@
-"""Fixture loading and slice construction.
+"""Loading a case: the alert, the file inventory, the complete slice catalog.
 
-SEAM: today this reads JSON fixtures off disk. Tomorrow the telemetry pipeline writes
-the same shapes -- `Alert`, `PatternSummary`, and log files with stable line numbering.
-Everything downstream depends on the schemas, not on the filesystem, so the pipeline
-lands here and nowhere else.
+Chunking itself lives in chunking.py; this module is the seam where inputs enter the
+system. Today they come from a case folder on disk. When the telemetry pipeline exists it
+lands here and nowhere else, because everything downstream depends on `Alert` and
+`LogSlice`, not on the filesystem.
 
-The line-ref index built here is what makes citations checkable: a slice knows exactly
-which lines it contains, each tagged `<file>:L<n>` with 1-based numbering that matches
-what a human sees in an editor.
+Line references are 1-based and match what a human sees in an editor, which is what makes
+a citation checkable with `sed -n '142p'`.
 """
 
 from __future__ import annotations
@@ -15,71 +14,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from soc_poc.chunking import FileInventory, chunk_logs
 from soc_poc.schemas.alert import Alert
-from soc_poc.schemas.pattern_summary import LogPointer, PatternSummary
-from soc_poc.schemas.slice import LogLine, LogSlice
-from soc_poc.summarize import DEFAULT_MAX_SLICES, summarize_logs
+from soc_poc.schemas.slice import LogSlice
 from soc_poc.validation.injection import InjectionSignal, scan_for_ai_directed_content
 
 
 def load_alert(path: Path) -> Alert:
     return Alert.model_validate_json(path.read_text(encoding="utf-8"))
-
-
-def load_pattern_summaries(directory: Path) -> list[PatternSummary]:
-    summaries = [
-        PatternSummary.model_validate_json(p.read_text(encoding="utf-8"))
-        for p in sorted(directory.glob("*.json"))
-    ]
-    if not summaries:
-        raise FileNotFoundError(f"no pattern summaries found in {directory}")
-    return summaries
-
-
-def _read_window(log_path: Path, pointer: LogPointer) -> list[LogLine]:
-    """Physical 1-based lines, inclusive of both endpoints.
-
-    Physical lines on purpose: one of the fixture logs is an ugly multiline format, and
-    a citation must point at something a human can find with `sed -n '142p'`. A
-    record-aware reader would be nicer to the model and worse for the operator.
-    """
-    all_lines = log_path.read_text(encoding="utf-8").splitlines()
-    start = max(1, pointer.start_line)
-    end = min(len(all_lines), pointer.end_line)
-    return [
-        LogLine(ref=f"{log_path.name}:L{n}", text=all_lines[n - 1])
-        for n in range(start, end + 1)
-    ]
-
-
-def build_slice_catalog(
-    summaries: list[PatternSummary], logs_dir: Path
-) -> dict[str, LogSlice]:
-    """One slice per log pointer. Slice ids are the commander's only handle on data."""
-    catalog: dict[str, LogSlice] = {}
-    for summary in summaries:
-        for index, pointer in enumerate(summary.log_pointers, start=1):
-            log_path = logs_dir / pointer.file
-            if not log_path.exists():
-                raise FileNotFoundError(
-                    f"pattern summary {summary.summary_id} points at missing log {log_path}"
-                )
-            slice_id = f"{summary.summary_id}-w{index}"
-            lines = _read_window(log_path, pointer)
-            catalog[slice_id] = LogSlice(
-                slice_id=slice_id,
-                file=log_path.name,
-                source=summary.source,
-                host=summary.host,
-                time_range=summary.time_range,
-                reason=pointer.why or summary.title,
-                start_line=pointer.start_line,
-                end_line=pointer.end_line,
-                lines=lines,
-            )
-    if not catalog:
-        raise ValueError("pattern summaries produced no log slices")
-    return catalog
 
 
 def scan_catalog_for_injection(catalog: dict[str, LogSlice]) -> list[InjectionSignal]:
@@ -105,25 +47,21 @@ def all_known_refs(catalog: dict[str, LogSlice]) -> set[str]:
 
 def load_run_inputs(
     alert_path: Path,
-    patterns_dir: Path | None,
     logs_dir: Path,
     *,
-    max_slices: int = DEFAULT_MAX_SLICES,
-) -> tuple[Alert, list[PatternSummary], dict[str, LogSlice]]:
-    """Load a run's inputs, generating pattern summaries when none were written.
+    slice_token_budget: int,
+    chars_per_token: float,
+) -> tuple[Alert, list[FileInventory], dict[str, LogSlice]]:
+    """Load a run's inputs: the alert, a file inventory, and a complete slice catalog.
 
-    `patterns_dir=None` means "nobody hand-wrote summaries for this case", and the
-    fallback summarizer stands in for the telemetry pipeline. A hand-written directory
-    always wins: it is the only way to point the commander at something specific.
+    There is no summarization step and no selection step. Every line of every file ends
+    up in exactly one slice, and every slice gets read -- see chunking.py.
     """
     alert = load_alert(alert_path)
-    summaries = (
-        load_pattern_summaries(patterns_dir)
-        if patterns_dir is not None
-        else summarize_logs(logs_dir, max_slices=max_slices)
+    catalog, inventory = chunk_logs(
+        logs_dir, slice_token_budget=slice_token_budget, chars_per_token=chars_per_token
     )
-    catalog = build_slice_catalog(summaries, logs_dir)
-    return alert, summaries, catalog
+    return alert, inventory, catalog
 
 
 def write_json(path: Path, payload: object) -> None:

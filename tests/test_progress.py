@@ -46,7 +46,8 @@ async def test_reasoning_tokens_reach_the_sink(tmp_path: Path) -> None:
     )
 
     assert any(channel == "reasoning" for channel, _ in recorder.tokens)
-    assert ("RECEIVED", "PLANNING") in recorder.states
+    assert ("RECEIVED", "TASKING") in recorder.states
+    assert ("TASKING", "SWEEPING") in recorder.states
     assert recorder.outcomes, "grunt outcomes must be reported to the sink"
 
 

@@ -106,8 +106,12 @@ async def run_grunt_task(
             progress.task_outcome(
                 tasking.task_id,
                 tasking.data_slice.slice_id,
-                f"{len(report.observations)} observation(s), "
-                f"{len(report.negative_findings)} negative finding(s)"
+                (
+                    f"{sum(f.match_count for f in report.findings)} matching line(s) in "
+                    f"{len(report.findings)} finding(s)"
+                    if report.relevant
+                    else "nothing relevant"
+                )
                 + (f", {attempt} attempts" if attempt > 1 else ""),
                 ok=True,
             )
@@ -124,7 +128,11 @@ async def run_grunt_task(
         if attempt < max_attempts:
             messages = build_retry_messages(tasking, response.text, problems)
 
-    reason = "citations" if any("cite" in p or "raw_line_refs" in p for p in problems) else "schema"
+    reason = (
+        "citations"
+        if any("cite" in p or "representative_refs" in p for p in problems)
+        else "schema"
+    )
     progress.task_outcome(
         tasking.task_id,
         tasking.data_slice.slice_id,

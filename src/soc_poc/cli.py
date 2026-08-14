@@ -12,12 +12,11 @@ import sys
 from pathlib import Path
 
 from soc_poc.casedir import CaseLayout, CaseLoadError, discover_case, scaffold_case
+from soc_poc.chunking import chunk_logs
 from soc_poc.config import AppConfig, FixtureConfig, load_config
-from soc_poc.loader import build_slice_catalog, load_pattern_summaries
 from soc_poc.progress import ConsoleProgress, NullProgress, ProgressSink
 from soc_poc.runner import run_investigation
 from soc_poc.states import InvestigationState
-from soc_poc.summarize import summarize_logs
 
 DEFAULT_CONFIG = "config/config.toml"
 
@@ -44,6 +43,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-iterations", type=int, help="override the drill-down cap")
     parser.add_argument("--max-tasks", type=int, help="override tasks per planning round")
     parser.add_argument("--id", dest="investigation_id", help="name this run explicitly")
+    parser.add_argument(
+        "-y", "--yes", action="store_true", help="skip the cost confirmation"
+    )
     return parser
 
 
@@ -61,44 +63,50 @@ def _apply_case(config: AppConfig, case: CaseLayout, args: argparse.Namespace) -
         update={
             "run": run,
             "fixtures": FixtureConfig(
-                alert=str(case.alert_path),
-                patterns_dir=str(case.patterns_dir or case.root / "patterns"),
-                logs_dir=str(case.logs_dir),
+                alert=str(case.alert_path), logs_dir=str(case.logs_dir)
             ),
         }
     )
 
 
+# Rough, from observed grunt latency on this box. Only used for the estimate printed
+# before a run; nothing depends on it being right.
+SECONDS_PER_GRUNT_CALL = 25
+
+
 def _preview(config: AppConfig, case: CaseLayout, out) -> int:
-    """Show what will be read before spending minutes reading it.
+    """Show what the sweep will cost before it is spent.
 
-    Returns the slice count. Building the catalog here costs a file read and catches
-    broken line pointers before any model is involved.
+    Chunking here costs a file read and catches a broken case before any model is
+    involved. It is also the honest moment to tell someone that their 40 MB of logs is
+    two hours of GPU time.
     """
-    if case.has_handwritten_patterns:
-        summaries = load_pattern_summaries(case.patterns_dir)  # type: ignore[arg-type]
-        origin = f"{len(summaries)} hand-written summar(ies)"
-    else:
-        summaries = summarize_logs(case.logs_dir)
-        origin = f"{len(summaries)} auto-generated summar(ies)"
-    catalog = build_slice_catalog(summaries, case.logs_dir)
+    catalog, inventory = chunk_logs(
+        case.logs_dir,
+        slice_token_budget=config.run.slice_token_budget,
+        chars_per_token=config.run.chars_per_token,
+    )
+    total_lines = sum(item.line_count for item in inventory)
+    slices = len(catalog)
+    per_slice = max(1, total_lines // max(slices, 1))
+    concurrency = config.run.max_concurrent_grunts
+    minutes = (slices / concurrency) * SECONDS_PER_GRUNT_CALL / 60
 
-    readable = config.run.max_tasks_per_iteration * config.run.max_iterations
     print(f"case      : {case.root}", file=out)
-    print(f"logs      : {len(case.log_files)} file(s) — {', '.join(case.log_files)}", file=out)
-    print(f"summaries : {origin}", file=out)
-    print(f"slices    : {len(catalog)}", file=out)
-    if len(catalog) > readable:
-        # Not an error. What the commander declines to read is itself a finding, but the
-        # operator should know the budget was the binding constraint.
+    print(f"logs      : {len(case.log_files)} file(s), {total_lines} lines", file=out)
+    for item in inventory:
         print(
-            f"  note: at most {readable} slices can be read "
-            f"({config.run.max_tasks_per_iteration} tasks x "
-            f"{config.run.max_iterations} rounds); {len(catalog) - readable} will go "
-            f"unread. Raise --max-tasks/--max-iterations, or narrow the case.",
+            f"            {item.file}: {item.line_count} lines, "
+            f"{item.slice_count} slice(s), {item.time_range}",
             file=out,
         )
-    return len(catalog)
+    print(f"slices    : {slices} (~{per_slice} lines each)", file=out)
+    print(
+        f"sweep     : {slices} grunt call(s), ~{minutes:.0f} min at {concurrency} "
+        f"concurrent — every line gets read",
+        file=out,
+    )
+    return slices
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -135,6 +143,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    if not args.yes and not args.stub and sys.stdin.isatty():
+        answer = input("proceed? [Y/n] ").strip().lower()
+        if answer and not answer.startswith("y"):
+            print("aborted before starting", file=sys.stderr)
+            return 1
+
     progress: ProgressSink = NullProgress() if args.quiet else ConsoleProgress(out)
     backend = "stub" if args.stub else "vllm"
 
@@ -145,7 +159,6 @@ def main(argv: list[str] | None = None) -> int:
             investigation_id=args.investigation_id,
             progress=progress,
             case_name=str(case.root),
-            generate_patterns=not case.has_handwritten_patterns,
         )
     )
 
@@ -154,7 +167,17 @@ def main(argv: list[str] | None = None) -> int:
     if result.brief is not None:
         print(f"brief          : {paths.brief}")
         print(f"alert status   : {result.brief.alert_ref.status} (unchanged, detector-owned)")
+        print(f"slices swept   : {result.brief.slices_swept}")
         print(f"tasks          : {len(result.brief.task_ledger)}")
+        failed = sum(1 for e in result.brief.task_ledger if e.outcome == "failure")
+        if failed:
+            # A brief synthesized entirely from failures is still a brief, and it is the
+            # kind of result that looks fine until you read it. Say so on the way out.
+            print(
+                f"FAILED TASKS   : {failed} of {len(result.brief.task_ledger)}"
+                + ("  — nothing was successfully read" if failed == len(result.brief.task_ledger) else ""),
+                file=sys.stderr,
+            )
         if result.brief.aborted_by_operator:
             print("interrupted    : yes — this brief covers only what was read before the abort")
         if result.brief.unresolved_citations:

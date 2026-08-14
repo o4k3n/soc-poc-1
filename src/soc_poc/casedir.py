@@ -3,8 +3,9 @@
     <case>/
         alert.json          required -- the external detector's alert
         logs/*.log          required -- raw logs, any text format
-        patterns/*.json     optional -- hand-written summaries; present means the
-                                        fallback summarizer is skipped entirely
+
+Every line of every file in logs/ is read by a worker. There is no summaries directory
+and nothing to hand-author: what gets read is not a choice.
 
 The whole point of this module is that mistakes are caught here, at the edge, with a
 message that says what to fix. Everything downstream assumes its inputs are valid, and a
@@ -23,7 +24,6 @@ from soc_poc.schemas.alert import Alert
 
 ALERT_FILE = "alert.json"
 LOGS_DIR = "logs"
-PATTERNS_DIR = "patterns"
 
 ALERT_TEMPLATE = {
     "alert_id": "EXT-0000-00-00-000000",
@@ -49,16 +49,11 @@ class CaseLayout(BaseModel):
     root: Path
     alert_path: Path
     logs_dir: Path
-    patterns_dir: Path | None  # None means "generate summaries"
     log_files: tuple[str, ...]
 
     @property
     def name(self) -> str:
         return self.root.name
-
-    @property
-    def has_handwritten_patterns(self) -> bool:
-        return self.patterns_dir is not None
 
 
 def _describe_alert_error(path: Path, exc: ValidationError) -> str:
@@ -110,15 +105,8 @@ def discover_case(root: Path) -> CaseLayout:
     if not log_files:
         raise CaseLoadError(f"{logs_dir} contains no log files.")
 
-    patterns_dir = root / PATTERNS_DIR
-    has_patterns = patterns_dir.is_dir() and any(patterns_dir.glob("*.json"))
-
     return CaseLayout(
-        root=root,
-        alert_path=alert_path,
-        logs_dir=logs_dir,
-        patterns_dir=patterns_dir if has_patterns else None,
-        log_files=log_files,
+        root=root, alert_path=alert_path, logs_dir=logs_dir, log_files=log_files
     )
 
 
@@ -135,6 +123,5 @@ def scaffold_case(root: Path) -> CaseLayout:
         root=root.resolve(),
         alert_path=(root / ALERT_FILE).resolve(),
         logs_dir=(root / LOGS_DIR).resolve(),
-        patterns_dir=None,
         log_files=(),
     )

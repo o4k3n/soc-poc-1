@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from soc_poc.schemas.brief import CommanderPlan
 from soc_poc.schemas.grunt import GruntReport
 from soc_poc.schemas.slice import LogSlice
+from soc_poc.schemas.sweep import SweepDirective
 
 
 class GruntTasking(BaseModel):
@@ -36,6 +37,10 @@ class GruntTasking(BaseModel):
     # question it is serving without the commander's reasoning bleeding into the task
     # text -- and so the transcript records intent separately for later analysis.
     commander_intent: str
+    # What the commander decided is relevant, written from the alert alone. Identical
+    # across every task in a sweep round: the workers differ only in which slice they
+    # were handed, which is what makes their reports comparable.
+    directive: SweepDirective
     data_slice: LogSlice
 
 
@@ -80,11 +85,27 @@ GruntOutcome = GruntSuccess | GruntFailure
 
 
 class PlanningResult(BaseModel):
-    """Result of one planning round: a plan, or a recorded reason there is none."""
+    """Result of one drill-down round: a plan, or a recorded reason there is none."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     ok: bool
     plan: CommanderPlan | None = None
+    error: str = ""
+    attempts: int = 0
+
+
+class TaskingResult(BaseModel):
+    """Result of the TASKING call: a sweep directive, or a recorded reason there is none.
+
+    A failure here is terminal for the investigation -- without a directive the workers
+    have no notion of relevance, and a sweep that reports everything is the same as a
+    sweep that reports nothing.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    ok: bool
+    directive: SweepDirective | None = None
     error: str = ""
     attempts: int = 0
