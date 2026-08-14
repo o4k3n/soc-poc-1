@@ -23,6 +23,10 @@ looks over-formal for Python.
 | `commander.plan_round` / `commander.synthesize_brief` | plain functions called from the orchestrator process | Deliberately not processes: they are synchronous request/response steps of the state machine, not concurrent activities. |
 | retry-with-feedback loops (`for attempt in range(...)`) | explicit retry count in the state data, with `{:next_event, :internal, :retry}` | The attempt counter is already an explicit parameter rather than a closure variable. |
 | `validation.no_verdict` import-time assertion | a compile-time check, or a test in the release pipeline | The guarantee ("no model-facing schema has a decision field") must fail the build, not a review. |
+| `progress.ProgressSink` | a pid the machine `send`s events to, or `:telemetry` events | Already a protocol with two implementations and no I/O inside the state machine. |
+| `control.py` sentinel polling | `gen_statem.call/2` — a real message, checked between states | The file sentinel exists because a Python asyncio process has no mailbox. OTP does: abort becomes `{:abort, mode}` handled in whichever state is current, and the polling disappears. Keep the two-mode distinction and the "no outcomes means no brief" rule. |
+| `ABORTING` / `ABORTED_BY_OPERATOR` | two `gen_statem` states, same as here | Split for the same reason: one state that means both "stop and write up" and "stop dead" is a state that means nothing. |
+| `summarize.py` | a `GenServer` or plain module the pipeline later replaces | It is a stand-in either way; the contract (`PatternSummary` with `log_pointers`) is what ports. |
 
 ## Supervision tree the port should land on
 

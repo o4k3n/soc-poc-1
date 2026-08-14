@@ -67,7 +67,10 @@ class GruntFailure(BaseModel):
     slice_id: str
     instruction: str
     commander_intent: str
-    reason: Literal["timeout", "transport", "schema", "citations", "internal"]
+    # "aborted" covers work cancelled by `abort.py --hard`. Cancelled work is still
+    # recorded: the commander (and the reader of the transcript) must be able to tell
+    # ground that was never examined from ground that was examined and found empty.
+    reason: Literal["timeout", "transport", "schema", "citations", "internal", "aborted"]
     detail: str
     attempts: int
     validation_errors: list[str] = Field(default_factory=list)

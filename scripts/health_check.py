@@ -41,10 +41,10 @@ async def _main(config_path: str) -> int:
     print(result.report(), flush=True)
     if not result.ok:
         print(
-            "\nEndpoints are not ready. If the commander passed /health and "
-            "served_model_name but failed guided_json_roundtrip with empty content, "
-            "that is the GB10/SM121 MXFP4 signature (vLLM issue #37030) -- see README "
-            "> Known issues for the fallback swap.",
+            "\nEndpoints are not ready. An endpoint that passes /health and "
+            "served_model_name but fails guided_json_roundtrip with empty content is "
+            "usually a reasoning-parser mismatch -- see README > Known issues, and the "
+            "flag ladder in deploy/commander.env.",
             file=sys.stderr,
         )
     return 0 if result.ok else 1

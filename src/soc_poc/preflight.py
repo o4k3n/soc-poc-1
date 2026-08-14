@@ -9,12 +9,13 @@ Three checks per endpoint, in increasing order of how much they tell you:
   3. a real guided-JSON round trip -- the model actually produces schema-conformant,
                              non-empty content.
 
-Check 3 is the one that earns its keep on this box. On GB10/SM121 the gpt-oss MXFP4
-path can fall back to Marlin kernels that corrupt the first Harmony token, and the
-symptom is `content: null` with everything else looking healthy (vLLM issue #37030,
-open at time of writing). A reasoning-parser misconfiguration produces the same
-symptom. Either way you want to learn it here, in five seconds, rather than halfway
-through an investigation with a confusing schema error.
+Check 3 is the one that earns its keep. A server can pass both HTTP checks and still be
+unable to produce usable output: a reasoning-parser mismatch returns `content: null`
+with everything else looking healthy, and a bad quantization kernel produces the same
+symptom for a completely different reason. Either way you want to learn it here, in a
+few seconds, rather than halfway through an investigation with a confusing schema
+error. It also proves guided decoding works at all on this hardware and image, which is
+the assumption the entire grunt contract rests on.
 
 Preflight calls are logged to the transcript like any other LLM interaction.
 """

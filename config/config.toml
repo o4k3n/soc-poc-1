@@ -33,11 +33,11 @@ request_timeout_s = 900.0  # latency is explicitly a non-goal on this box
 extra_body = {}
 
 # --- Fallback commander -------------------------------------------------------------
-# gpt-oss-120b MXFP4 has an open kernel bug on GB10/SM121 (vLLM issue #37030): the
-# Marlin fallback path can emit a wrong first Harmony token and return content: null.
-# `make health` catches that on the spot. If it fires, comment out [models.commander]
-# above, uncomment this block, and start the commander container with
-# COMMANDER_MODEL/COMMANDER_SERVED_NAME overridden in deploy/commander.env.
+# The seam that makes the commander model disposable. If gpt-oss-120b fails to load, OOMs
+# against its memory fraction, or fails the guided-JSON check in `make health`, comment
+# out [models.commander] above, uncomment this block, and override
+# COMMANDER_MODEL/COMMANDER_SERVED_NAME in deploy/commander.env. The commander's contract
+# is a JSON schema; nothing in the orchestrator knows which model satisfies it.
 #
 # [models.commander]
 # role = "commander"

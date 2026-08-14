@@ -16,6 +16,7 @@ from soc_poc.config import RunConfig
 from soc_poc.llm.base import LLMClient, LLMTransportError
 from soc_poc.messages import GruntOutcome, PlanningResult
 from soc_poc.parsing import ParseFailure, parse_model_json
+from soc_poc.progress import NullProgress, ProgressSink
 from soc_poc.prompting import commander as prompts
 from soc_poc.schemas.alert import Alert
 from soc_poc.schemas.brief import BriefBody, CommanderPlan
@@ -59,7 +60,9 @@ async def plan_round(
     catalog: dict[str, LogSlice],
     outcomes: list[GruntOutcome],
     iteration: int,
+    progress: ProgressSink | None = None,
 ) -> PlanningResult:
+    progress = progress or NullProgress()
     base = prompts.build_planning_messages(
         alert=alert,
         summaries=summaries,
@@ -75,6 +78,7 @@ async def plan_round(
     problems: list[str] = []
 
     for attempt in range(1, max_attempts + 1):
+        progress.call_started("commander", PLAN_SCHEMA_NAME, None)
         try:
             response = await client.complete_json(
                 messages=messages,
@@ -82,9 +86,11 @@ async def plan_round(
                 json_schema=schema,
                 state=InvestigationState.PLANNING.value,
                 attempt=attempt,
+                on_token=progress.token if progress.wants_tokens else None,
             )
         except LLMTransportError as exc:
             return PlanningResult(ok=False, error=str(exc), attempts=attempt)
+        progress.call_finished("commander", response.latency_ms, attempt)
 
         try:
             plan = parse_model_json(response.text, CommanderPlan)
@@ -116,8 +122,10 @@ async def synthesize_brief(
     summaries: list[PatternSummary],
     outcomes: list[GruntOutcome],
     iteration_note: str,
+    progress: ProgressSink | None = None,
 ) -> tuple[BriefBody | None, str]:
     """Return (body, error). Exactly one of the two is meaningful."""
+    progress = progress or NullProgress()
     base = prompts.build_synthesis_messages(
         alert=alert,
         summaries=summaries,
@@ -130,6 +138,7 @@ async def synthesize_brief(
     problems: list[str] = []
 
     for attempt in range(1, max_attempts + 1):
+        progress.call_started("commander", BRIEF_SCHEMA_NAME, None)
         try:
             response = await client.complete_json(
                 messages=messages,
@@ -137,9 +146,11 @@ async def synthesize_brief(
                 json_schema=schema,
                 state=InvestigationState.SYNTHESIZING.value,
                 attempt=attempt,
+                on_token=progress.token if progress.wants_tokens else None,
             )
         except LLMTransportError as exc:
             return None, str(exc)
+        progress.call_finished("commander", response.latency_ms, attempt)
 
         try:
             body = parse_model_json(response.text, BriefBody)

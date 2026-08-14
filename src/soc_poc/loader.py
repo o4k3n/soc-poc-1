@@ -18,6 +18,7 @@ from pathlib import Path
 from soc_poc.schemas.alert import Alert
 from soc_poc.schemas.pattern_summary import LogPointer, PatternSummary
 from soc_poc.schemas.slice import LogLine, LogSlice
+from soc_poc.summarize import DEFAULT_MAX_SLICES, summarize_logs
 from soc_poc.validation.injection import InjectionSignal, scan_for_ai_directed_content
 
 
@@ -103,10 +104,24 @@ def all_known_refs(catalog: dict[str, LogSlice]) -> set[str]:
 
 
 def load_run_inputs(
-    alert_path: Path, patterns_dir: Path, logs_dir: Path
+    alert_path: Path,
+    patterns_dir: Path | None,
+    logs_dir: Path,
+    *,
+    max_slices: int = DEFAULT_MAX_SLICES,
 ) -> tuple[Alert, list[PatternSummary], dict[str, LogSlice]]:
+    """Load a run's inputs, generating pattern summaries when none were written.
+
+    `patterns_dir=None` means "nobody hand-wrote summaries for this case", and the
+    fallback summarizer stands in for the telemetry pipeline. A hand-written directory
+    always wins: it is the only way to point the commander at something specific.
+    """
     alert = load_alert(alert_path)
-    summaries = load_pattern_summaries(patterns_dir)
+    summaries = (
+        load_pattern_summaries(patterns_dir)
+        if patterns_dir is not None
+        else summarize_logs(logs_dir, max_slices=max_slices)
+    )
     catalog = build_slice_catalog(summaries, logs_dir)
     return alert, summaries, catalog
 

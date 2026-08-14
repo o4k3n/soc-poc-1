@@ -25,15 +25,18 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
 from soc_poc import commander as commander_agent
 from soc_poc.config import AppConfig
+from soc_poc.control import AbortMode, read_abort
 from soc_poc.grunt import run_grunt_task
 from soc_poc.llm.base import LLMClient
 from soc_poc.loader import all_known_refs
 from soc_poc.messages import GruntFailure, GruntOutcome, GruntTasking
+from soc_poc.progress import NullProgress, ProgressSink
 from soc_poc.schemas.alert import Alert
 from soc_poc.schemas.brief import (
     AlertRef,
@@ -70,6 +73,7 @@ class InvestigationContext(BaseModel):
     outcomes: tuple[GruntOutcome, ...] = ()
     request_followup: bool = False
     iteration_cap_hit: bool = False
+    aborted_by_operator: bool = False
     failure_reason: str = ""
     body: BriefBody | None = None
 
@@ -95,6 +99,8 @@ class Orchestrator:
         catalog: dict[str, LogSlice],
         injection_signals: list[InjectionSignal],
         investigation_id: str | None = None,
+        progress: ProgressSink | None = None,
+        run_dir: Path | None = None,
     ) -> None:
         self._config = config
         self._run = config.run
@@ -105,6 +111,9 @@ class Orchestrator:
         self._summaries = summaries
         self._catalog = catalog
         self._injection_signals = injection_signals
+        self._progress = progress or NullProgress()
+        # Where abort.py leaves its sentinel. None disables abort entirely (library use).
+        self._run_dir = run_dir
         self._known_refs = all_known_refs(catalog)
         self.investigation_id = investigation_id or f"inv-{uuid.uuid4().hex[:12]}"
         # The Registry: in-flight work, addressable by task id.
@@ -129,13 +138,21 @@ class Orchestrator:
 
         while context.state not in TERMINAL_STATES:
             previous = context.state
-            context = await self._step(context)
+            # Abort is polled at the state boundary, where the machine is quiescent:
+            # nothing is in flight, the context is a complete value, and routing to
+            # SYNTHESIZING or stopping outright is a normal transition rather than an
+            # interruption. SYNTHESIZING itself is exempt -- see states.py.
+            abort = self._check_abort(context)
+            context = abort if abort is not None else await self._step(context)
             assert_legal_transition(previous, context.state)
             self._transcript.log_state_transition(
                 from_state=previous.value,
                 to_state=context.state.value,
                 iteration=context.iteration,
                 note=context.failure_reason,
+            )
+            self._progress.state_changed(
+                previous.value, context.state.value, context.iteration
             )
 
         brief = self._assemble_brief(context) if context.body is not None else None
@@ -146,11 +163,74 @@ class Orchestrator:
                 "iterations_used": context.iteration,
                 "outcomes": len(context.outcomes),
                 "failures": sum(1 for o in context.outcomes if isinstance(o, GruntFailure)),
+                # Countable across the corpus later: which failure modes actually bite.
+                "failure_reasons": sorted(
+                    {o.reason for o in context.outcomes if isinstance(o, GruntFailure)}
+                ),
                 "failure_reason": context.failure_reason,
             },
         )
         return RunResult(
             terminal_state=context.state, brief=brief, failure_reason=context.failure_reason
+        )
+
+    # -- abort ------------------------------------------------------------------------
+
+    # States where nothing is in flight, so an abort can be honoured by returning a new
+    # context and nothing leaks. DISPATCHED and COLLECTING own live asyncio tasks and
+    # handle abort themselves in _on_collecting; SYNTHESIZING runs to completion.
+    _ABORTABLE_AT_BOUNDARY = frozenset(
+        {InvestigationState.RECEIVED, InvestigationState.PLANNING}
+    )
+
+    def _check_abort(self, context: InvestigationContext) -> InvestigationContext | None:
+        if self._run_dir is None or context.state not in self._ABORTABLE_AT_BOUNDARY:
+            return None
+        request = read_abort(self._run_dir)
+        if request is None:
+            return None
+        return self._abort_context(context, request.mode)
+
+    def _abort_context(
+        self, context: InvestigationContext, mode: AbortMode
+    ) -> InvestigationContext:
+        """Route an abort to the right state.
+
+        A graceful abort still owes the operator a brief -- that is the whole difference
+        between it and --hard. But synthesizing over zero collected reports spends two
+        minutes to say nothing, so an abort that lands before any outcome exists stops
+        outright regardless of mode.
+        """
+        hard = mode is AbortMode.HARD or not context.outcomes
+        reason = (
+            f"aborted by operator ({mode.value})"
+            + ("" if context.outcomes else "; no reports had been collected")
+        )
+        self._transcript.log_event(
+            "abort_requested",
+            {
+                "mode": mode.value,
+                "state": context.state.value,
+                "outcomes_collected": len(context.outcomes),
+                "brief_will_be_written": not hard,
+            },
+        )
+        self._progress.note(
+            f"abort ({mode.value}): "
+            + (
+                "stopping without a brief"
+                if hard
+                else f"synthesizing from {len(context.outcomes)} collected report(s)"
+            )
+        )
+        return context.model_copy(
+            update={
+                "state": InvestigationState.ABORTED_BY_OPERATOR
+                if hard
+                else InvestigationState.ABORTING,
+                "aborted_by_operator": True,
+                "failure_reason": reason,
+            }
         )
 
     async def _step(self, context: InvestigationContext) -> InvestigationContext:
@@ -160,6 +240,7 @@ class Orchestrator:
             InvestigationState.DISPATCHED: self._on_dispatched,
             InvestigationState.COLLECTING: self._on_collecting,
             InvestigationState.ABORTED_ITERATION_CAP: self._on_cap_reached,
+            InvestigationState.ABORTING: self._on_aborting,
             InvestigationState.SYNTHESIZING: self._on_synthesizing,
         }
         return await handlers[context.state](context)
@@ -179,6 +260,7 @@ class Orchestrator:
             catalog=self._catalog,
             outcomes=list(context.outcomes),
             iteration=context.iteration,
+            progress=self._progress,
         )
 
         if not result.ok or result.plan is None:
@@ -250,7 +332,9 @@ class Orchestrator:
         """
         for tasking in context.pending_taskings:
             self._registry[tasking.task_id] = asyncio.create_task(
-                run_grunt_task(tasking, self._grunt, self._run, self._transcript),
+                run_grunt_task(
+                    tasking, self._grunt, self._run, self._transcript, self._progress
+                ),
                 name=tasking.task_id,
             )
         self._transcript.log_event(
@@ -264,8 +348,30 @@ class Orchestrator:
         by_id = {tasking.task_id: tasking for tasking in context.pending_taskings}
         collected: list[GruntOutcome] = []
 
+        hard_abort = False
         for task_id, task in self._registry.items():
             tasking = by_id[task_id]
+
+            # A hard abort cancels the rest of the round rather than waiting it out.
+            # A graceful abort deliberately does not: letting in-flight readers finish
+            # is most of the difference between the two modes, and a grunt that is
+            # already running costs seconds.
+            if not hard_abort and self._run_dir is not None:
+                request = read_abort(self._run_dir)
+                if request is not None and request.mode is AbortMode.HARD:
+                    hard_abort = True
+
+            # Only work still running is cancelled. A task that already finished has a
+            # real report sitting in it, and throwing that away to label it "aborted"
+            # would be losing evidence the system paid for -- and lying about it in the
+            # ledger, which is worse.
+            if hard_abort and not task.done():
+                task.cancel()
+                collected.append(
+                    self._task_failure(tasking, "aborted", "cancelled by operator (--hard)")
+                )
+                continue
+
             try:
                 collected.append(await asyncio.wait_for(task, timeout=timeout))
             except asyncio.TimeoutError:
@@ -292,6 +398,23 @@ class Orchestrator:
         )
 
         next_iteration = context.iteration + 1
+
+        # An abort seen during collection decides the run's fate now that the registry
+        # is drained and every task has a record.
+        if self._run_dir is not None:
+            request = read_abort(self._run_dir)
+            if request is not None:
+                return self._abort_context(
+                    context.model_copy(
+                        update={
+                            "outcomes": outcomes,
+                            "pending_taskings": (),
+                            "iteration": next_iteration,
+                        }
+                    ),
+                    request.mode,
+                )
+
         if context.request_followup and next_iteration >= self._run.max_iterations:
             return context.model_copy(
                 update={
@@ -320,6 +443,10 @@ class Orchestrator:
             }
         )
 
+    async def _on_aborting(self, context: InvestigationContext) -> InvestigationContext:
+        """Graceful abort acknowledged: write up what we have."""
+        return context.model_copy(update={"state": InvestigationState.SYNTHESIZING})
+
     async def _on_cap_reached(self, context: InvestigationContext) -> InvestigationContext:
         """Hitting the cap is not an error; it is a coverage gap the brief must state."""
         self._transcript.log_event(
@@ -338,6 +465,12 @@ class Orchestrator:
                 " You requested a further round and the hard cap stopped you, so lines "
                 "you wanted read were not read. Say so in coverage_gaps."
             )
+        if context.aborted_by_operator:
+            note += (
+                " The operator aborted this investigation before it finished. Anything "
+                "not already read was not read; record that in coverage_gaps so nobody "
+                "mistakes an interrupted run for a complete one."
+            )
         body, error = await commander_agent.synthesize_brief(
             client=self._commander,
             transcript=self._transcript,
@@ -346,6 +479,7 @@ class Orchestrator:
             summaries=self._summaries,
             outcomes=list(context.outcomes),
             iteration_note=note,
+            progress=self._progress,
         )
         if body is None:
             return context.model_copy(
@@ -421,5 +555,6 @@ class Orchestrator:
             injection_signals=[signal.model_dump() for signal in self._injection_signals],
             iterations_used=context.iteration,
             terminal_state=context.state.value,
+            aborted_by_operator=context.aborted_by_operator,
             unresolved_citations=unresolved_brief_citations(cited, self._known_refs),
         )

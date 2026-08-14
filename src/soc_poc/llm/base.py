@@ -10,11 +10,16 @@ record/replay client, or a cost-accounting decorator all satisfy the same interf
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
 from soc_poc.config import ModelConfig
+
+# (channel, text) where channel is "reasoning" or "content". Passing one of these to
+# complete_json opts into the streaming transport; omitting it keeps the simpler
+# request/response path, which is the one the tests exercise.
+TokenCallback = Callable[[str, str], None]
 
 
 class LLMTransportError(RuntimeError):
@@ -34,6 +39,10 @@ class LLMResponse(BaseModel):
     finish_reason: str
     usage: dict[str, Any]
     latency_ms: float
+    # Reasoning-channel output, when the server separates it. Kept because it is the
+    # part of the corpus that shows *how* a conclusion was reached, which is what makes
+    # these transcripts worth collecting.
+    reasoning: str = ""
 
 
 class LLMClient(Protocol):
@@ -52,6 +61,7 @@ class LLMClient(Protocol):
         attempt: int,
         task_id: str | None = None,
         parent_task_id: str | None = None,
+        on_token: TokenCallback | None = None,
     ) -> LLMResponse: ...
 
     async def aclose(self) -> None: ...

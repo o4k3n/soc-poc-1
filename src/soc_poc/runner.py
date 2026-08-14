@@ -15,6 +15,7 @@ Output layout, one directory per run:
 from __future__ import annotations
 
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -22,12 +23,14 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from soc_poc.config import AppConfig
+from soc_poc.control import clear_marker, write_marker
 from soc_poc.llm.base import LLMClient
 from soc_poc.llm.stub_client import StubClient
 from soc_poc.llm.vllm_client import VLLMClient
 from soc_poc.loader import load_run_inputs, scan_catalog_for_injection, write_json
 from soc_poc.orchestrator import Orchestrator, RunResult
 from soc_poc.preflight import preflight
+from soc_poc.progress import NullProgress, ProgressSink
 from soc_poc.states import InvestigationState
 from soc_poc.transcript import TranscriptLogger
 
@@ -84,18 +87,42 @@ async def run_investigation(
     *,
     backend: Backend = "vllm",
     investigation_id: str | None = None,
+    progress: ProgressSink | None = None,
+    case_name: str = "",
+    patterns_dir_override: Path | None = None,
+    generate_patterns: bool = False,
 ) -> tuple[RunResult, RunPaths]:
+    # Timestamp for sorting, random suffix because a timestamp alone is only
+    # second-resolution: two runs started in the same second would share an output
+    # directory and interleave their transcripts, which would quietly corrupt the one
+    # artifact this PoC exists to produce.
     investigation_id = investigation_id or (
-        f"inv-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+        f"inv-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:4]}"
     )
     paths = make_paths(config, investigation_id)
+    progress = progress or NullProgress()
     transcript = TranscriptLogger(paths.transcript, investigation_id)
 
+    # `generate_patterns` means the case had no hand-written patterns/, so the fallback
+    # summarizer stands in for the telemetry pipeline (see summarize.py).
+    patterns_dir = (
+        None
+        if generate_patterns
+        else (patterns_dir_override or config.path(config.fixtures.patterns_dir))
+    )
     alert, summaries, catalog = load_run_inputs(
         config.path(config.fixtures.alert),
-        config.path(config.fixtures.patterns_dir),
+        patterns_dir,
         config.path(config.fixtures.logs_dir),
     )
+    if generate_patterns:
+        # Persist what the summarizer produced, so the run is reproducible and a summary
+        # worth keeping can be promoted into the case's own patterns/ directory.
+        for summary in summaries:
+            write_json(
+                paths.run_dir / "generated_patterns" / f"{summary.summary_id}.json",
+                summary.model_dump(),
+            )
     # Injection scan runs once over all raw content at load time; hits ride along to
     # the brief because an attempt to address an AI system is itself a signal.
     injection_signals = scan_catalog_for_injection(catalog)
@@ -111,6 +138,12 @@ async def run_investigation(
     )
 
     commander_client, grunt_client = _build_clients(config, backend, transcript)
+    write_marker(
+        paths.run_dir,
+        investigation_id=investigation_id,
+        case=case_name or str(config.path(config.fixtures.logs_dir).parent),
+        backend=backend,
+    )
 
     try:
         if backend == "vllm":
@@ -138,12 +171,17 @@ async def run_investigation(
             catalog=catalog,
             injection_signals=injection_signals,
             investigation_id=investigation_id,
+            progress=progress,
+            run_dir=paths.run_dir,
         )
         result = await orchestrator.run()
     finally:
         await commander_client.aclose()
         await grunt_client.aclose()
         transcript.close()
+        # The marker is how abort.py knows this run is alive. Leaving one behind would
+        # make a finished run look abortable forever.
+        clear_marker(paths.run_dir)
 
     if result.brief is not None:
         write_json(paths.brief, result.brief.model_dump())

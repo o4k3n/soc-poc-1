@@ -8,19 +8,35 @@
 #                                             cache, container runtime and orchestrator.
 #
 # `--gpu-memory-utilization` is a PER-INSTANCE fraction of TOTAL device memory, not of
-# free memory, which is exactly why two static fractions can coexist. Neither instance
-# is allowed to autodetect "all available memory": on a unified-memory box that would
-# starve the OS, and the second instance to start would lose.
+# free memory. That is not folklore -- it is what this build's own help text says:
+#
+#   "This is a per-instance limit, and only applies to the current vLLM instance. It
+#    does not matter if you have another vLLM instance running on the same GPU. For
+#    example, if you have two vLLM instances running on the same GPU, you can set the
+#    GPU memory utilization to 0.5 for each instance."
+#
+# The default is 0.92, and NVIDIA's own release notes call that out as the cause of OOM
+# on unified-memory systems (DGX Spark, Jetson). Neither instance is allowed to
+# autodetect here; both fractions are explicit, which is the documented fix.
 #
 # Startup order is not cosmetic. vLLM has a known memory-accounting issue when a second
 # instance starts while another is still profiling (vllm-project/vllm#10643), so the
 # grunt service waits on the commander's healthcheck. Start the big model first, always.
 #
-# VERIFY EVERYTHING BELOW against the image you actually pin. Flag names in this area
-# have churned across vLLM releases (`--structured-outputs-config.backend` was
-# `--guided-decoding-backend`; MXFP4 backend selection has moved between env vars and
-# CLI flags), and GB10/SM121 support is young. `make health` is the arbiter: if the
-# guided-JSON round trip passes on both ports, this file is right for your image.
+# --- image facts, verified by inspecting the pulled image (2026-08-11) ---------------
+#   nvcr.io/nvidia/vllm:26.07-py3   arm64
+#   vLLM 0.24.0+092c4842.dev, torch 2.13.0a0, CUDA 13.3.1
+#   ENTRYPOINT = /opt/nvidia/nvidia_entrypoint.sh, CMD = null
+#
+# That entrypoint is the generic NGC wrapper: it execs "$@" and nothing more. Unlike
+# upstream `vllm/vllm-openai`, whose ENTRYPOINT *is* `vllm serve`, the command below
+# must therefore start with `vllm serve` itself. Passing bare flags here gets you an
+# exec failure, not a server.
+#
+# There is deliberately no `runtime: nvidia`: this host registers only `runc` and
+# `io.containerd.runc.v2`. GPU access comes through the device reservation below (the
+# Compose spelling of `--gpus all`), which is verified working -- a container started
+# this way reports compute capability (12, 1).
 #
 # The ${...} values come from deploy/commander.env and deploy/grunt.env, which the
 # Makefile passes as --env-file so Compose can interpolate them here. Run this file
@@ -30,16 +46,16 @@
 name: soc-poc
 
 x-vllm-common: &vllm-common
-  # PIN THIS. `cu130-nightly` is the tested compatibility track for DGX Spark as of
-  # 2026-08, but a nightly tag moves under you. Once a run works, replace it with the
-  # image digest and keep that digest in the runbook.
-  image: vllm/vllm-openai:cu130-nightly
-  runtime: nvidia
+  image: nvcr.io/nvidia/vllm:26.07-py3
   ipc: host
   shm_size: "8gb"
-  restart: unless-stopped
+  # Bounded, not unless-stopped: a memory misconfiguration fails at engine init, and an
+  # unbounded restart policy turns that into a silent crash loop that looks like a slow
+  # load. Three tries, then it stays down and `make ps` shows you.
+  restart: on-failure:3
   volumes:
-    # Model weights are large; share one cache between both services.
+    # Model weights are large; share one cache between both services. Populate it with
+    # `make weights` BEFORE `make up` -- see the Makefile for why that matters.
     - ${HF_CACHE_DIR}:/root/.cache/huggingface
   deploy:
     resources:
@@ -57,7 +73,7 @@ services:
     ports:
       - "8000:8000"
     command: >
-      --model ${COMMANDER_MODEL}
+      vllm serve ${COMMANDER_MODEL}
       --served-model-name ${COMMANDER_SERVED_NAME}
       --host 0.0.0.0
       --port 8000
@@ -70,11 +86,12 @@ services:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 20s
       timeout: 5s
-      # gpt-oss-120b is ~60 GB of weights over ~273 GB/s: first load is slow, and a
-      # cold HF download is slower still. Be generous or you will fight your own
-      # healthcheck instead of the model.
-      retries: 60
-      start_period: 600s
+      # ~62 GB of weights over ~273 GB/s, plus torch.compile warmup on first boot. This
+      # window assumes `make weights` already populated the cache; a cold download would
+      # blow through it and leave the grunt service waiting forever on an unhealthy
+      # commander.
+      retries: 90
+      start_period: 900s
 
   grunt:
     <<: *vllm-common
@@ -89,7 +106,7 @@ services:
     # continuous batching inside this server; spawning an instance per agent would
     # duplicate the weights and shred the memory budget for no throughput gain.
     command: >
-      --model ${GRUNT_MODEL}
+      vllm serve ${GRUNT_MODEL}
       --served-model-name ${GRUNT_SERVED_NAME}
       --host 0.0.0.0
       --port 8001
@@ -102,5 +119,5 @@ services:
       test: ["CMD", "curl", "-fsS", "http://localhost:8001/health"]
       interval: 15s
       timeout: 5s
-      retries: 40
+      retries: 60
       start_period: 300s

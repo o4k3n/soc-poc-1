@@ -38,6 +38,20 @@ healthy; we never started).
 ABORTED_ITERATION_CAP is a real state rather than a boolean because "we stopped early"
 is something the operator must be able to read off the brief, and something the
 transcript must show as a transition.
+
+Operator aborts (see control.py and abort.py) get two states rather than one, because
+they mean two different things and a state that means two things is a bug waiting:
+
+  ABORTING              graceful. Stop planning further rounds, let in-flight grunts
+                        finish, then synthesize from whatever was collected. Routes to
+                        SYNTHESIZING exactly as ABORTED_ITERATION_CAP does.
+  ABORTED_BY_OPERATOR   terminal, no brief. Either `abort.py --hard`, or a graceful
+                        abort that arrived before a single outcome existed -- spending
+                        two minutes synthesizing a brief about nothing helps no one.
+
+Abort is checked at state boundaries and inside the collection loop. Once SYNTHESIZING
+starts it runs to completion: interrupting the one call that produces the artifact would
+throw away the whole run's product.
 """
 
 from __future__ import annotations
@@ -51,11 +65,13 @@ class InvestigationState(str, Enum):
     DISPATCHED = "DISPATCHED"
     COLLECTING = "COLLECTING"
     ABORTED_ITERATION_CAP = "ABORTED_ITERATION_CAP"
+    ABORTING = "ABORTING"
     SYNTHESIZING = "SYNTHESIZING"
     DONE = "DONE"
     FAILED_PREFLIGHT = "FAILED_PREFLIGHT"
     FAILED_PLANNING = "FAILED_PLANNING"
     FAILED_SYNTHESIS = "FAILED_SYNTHESIS"
+    ABORTED_BY_OPERATOR = "ABORTED_BY_OPERATOR"
 
 
 TERMINAL_STATES: frozenset[InvestigationState] = frozenset(
@@ -64,6 +80,7 @@ TERMINAL_STATES: frozenset[InvestigationState] = frozenset(
         InvestigationState.FAILED_PREFLIGHT,
         InvestigationState.FAILED_PLANNING,
         InvestigationState.FAILED_SYNTHESIS,
+        InvestigationState.ABORTED_BY_OPERATOR,
     }
 )
 
@@ -72,13 +89,19 @@ TERMINAL_STATES: frozenset[InvestigationState] = frozenset(
 # instead of producing an investigation nobody can reconstruct from the transcript.
 LEGAL_TRANSITIONS: dict[InvestigationState, frozenset[InvestigationState]] = {
     InvestigationState.RECEIVED: frozenset(
-        {InvestigationState.PLANNING, InvestigationState.FAILED_PREFLIGHT}
+        {
+            InvestigationState.PLANNING,
+            InvestigationState.FAILED_PREFLIGHT,
+            InvestigationState.ABORTED_BY_OPERATOR,
+        }
     ),
     InvestigationState.PLANNING: frozenset(
         {
             InvestigationState.DISPATCHED,
             InvestigationState.SYNTHESIZING,
             InvestigationState.FAILED_PLANNING,
+            InvestigationState.ABORTING,
+            InvestigationState.ABORTED_BY_OPERATOR,
         }
     ),
     InvestigationState.DISPATCHED: frozenset({InvestigationState.COLLECTING}),
@@ -87,9 +110,12 @@ LEGAL_TRANSITIONS: dict[InvestigationState, frozenset[InvestigationState]] = {
             InvestigationState.PLANNING,
             InvestigationState.SYNTHESIZING,
             InvestigationState.ABORTED_ITERATION_CAP,
+            InvestigationState.ABORTING,
+            InvestigationState.ABORTED_BY_OPERATOR,
         }
     ),
     InvestigationState.ABORTED_ITERATION_CAP: frozenset({InvestigationState.SYNTHESIZING}),
+    InvestigationState.ABORTING: frozenset({InvestigationState.SYNTHESIZING}),
     InvestigationState.SYNTHESIZING: frozenset(
         {InvestigationState.DONE, InvestigationState.FAILED_SYNTHESIS}
     ),
@@ -97,6 +123,7 @@ LEGAL_TRANSITIONS: dict[InvestigationState, frozenset[InvestigationState]] = {
     InvestigationState.FAILED_PREFLIGHT: frozenset(),
     InvestigationState.FAILED_PLANNING: frozenset(),
     InvestigationState.FAILED_SYNTHESIS: frozenset(),
+    InvestigationState.ABORTED_BY_OPERATOR: frozenset(),
 }
 
 

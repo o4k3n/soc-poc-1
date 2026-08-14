@@ -23,7 +23,7 @@ import re
 from typing import Any
 
 from soc_poc.config import ModelConfig
-from soc_poc.llm.base import LLMResponse
+from soc_poc.llm.base import LLMResponse, TokenCallback
 from soc_poc.transcript import Stopwatch, TranscriptLogger
 
 # Refs are read the way a model would read them: only from the fenced data block,
@@ -71,11 +71,21 @@ class StubClient:
         attempt: int,
         task_id: str | None = None,
         parent_task_id: str | None = None,
+        on_token: TokenCallback | None = None,
     ) -> LLMResponse:
         watch = Stopwatch()
         prompt = "\n".join(message.get("content", "") for message in messages)
         payload = self._respond(schema_name, prompt, attempt)
         text = json.dumps(payload, indent=2)
+
+        # Canned reasoning, emitted word by word so `--stub` exercises the same console
+        # path as a real run. Without this the offline demo would look nothing like the
+        # thing it is meant to stand in for.
+        reasoning = self._reasoning(schema_name, attempt)
+        if on_token is not None:
+            for word in reasoning.split(" "):
+                on_token("reasoning", word + " ")
+            on_token("content", text)
 
         self._transcript.log_llm_call(
             role=self.role,
@@ -89,7 +99,7 @@ class StubClient:
             params={"stub": True, "temperature": self.config.temperature},
             request_messages=messages,
             response_text=text,
-            raw_response={"stub": True},
+            raw_response={"stub": True, "reasoning": reasoning},
             finish_reason="stop",
             usage={"prompt_tokens": len(prompt) // 4, "completion_tokens": len(text) // 4},
             latency_ms=watch.elapsed_ms,
@@ -100,7 +110,25 @@ class StubClient:
             finish_reason="stop",
             usage={},
             latency_ms=watch.elapsed_ms,
+            reasoning=reasoning,
         )
+
+    def _reasoning(self, schema_name: str, attempt: int) -> str:
+        if attempt > 1:
+            return (
+                "The validator rejected the previous report because a cited line was not "
+                "in the slice. Re-reading the fenced lines and citing only those."
+            )
+        return {
+            "commander_plan": "Looking at the summaries, the periodic resolver traffic is "
+            "the thread worth pulling. Dispatching against the slices that contain it, "
+            "and one that could disconfirm it.",
+            "grunt_report": "Reading the slice line by line. Recording what is literally "
+            "present, and noting what I checked for and did not find.",
+            "investigation_brief": "Assembling the timeline from cited lines, then stating "
+            "each hypothesis with the evidence on both sides. No disposition -- that is "
+            "the operator's call.",
+        }.get(schema_name, "Working.")
 
     # -- canned bodies ---------------------------------------------------------------
 

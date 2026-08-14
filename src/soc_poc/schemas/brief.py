@@ -152,4 +152,10 @@ class InvestigationBrief(BaseModel):
     injection_signals: list[dict[str, str]] = Field(default_factory=list)
     iterations_used: int = 0
     terminal_state: str = ""
+    # Stamped by code, not written by the commander. A graceful abort ends in DONE --
+    # synthesis really did complete -- so without this field the artifact looks like a
+    # finished investigation. The commander is also asked to record the abort in
+    # coverage_gaps, but asking a model to disclose a limitation is not a guarantee;
+    # this is.
+    aborted_by_operator: bool = False
     unresolved_citations: list[str] = Field(default_factory=list)

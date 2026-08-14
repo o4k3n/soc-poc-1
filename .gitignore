@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
+# Real log data stays out of the repo; fixtures/ is the committed example.
+cases/

@@ -20,6 +20,7 @@ from soc_poc.config import RunConfig
 from soc_poc.llm.base import LLMClient, LLMTransportError
 from soc_poc.messages import GruntFailure, GruntOutcome, GruntSuccess, GruntTasking
 from soc_poc.parsing import ParseFailure, parse_model_json
+from soc_poc.progress import NullProgress, ProgressSink
 from soc_poc.prompting.grunt import build_grunt_messages, build_retry_messages
 from soc_poc.schemas.grunt import GruntReport
 from soc_poc.schemas.jsonschema import schema_for
@@ -55,8 +56,10 @@ async def run_grunt_task(
     client: LLMClient,
     run_config: RunConfig,
     transcript: TranscriptLogger,
+    progress: ProgressSink | None = None,
 ) -> GruntOutcome:
     """Run one task to completion. Always returns; never raises."""
+    progress = progress or NullProgress()
     schema = schema_for(GruntReport)
     messages = build_grunt_messages(tasking)
     max_attempts = run_config.max_validation_retries + 1
@@ -77,6 +80,9 @@ async def run_grunt_task(
             # Transport failures are not retried here: the orchestrator's timeout and
             # the operator's patience are the budget, and a dead endpoint will not
             # revive within one re-prompt.
+            progress.task_outcome(
+                tasking.task_id, tasking.data_slice.slice_id, f"transport: {exc}", ok=False
+            )
             return _failure(tasking, "transport", str(exc), attempt)
 
         try:
@@ -97,6 +103,14 @@ async def run_grunt_task(
         )
 
         if not problems and report is not None:
+            progress.task_outcome(
+                tasking.task_id,
+                tasking.data_slice.slice_id,
+                f"{len(report.observations)} observation(s), "
+                f"{len(report.negative_findings)} negative finding(s)"
+                + (f", {attempt} attempts" if attempt > 1 else ""),
+                ok=True,
+            )
             return GruntSuccess(
                 task_id=tasking.task_id,
                 iteration=tasking.iteration,
@@ -111,6 +125,12 @@ async def run_grunt_task(
             messages = build_retry_messages(tasking, response.text, problems)
 
     reason = "citations" if any("cite" in p or "raw_line_refs" in p for p in problems) else "schema"
+    progress.task_outcome(
+        tasking.task_id,
+        tasking.data_slice.slice_id,
+        f"rejected ({reason}): {problems[0] if problems else 'unknown'}",
+        ok=False,
+    )
     return _failure(
         tasking,
         reason,
