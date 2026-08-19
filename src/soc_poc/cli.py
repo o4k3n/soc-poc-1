@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from soc_poc.chunking import chunk_logs
 from soc_poc.config import AppConfig, FixtureConfig, load_config
 from soc_poc.progress import ConsoleProgress, NullProgress, ProgressSink
 from soc_poc.runner import run_investigation
+from soc_poc.stats import estimate_sweep, format_summary
 from soc_poc.states import InvestigationState
 
 DEFAULT_CONFIG = "config/config.toml"
@@ -69,11 +71,6 @@ def _apply_case(config: AppConfig, case: CaseLayout, args: argparse.Namespace) -
     )
 
 
-# Rough, from observed grunt latency on this box. Only used for the estimate printed
-# before a run; nothing depends on it being right.
-SECONDS_PER_GRUNT_CALL = 25
-
-
 def _preview(config: AppConfig, case: CaseLayout, out) -> int:
     """Show what the sweep will cost before it is spent.
 
@@ -90,7 +87,9 @@ def _preview(config: AppConfig, case: CaseLayout, out) -> int:
     slices = len(catalog)
     per_slice = max(1, total_lines // max(slices, 1))
     concurrency = config.run.max_concurrent_grunts
-    minutes = (slices / concurrency) * SECONDS_PER_GRUNT_CALL / 60
+    minutes, basis = estimate_sweep(
+        config.path(config.run.output_dir), slices=slices, concurrency=concurrency
+    )
 
     print(f"case      : {case.root}", file=out)
     print(f"logs      : {len(case.log_files)} file(s), {total_lines} lines", file=out)
@@ -102,10 +101,11 @@ def _preview(config: AppConfig, case: CaseLayout, out) -> int:
         )
     print(f"slices    : {slices} (~{per_slice} lines each)", file=out)
     print(
-        f"sweep     : {slices} grunt call(s), ~{minutes:.0f} min at {concurrency} "
+        f"sweep     : {slices} slice(s), ~{minutes:.0f} min at {concurrency} "
         f"concurrent — every line gets read",
         file=out,
     )
+    print(f"            estimate basis: {basis}", file=out)
     return slices
 
 
@@ -164,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\nterminal state : {result.terminal_state.value}")
     print(f"transcript     : {paths.transcript}")
+    if paths.transcript_pretty.exists():
+        print(f"  readable     : {paths.transcript_pretty}")
     if result.brief is not None:
         print(f"brief          : {paths.brief}")
         print(f"alert status   : {result.brief.alert_ref.status} (unchanged, detector-owned)")
@@ -188,6 +190,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"injection flags: {len(result.brief.injection_signals)}")
     if result.failure_reason:
         print(f"note           : {result.failure_reason}", file=sys.stderr)
+
+    if paths.stats.exists():
+        print(f"stats          : {paths.stats}")
+        try:
+            print(format_summary(json.loads(paths.stats.read_text(encoding="utf-8"))))
+        except (OSError, ValueError, KeyError):
+            pass
 
     return 0 if result.terminal_state is InvestigationState.DONE else 1
 

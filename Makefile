@@ -15,7 +15,7 @@ COMPOSE := HF_CACHE_DIR=$(HF_CACHE_DIR) docker compose \
 
 VLLM_IMAGE := nvcr.io/nvidia/vllm:26.07-py3
 
-.PHONY: setup weights up down logs ps health demo demo-offline abort test clean
+.PHONY: setup weights up down logs ps restart restart-grunt restart-commander health demo demo-offline abort test clean
 
 setup:              ## create venv and install the package (editable) + dev deps
 	python3 -m venv .venv
@@ -53,6 +53,24 @@ up:                 ## start both vLLM instances (commander first, grunt gated o
 
 ps:                 ## service state, including health
 	$(COMPOSE) ps
+
+# Restarting one service is the common case after editing deploy/*.env: the commander
+# takes ~8 minutes to load 62 GB of weights, so bouncing the whole stack to change a
+# grunt flag wastes a quarter of an hour. `docker compose up -d <svc>` recreates only
+# that container and picks up the new env; the other keeps serving throughout.
+restart:            ## restart one service, e.g. make restart SERVICE=grunt
+	@test -n "$(SERVICE)" || { echo "usage: make restart SERVICE=grunt|commander"; exit 2; }
+	$(COMPOSE) up -d --force-recreate --no-deps $(SERVICE)
+	@echo ">> waiting for $(SERVICE) to come back healthy (Ctrl-C is safe)"
+	@until [ "$$($(COMPOSE) ps --format json $(SERVICE) | $(PY) -c 		'import sys,json;print(json.loads(sys.stdin.read() or "{}").get("Health",""))')" = "healthy" ]; do 		sleep 5; 	done
+	@echo ">> $(SERVICE) healthy"
+	@$(COMPOSE) exec -T $(SERVICE) sh -lc 'echo ">> serving: $$(cat /proc/1/cmdline | tr "\0" " ")"' 2>/dev/null || true
+
+restart-grunt:      ## shorthand: restart the grunt fleet only
+	@$(MAKE) --no-print-directory restart SERVICE=grunt
+
+restart-commander:  ## shorthand: restart the commander only
+	@$(MAKE) --no-print-directory restart SERVICE=commander
 
 down:
 	$(COMPOSE) down

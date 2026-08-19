@@ -215,8 +215,15 @@ make weights        # fetch ~72 GB of weights into the shared HF cache
 make up             # start both vLLM instances (commander first)
 make health         # /health, served model name, guided-JSON round trip, both ports
 make ps             # service state, including health
+make restart-grunt  # bounce one service after editing deploy/*.env
 make down           # when you want the GPU back
 ```
+
+`make restart SERVICE=grunt` (or the `restart-grunt` / `restart-commander` shorthands)
+recreates a single container, waits for it to come back healthy, and prints the command
+line it is actually serving with so you can confirm a flag took. Use it rather than
+`make down && make up` after an env edit: the commander takes ~8 minutes to load 62 GB of
+weights, and bouncing the stack to change a grunt flag throws that away for nothing.
 
 `make weights` is not optional convenience. `openai/gpt-oss-120b` is 195.8 GB in full,
 but vLLM loads only the root `model-*-of-00014.safetensors` (~62 GB) — the rest is
@@ -269,10 +276,30 @@ Output, one directory per run:
 
 ```
 out/<investigation_id>/
-    transcript.jsonl        every LLM call, every state transition, every validation
+    transcript.jsonl        canonical: every LLM call, transition and validation, one
+                            JSON object per line, flushed as it goes
+    transcript.json         readable view of the same, written at close
     brief.json              the artifact for the operator (absent if the run failed)
     run_meta.json           config snapshot, model ids, git sha, terminal state
+    stats.json              performance counters, for comparing runs
 ```
+
+`transcript.jsonl` stays canonical because it is the only form a dying run can leave
+usable — a single pretty-printed array cannot be written incrementally. The readable view
+splits multi-line strings into arrays of lines, because indenting JSON does nothing for
+prompts: `\n` inside a string stays escaped however you format the document. Join a list
+with `\n` to recover the canonical string.
+
+`stats.json` carries what you want when comparing runs: wall clock and time per phase,
+per-role call counts, retries and latency spread, token usage, grunt rejection rate broken
+down by reason, and — from vLLM's own `/metrics`, snapshotted before and after and
+reported as deltas — server-side tokens, mean end-to-end latency, time to first token and
+**prefix-cache hit rate**. That last one is the number to watch on a sweep: every grunt
+shares a long identical prefix, so a low rate means it is being recomputed per call.
+Machine counters (GPU utilisation, power, temperature, host memory) are sampled every 5 s
+during the run. GPU memory is reported as `null` rather than zero — GB10 shares the host
+pool and `nvidia-smi` returns `[N/A]`, and an absent measurement is not a measurement of
+zero.
 
 `brief.json` carries two audit fields worth reading first: `unresolved_citations`
 (references that do not resolve to a real line) and `uncited_claims` (evidence written
@@ -332,8 +359,10 @@ This is why `make health` round-trips real guided JSON rather than just pinging
 `/health`, and why `llm/vllm_client.py` treats empty content as a transport error that
 names the likely suspect instead of handing an empty string to a JSON parser.
 
-If it fires: work through the flag ladder in `deploy/commander.env`, and if none of it
-works, swap the commander model (commented fallback block in `config/config.toml`). The
+If it fires: work through the flag ladder in `deploy/commander.env`, applying each
+candidate with `make restart-commander` and re-running `make health` — the round trip is
+the arbiter, so there is no point reasoning about which flag *should* work. If none of
+them do, swap the commander model (commented fallback block in `config/config.toml`). The
 investigation loop does not care which model is behind the schema.
 
 **If the commander OOMs** — `No available memory for the cache blocks`, which is what
@@ -343,6 +372,12 @@ investigation loop does not care which model is behind the schema.
 profiler prints the exact shortfall, including a suggested fraction, so read it rather
 than guessing.
 
+Memory fractions are the one change where `make restart-<service>` is the wrong tool.
+Moving memory between the two instances means both must re-profile, and they must do it in
+order — the grunt cannot claim its share until the commander has taken its own, which is
+what the healthcheck gate exists for. Use `make down && make up` for a fraction change;
+single-service restarts are for everything else.
+
 Because a memory misconfiguration fails at engine init, both services use
 `restart: on-failure:3` rather than `unless-stopped` — otherwise the failure presents as
 an endlessly "starting" container that looks like a slow load.
@@ -351,7 +386,8 @@ an endlessly "starting" container that looks like a slow load.
 which vLLM routes through DeepGEMM by default; on GB10 that dies at weight load with
 `Unknown SF transformation` from `layout.hpp` — DeepGEMM's scale-factor layout transform
 has no case for this architecture. `deploy/grunt.env` sets `VLLM_USE_DEEP_GEMM=0`, which
-falls back to the generic FP8 path. Recheck on a vLLM bump.
+falls back to the generic FP8 path. Recheck on a vLLM bump — `make restart-grunt` and
+`make health` will tell you in about two minutes, without disturbing the commander.
 
 **Two host-level gotchas**, both already handled in `deploy/`:
 
@@ -367,7 +403,9 @@ falls back to the generic FP8 path. Recheck on a vLLM bump.
 `--mxfp4-backend` / `--mxfp4-layers` recipes widely posted online are from earlier builds
 and are rejected by 0.24.0). Everything in `deploy/` was verified against
 `26.07-py3` by inspecting the image; re-verify when you bump the tag, and let
-`make health` be the arbiter.
+`make health` be the arbiter. `make restart SERVICE=<name>` prints the command line the
+container is actually serving with, which is the quickest way to confirm a flag was
+accepted rather than silently dropped.
 
 ---
 
@@ -439,7 +477,40 @@ had `raw_line_refs: []`, and every cited claim was true.** The correlation was p
   NS → `ns1.` → `45.77.203.118` delegation chain at `dns.log:L975-976` is the strongest
   evidence in the case; `dns-0013` cited L975 but described it as a TXT query, and the
   nameserver IP appears in no report at all.
-- **22% grunt validation failure rate** (24 of 109), almost all refs-cap violations
-  (25–38 references against a cap of 5). All recovered on retry, at ~24 extra calls.
 - **Findings double-count within a slice** — totals came to 817 against a ground truth of
   788.
+
+### The efficiency problem, and what fixed it
+
+The 83-slice run took **34.6 minutes against a 4.3-minute estimate**. Almost all of the
+overrun was one pathology:
+
+| | calls | median | total compute |
+|---|---|---|---|
+| normal | 112 | 39.4 s | 4,891 s |
+| **truncated** | **22** | **330.6 s** | **6,372 s** |
+
+**22 replies burned 57% of all grunt compute and every one was discarded.** They hit the
+3,072-token ceiling emitting indentation — a sampled reply was 92% whitespace. Guided
+decoding permits arbitrary whitespace between tokens, and a small model can fall into a
+low-entropy loop producing it. Three changes:
+
+- `--structured-outputs-config.disable_any_whitespace true` on the grunt server, which is
+  what that flag exists for. Measured after: **92% → 9% whitespace**.
+- Grunt `max_tokens` 3072 → **1400**, sized from data rather than guessed: across 112
+  successful reports the median completion was 313 tokens, p99 971, maximum 1125. A
+  runaway now fails fast and cheap instead of burning the full ceiling.
+- **`maxItems` is no longer stripped from the schema.** It was removed on an untested
+  assumption that xgrammar ignores it; it does not — a schema declaring `maxItems: 3`
+  returns exactly 3 when asked for 20. That converts the largest remaining failure class
+  (23 of 60 rejections were workers returning 25–38 references against a cap of 5) from
+  "reject and retry" into "cannot happen". `minItems` stays stripped, deliberately: a cap
+  stops over-production, a floor would force a worker to invent a citation it does not
+  have.
+
+**The estimate itself was the other half of the problem.** It multiplied slices by a
+hardcoded 25 s and divided by configured concurrency, ignoring retries (83 slices produced
+136 calls), the gap between configured and achieved concurrency (6.0 of 8), and the
+latency tail (median 41 s, p95 338 s). It now calibrates from the machine's own last real
+run using observed wall-clock seconds per slice, which contains all three by construction.
+It retro-predicts that run at 31.3 minutes against an actual 31.3.

@@ -44,8 +44,13 @@ class Finding(BaseModel):
     # How many lines in THIS slice match this finding. The commander sums these across
     # slices to get volume, which is the number that distinguishes a tunnel from a typo.
     match_count: int
-    # At most MAX_REPRESENTATIVE_REFS, each resolvable inside this slice.
-    representative_refs: list[str] = Field(default_factory=list)
+    # At most MAX_REPRESENTATIVE_REFS, each resolvable inside this slice. The cap is
+    # declared to the grammar (json_schema_extra, not a pydantic constraint) so the model
+    # physically cannot emit a sixth -- while validation/citations.py keeps checking it,
+    # so a backend that stops honouring maxItems cannot quietly uncap the contract.
+    representative_refs: list[str] = Field(
+        default_factory=list, json_schema_extra={"maxItems": MAX_REPRESENTATIVE_REFS}
+    )
     # Endpoints of the pattern within the slice, so the commander can build a timeline
     # without being handed every line.
     first_ref: str

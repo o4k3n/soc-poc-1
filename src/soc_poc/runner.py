@@ -7,14 +7,18 @@ to the offline stub.
 Output layout, one directory per run:
 
     out/<investigation_id>/
-        transcript.jsonl   every LLM call, every state transition, every validation
+        transcript.jsonl   canonical: every LLM call, transition and validation, one
+                           JSON object per line, flushed as it goes
+        transcript.json    readable view of the same thing, written at close
         brief.json         the artifact for the operator (absent if the run failed)
         run_meta.json      what produced it: config, models, git sha, terminal state
+        stats.json         performance counters, for comparing runs
 """
 
 from __future__ import annotations
 
 import subprocess
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,7 +36,8 @@ from soc_poc.orchestrator import Orchestrator, RunResult
 from soc_poc.preflight import preflight
 from soc_poc.progress import NullProgress, ProgressSink
 from soc_poc.states import InvestigationState
-from soc_poc.transcript import TranscriptLogger
+from soc_poc.stats import ResourceSampler, build_stats, capture_vllm_metrics
+from soc_poc.transcript import TranscriptLogger, render_pretty
 
 Backend = Literal["vllm", "stub"]
 
@@ -42,8 +47,10 @@ class RunPaths(BaseModel):
 
     run_dir: Path
     transcript: Path
+    transcript_pretty: Path
     brief: Path
     meta: Path
+    stats: Path
 
 
 def _git_sha(root: Path) -> str:
@@ -63,8 +70,10 @@ def make_paths(config: AppConfig, investigation_id: str) -> RunPaths:
     return RunPaths(
         run_dir=run_dir,
         transcript=run_dir / "transcript.jsonl",
+        transcript_pretty=run_dir / "transcript.json",
         brief=run_dir / "brief.json",
         meta=run_dir / "run_meta.json",
+        stats=run_dir / "stats.json",
     )
 
 
@@ -121,6 +130,11 @@ async def run_investigation(
         },
     )
 
+    endpoints = {"commander": config.commander.base_url, "grunt": config.grunt.base_url}
+    metrics_before = capture_vllm_metrics(endpoints) if backend == "vllm" else {}
+    sampler = ResourceSampler().start() if backend == "vllm" else None
+    started = time.monotonic()
+
     commander_client, grunt_client = _build_clients(config, backend, transcript)
     write_marker(
         paths.run_dir,
@@ -167,9 +181,40 @@ async def run_investigation(
         # make a finished run look abortable forever.
         clear_marker(paths.run_dir)
 
+    wall_clock_s = time.monotonic() - started
+    if sampler is not None:
+        sampler.stop()
+
     if result.brief is not None:
         write_json(paths.brief, result.brief.model_dump())
     _write_meta(config, paths, investigation_id, backend, result)
+
+    # Convenience artifacts, written last and guarded: a run that has already produced
+    # its brief must not fail because a readable view or a counter could not be written.
+    try:
+        render_pretty(paths.transcript, paths.transcript_pretty)
+        write_json(
+            paths.stats,
+            build_stats(
+                transcript_path=paths.transcript,
+                investigation_id=investigation_id,
+                case=case_name or str(config.path(config.fixtures.logs_dir).parent),
+                backend=backend,
+                terminal_state=result.terminal_state.value,
+                wall_clock_s=wall_clock_s,
+                metrics_before=metrics_before,
+                metrics_after=capture_vllm_metrics(endpoints) if backend == "vllm" else {},
+                sampler=sampler,
+                brief=result.brief,
+                inventory=inventory,
+                slice_count=len(catalog),
+                concurrency_configured=config.run.max_concurrent_grunts,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - a stats file is never worth a failed run
+        transcript_note = f"could not write run artifacts: {type(exc).__name__}: {exc}"
+        write_json(paths.run_dir / "artifacts_error.txt", transcript_note)
+
     return result, paths
 
 

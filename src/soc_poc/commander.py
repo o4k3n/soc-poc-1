@@ -29,6 +29,18 @@ from soc_poc.schemas.sweep import SweepDirective
 from soc_poc.states import InvestigationState
 from soc_poc.transcript import TranscriptLogger
 
+
+def _truncation_hint(response) -> list[str]:
+    """See grunt._truncation_hint -- a reply cut off at max_tokens is not malformed."""
+    if response.finish_reason != "length":
+        return []
+    return [
+        f"Your reply was cut off at the token limit "
+        f"({response.usage.get('completion_tokens', 'max')} tokens) -- it was not "
+        f"rejected for being malformed. Be more concise rather than restructuring."
+    ]
+
+
 TASKING_SCHEMA_NAME = "sweep_directive"
 PLAN_SCHEMA_NAME = "commander_plan"
 BRIEF_SCHEMA_NAME = "investigation_brief"
@@ -75,7 +87,7 @@ async def _call_with_retry(
             parsed = parse_model_json(response.text, model)
             problems = validate(parsed)
         except ParseFailure as exc:
-            parsed, problems = None, exc.problems
+            parsed, problems = None, _truncation_hint(response) + exc.problems
 
         transcript.log_event(
             event_kind, {"attempt": attempt, "ok": not problems, "problems": problems}

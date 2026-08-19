@@ -66,7 +66,16 @@ model = "qwen3-8b"
 api_key = "EMPTY"
 temperature = 0.1
 top_p = 0.9
-max_tokens = 3072
+# Measured, not guessed: across 112 successful sweep reports the median completion was
+# 313 tokens, p99 971, maximum 1125. 1400 leaves 25% headroom over the worst real report.
+#
+# The cap is a cost control, not a size limit. Guided decoding occasionally sends a small
+# model into a whitespace loop -- in the 83-slice run, 22 replies ran to the old 3072-token
+# ceiling emitting indentation (92% whitespace in the sample), each taking ~330s against a
+# 39s median, and all 22 were rejected. That single pathology burned 57% of all grunt
+# compute. A lower ceiling makes the failure cheap and fast; the real cure is
+# --structured-outputs-config.disable_any_whitespace on the grunt server.
+max_tokens = 1400
 request_timeout_s = 600.0
 # Qwen3 is a hybrid-reasoning model. Thinking blocks fight with guided decoding, so we
 # turn them off at the request level. VERIFY against your pinned vLLM/Qwen chat

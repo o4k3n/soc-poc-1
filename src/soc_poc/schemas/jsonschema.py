@@ -27,8 +27,12 @@ _STRIPPED_KEYWORDS = frozenset(
     {
         "default",
         "format",
+        # minItems stays stripped on purpose, and it is not the same call as maxItems.
+        # A cap stops a model over-producing, which is safe. A floor *forces* it to
+        # produce, and a worker required to emit at least one citation for a finding it
+        # cannot support will invent one -- trading a rejected report for a fabricated
+        # reference, which is the worse of the two.
         "minItems",
-        "maxItems",
         "minLength",
         "maxLength",
         "pattern",

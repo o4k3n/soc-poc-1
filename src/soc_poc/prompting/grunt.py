@@ -26,7 +26,12 @@ Rules:
 must not speculate about what is outside this slice.
 2. **Finding nothing is the expected answer.** Most slices in a sweep are ordinary \
 traffic. If nothing here bears on the alert, set relevant to false, record what you \
-looked for in checked_for, and stop. Do not manufacture a finding to seem useful.
+looked for with found=false, and stop. Do not manufacture a finding to seem useful.
+2a. **But if you did find it, say so as a finding.** checked_for is for things you looked \
+for and did NOT see. The moment you set found=true on anything, this slice is relevant: \
+set relevant to true and report it in findings with line references. Writing "found it in \
+line X" into checked_for while marking the slice irrelevant is the one shape that gets \
+your work discarded.
 3. Aggregate. If forty lines match the same pattern, that is ONE finding with \
 match_count 40 and at most {MAX_REPRESENTATIVE_REFS} representative_refs -- not forty \
 findings and not forty references. Set first_ref and last_ref to the earliest and latest \

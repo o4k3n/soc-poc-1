@@ -12,7 +12,12 @@ make an unlogged call cannot be constructed. If you are tempted to add an
 breaks the PoC's premise.
 
 Every record is one JSON object on one line, appended and flushed immediately, so a
-crashed run still leaves a readable partial transcript.
+crashed run still leaves a readable partial transcript. That property is why the JSONL
+stays canonical even though it is unpleasant to read: a single pretty-printed array
+cannot be written incrementally, so a run that dies mid-flight would leave a truncated
+document instead of a complete-up-to-here record.
+
+`render_pretty` produces the readable view at the end of a run, as a separate file.
 """
 
 from __future__ import annotations
@@ -130,6 +135,59 @@ class TranscriptLogger:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def _split_multiline(node: Any) -> Any:
+    """Render multi-line strings as arrays of lines.
+
+    Indenting JSON does nothing for the part of a transcript anyone actually wants to
+    read: prompts and responses are single strings, and `\n` inside a JSON string stays
+    escaped however you format the document. A 5 MB pretty file whose every prompt is one
+    unreadable line is not an improvement.
+
+    Splitting is lossless and reversible -- join a list back with "\n" to recover the
+    original string -- but it does mean the pretty file is a *view*, not a byte-identical
+    copy. transcript.jsonl remains canonical.
+    """
+    if isinstance(node, str):
+        return node.split("\n") if "\n" in node else node
+    if isinstance(node, list):
+        return [_split_multiline(item) for item in node]
+    if isinstance(node, dict):
+        return {key: _split_multiline(value) for key, value in node.items()}
+    return node
+
+
+def render_pretty(jsonl_path: Path, out_path: Path) -> int:
+    """Write a human-readable view of a transcript. Returns the record count.
+
+    Never raises on a malformed line: this runs at the end of a run, including an aborted
+    one, and failing to produce a convenience file must not be able to take down a run
+    that has already done its work.
+    """
+    records: list[Any] = []
+    try:
+        with jsonl_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(_split_multiline(json.loads(line)))
+                except json.JSONDecodeError:
+                    # A partial final line is exactly what a crashed run leaves behind.
+                    records.append({"kind": "unparseable_line", "raw": line[:500]})
+    except OSError:
+        return 0
+
+    try:
+        out_path.write_text(
+            json.dumps(records, indent=2, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        return 0
+    return len(records)
 
 
 class Stopwatch:

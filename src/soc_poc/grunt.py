@@ -31,6 +31,25 @@ from soc_poc.validation.citations import validate_report_citations
 GRUNT_SCHEMA_NAME = "grunt_report"
 
 
+def _truncation_hint(response) -> list[str]:
+    """A reply cut off at max_tokens is not a malformed reply.
+
+    Observed live: a grunt hit the 3072-token cap emitting indentation and the parser
+    reported "not valid JSON", so the retry told it to return one JSON object -- which is
+    exactly what it had been doing. Naming the real cause is the difference between a
+    useful retry and a wasted one.
+    """
+    if response.finish_reason != "length":
+        return []
+    return [
+        f"Your reply was cut off at the token limit "
+        f"({response.usage.get('completion_tokens', 'max')} tokens) -- it was not "
+        f"rejected for being malformed. Almost always this means you listed too much: "
+        f"report an aggregate (match_count plus at most a handful of "
+        f"representative_refs) instead of enumerating lines."
+    ]
+
+
 def _failure(
     tasking: GruntTasking,
     reason: str,
@@ -89,7 +108,7 @@ async def run_grunt_task(
             report = parse_model_json(response.text, GruntReport)
             problems = validate_report_citations(report, tasking.data_slice)
         except ParseFailure as exc:
-            problems = exc.problems
+            problems = _truncation_hint(response) + exc.problems
             report = None  # type: ignore[assignment]
 
         transcript.log_event(
