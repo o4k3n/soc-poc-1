@@ -31,6 +31,12 @@ class LogSlice(BaseModel):
     reason: str  # why this slice is being shown to this grunt
     start_line: int
     end_line: int
+    # The file's format preamble (Zeek's #fields/#types, or similar), reproduced on every
+    # slice from the file. It is NOT part of `lines` and is not citable -- it exists so a
+    # worker reading window 57 knows what the columns mean. Without it, the first real run
+    # had 78 of 79 slices reading anonymous tab-separated fields, and the brief went out
+    # claiming the logs contained no DNS answers when column 22 was full of them.
+    format_header: list[str] = Field(default_factory=list)
     lines: list[LogLine] = Field(default_factory=list)
 
     def refs(self) -> set[str]:

@@ -182,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
             print("interrupted    : yes — this brief covers only what was read before the abort")
         if result.brief.unresolved_citations:
             print(f"unresolved refs: {len(result.brief.unresolved_citations)}")
+        if result.brief.uncited_claims:
+            print(f"uncited claims : {len(result.brief.uncited_claims)} (see brief.json)")
         if result.brief.injection_signals:
             print(f"injection flags: {len(result.brief.injection_signals)}")
     if result.failure_reason:

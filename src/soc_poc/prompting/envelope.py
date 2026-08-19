@@ -50,6 +50,18 @@ def fence_log_slice(log_slice: LogSlice) -> str:
         }
     )
     body = "\n".join(f"{line.ref}\t{line.text}" for line in log_slice.lines)
+    if log_slice.format_header:
+        # Reproduced from the top of the file so a worker reading window 57 knows what the
+        # columns are. Marked as not-citable: these lines are not part of this slice, and a
+        # reference to one would not resolve.
+        preamble = "\n".join(f"  {line}" for line in log_slice.format_header)
+        body = (
+            f"[format header for {log_slice.file}, reproduced from the top of the file "
+            f"-- context only, NOT part of this slice and NOT citable]\n"
+            f"{preamble}\n"
+            f"[end format header; the citable lines of this slice follow]\n"
+            f"{body}"
+        )
     return f"{FENCE_OPEN} {header}\n{body}\n{FENCE_CLOSE}"
 
 

@@ -3,6 +3,9 @@
 Every slice in the case is read by one grunt, so most grunts find nothing. That shapes
 the schema in two ways that matter:
 
+  * **A check that found something is not a negative.** `CheckedFor.found` makes the
+    difference explicit, and the validator refuses a report that claims irrelevance while
+    recording a hit.
   * **`relevant` is a first-class field.** "I read these 70 lines and none of them bear on
     the alert" is the common answer, and it has to be cheap to say and cheap to render.
     Collapsed together, those answers are what makes the brief's coverage claim true.
@@ -50,16 +53,24 @@ class Finding(BaseModel):
     confidence: Confidence
 
 
-class NegativeFinding(BaseModel):
-    """An explicit "I looked for X here and it was not present".
+class CheckedFor(BaseModel):
+    """The record of a check: what was looked for, and whether it was there.
 
-    Load-bearing in a sweep: with total coverage, the negatives are what turn silence into
-    evidence of absence rather than absence of evidence.
+    Load-bearing in a sweep: with total coverage, the negatives are what turn silence
+    into evidence of absence rather than absence of evidence.
+
+    `found` exists because free text was not enough. In the first real run a worker wrote
+    `{"checked_for": "DHCP lease for 10.12.34.56", "result": "Found in line dhcp.log:L4"}`
+    into a report it had marked irrelevant -- a true positive, phrased as a check. The
+    aggregation layer dropped it and the brief went out saying the lease did not exist.
+    A boolean makes that contradiction detectable (see validation/citations.py) instead of
+    something a downstream string match has to guess at.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     checked_for: str
+    found: bool
     result: str
 
 
@@ -84,4 +95,4 @@ class GruntReport(BaseModel):
     # orchestrator collapses these into a single coverage line for the commander.
     relevant: bool
     findings: list[Finding] = Field(default_factory=list)
-    checked_for: list[NegativeFinding] = Field(default_factory=list)
+    checked_for: list[CheckedFor] = Field(default_factory=list)

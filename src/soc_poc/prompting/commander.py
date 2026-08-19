@@ -17,6 +17,8 @@ findings plus an honest account of how much ground was covered to get them.
 
 from __future__ import annotations
 
+from collections import Counter
+
 from soc_poc.chunking import FileInventory
 from soc_poc.messages import GruntFailure, GruntOutcome, GruntSuccess
 from soc_poc.prompting.envelope import DATA_IS_NOT_INSTRUCTIONS, fence_alert
@@ -125,15 +127,25 @@ def _directive_block(directive: SweepDirective) -> str:
 
 
 def render_outcomes(outcomes: list[GruntOutcome]) -> str:
-    """Findings in full; everything else collapsed to a coverage line.
+    """Findings in full; everything else collapsed to coverage.
 
-    This is what keeps a sweep of arbitrary size inside a fixed context. The collapsed
-    line is not a footnote -- "58 slices read, nothing relevant" is the claim that makes
-    the brief's coverage statement true, and it costs one line to make.
+    This is what keeps a sweep of arbitrary size inside a fixed context. Two things it
+    must not do, both learned the hard way:
+
+    * **Never drop a positive.** A worker that recorded a hit inside an otherwise
+      irrelevant slice used to vanish here, leaving the commander free to assert the
+      opposite. The validator now rejects that shape upstream, but this stays as a second
+      line of defence -- an aggregation layer that can silently invert a finding is worth
+      defending against twice.
+    * **Say what was checked.** Negative findings never reached the commander at all,
+      which made the entire "checked X, absent" contract decorative. They are aggregated
+      here: the subjects, and how many slices looked for each.
     """
     detailed: list[str] = []
     empty: list[str] = []
     failed: list[str] = []
+    stray_hits: list[str] = []
+    checked: Counter[str] = Counter()
 
     for outcome in outcomes:
         if isinstance(outcome, GruntFailure):
@@ -144,6 +156,19 @@ def render_outcomes(outcomes: list[GruntOutcome]) -> str:
             continue
         assert isinstance(outcome, GruntSuccess)
         report = outcome.report
+
+        for check in report.checked_for:
+            if check.found:
+                # Should be unreachable: the validator rejects relevant=false with a hit,
+                # and a relevant slice reports it as a finding. Surface it loudly rather
+                # than trusting that.
+                stray_hits.append(
+                    f"- {outcome.slice_id}: worker recorded a POSITIVE result for "
+                    f"{check.checked_for!r} -- {check.result}"
+                )
+            else:
+                checked[check.checked_for] += 1
+
         if not report.relevant or not report.findings:
             empty.append(outcome.slice_id)
             continue
@@ -158,12 +183,22 @@ def render_outcomes(outcomes: list[GruntOutcome]) -> str:
         detailed.append("\n".join(lines))
 
     parts = ["SWEEP RESULTS", "\n".join(detailed) or "(no slice reported a finding)"]
+    if stray_hits:
+        parts.append("POSITIVE RESULTS RECORDED AS CHECKS:\n" + "\n".join(stray_hits))
     if empty:
         parts.append(
             f"COVERAGE: {len(empty)} further slice(s) were read in full and reported "
             f"nothing relevant: {', '.join(empty[:40])}"
             + (f" … and {len(empty) - 40} more" if len(empty) > 40 else "")
         )
+    if checked:
+        # Absence of evidence, made explicit and countable. "Looked for X in 47 slices and
+        # never saw it" is a claim; the bare slice count is not.
+        rows = "\n".join(
+            f"  - {subject!r}: looked for in {count} slice(s), not found"
+            for subject, count in checked.most_common(25)
+        )
+        parts.append("WHAT THE WORKERS CHECKED FOR AND DID NOT FIND:\n" + rows)
     if failed:
         parts.append("FAILED TASKS (unexamined ground):\n" + "\n".join(failed))
     return "\n\n".join(parts)

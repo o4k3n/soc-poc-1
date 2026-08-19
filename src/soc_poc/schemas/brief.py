@@ -162,3 +162,9 @@ class InvestigationBrief(BaseModel):
     # this is.
     aborted_by_operator: bool = False
     unresolved_citations: list[str] = Field(default_factory=list)
+    # Evidence and timeline entries the commander wrote with no line reference at all.
+    # Stamped by code, non-blocking: some claims are legitimately uncitable ("no
+    # host-level telemetry was in scope"). But in the first real run the correlation was
+    # perfect -- every false statement in the brief was uncited and every cited statement
+    # was true -- so the operator should be able to see which claims cannot be checked.
+    uncited_claims: list[str] = Field(default_factory=list)

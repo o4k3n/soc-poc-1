@@ -47,6 +47,10 @@ DEFAULT_SLICE_TOKEN_BUDGET = 10_000
 REF_OVERHEAD_TOKENS = 12
 # Below this, slices get so small that prompt scaffolding dominates the call.
 MIN_LINES_PER_SLICE = 10
+# Leading comment lines reproduced on every slice of a file so workers can read its
+# columns. Zeek writes 8; the cap stops a file with a 300-line licence banner from eating
+# the slice budget.
+MAX_PREAMBLE_LINES = 12
 
 _ISO_TS = re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b")
 _SYSLOG_TS = re.compile(r"\b[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\b")
@@ -68,6 +72,21 @@ class FileInventory(BaseModel):
     line_count: int
     time_range: str
     slice_count: int
+
+
+def _preamble(lines: list[str]) -> list[str]:
+    """The contiguous run of leading comment lines, if any.
+
+    Zeek's dns.log opens with #separator/#fields/#types; syslog and JSONL have none. Only
+    `#`-prefixed lines are taken, which is conservative: a format whose header is a bare
+    first row is left alone rather than guessed at.
+    """
+    header: list[str] = []
+    for line in lines[:MAX_PREAMBLE_LINES]:
+        if not line.startswith("#"):
+            break
+        header.append(line)
+    return header
 
 
 def _time_range(lines: list[str]) -> str:
@@ -139,7 +158,12 @@ def chunk_file(
     chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
 ) -> tuple[list[LogSlice], FileInventory]:
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    windows = _pack(lines, slice_token_budget, chars_per_token)
+    header = _preamble(lines)
+    # The header rides on every slice, so it comes out of the budget before packing --
+    # otherwise reintroducing it silently pushes slices back over the context limit, which
+    # is the exact failure this module exists to prevent.
+    header_cost = sum(len(line) / chars_per_token for line in header)
+    windows = _pack(lines, max(500, int(slice_token_budget - header_cost)), chars_per_token)
     time_range = _time_range(lines)
     total = len(lines)
 
@@ -156,6 +180,7 @@ def chunk_file(
             ),
             start_line=first,
             end_line=last,
+            format_header=header,
             lines=[LogLine(ref=f"{path.name}:L{n}", text=lines[n - 1])
                    for n in range(first, last + 1)],
         )

@@ -630,11 +630,20 @@ class Orchestrator:
         body = context.body
 
         cited: list[str] = []
-        for event in body.timeline:
+        uncited: list[str] = []
+        for index, event in enumerate(body.timeline):
             cited.extend(event.raw_line_refs)
-        for hypothesis in body.hypotheses:
-            for evidence in (*hypothesis.supporting_evidence, *hypothesis.contradicting_evidence):
-                cited.extend(evidence.raw_line_refs)
+            if not event.raw_line_refs:
+                uncited.append(f"timeline[{index}]: {event.description[:120]}")
+        for h_index, hypothesis in enumerate(body.hypotheses):
+            for field in ("supporting_evidence", "contradicting_evidence"):
+                for e_index, evidence in enumerate(getattr(hypothesis, field)):
+                    cited.extend(evidence.raw_line_refs)
+                    if not evidence.raw_line_refs:
+                        uncited.append(
+                            f"hypotheses[{h_index}].{field}[{e_index}]: "
+                            f"{evidence.description[:120]}"
+                        )
 
         ledger = [
             TaskLedgerEntry(
@@ -677,4 +686,5 @@ class Orchestrator:
             terminal_state=context.state.value,
             aborted_by_operator=context.aborted_by_operator,
             unresolved_citations=unresolved_brief_citations(cited, self._known_refs),
+            uncited_claims=uncited,
         )

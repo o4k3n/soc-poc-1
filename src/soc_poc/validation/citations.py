@@ -11,7 +11,10 @@ Three failure modes are caught here:
     interesting one, because it is exactly what a model does when it is pattern-matching
     rather than reading;
   * more references than the contract allows -- the schema declares a cap, but a grammar
-    constrains shape and cannot count, so the cap is re-checked here.
+    constrains shape and cannot count, so the cap is re-checked here;
+  * a report that claims the slice is irrelevant while recording a hit in `checked_for`.
+    That one is not hypothetical: it is how the first real run produced a brief denying a
+    DHCP lease that a worker had correctly found.
 
 All are validation failures. The caller re-prompts once with the message below (the model
 is told precisely which reference did not resolve) and, failing that, records an explicit
@@ -58,6 +61,19 @@ def validate_report_citations(report: GruntReport, log_slice: LogSlice) -> list[
         problems.append(
             "relevant is false but findings were returned. Set relevant to true if this "
             "slice contains anything bearing on the alert, or remove the findings."
+        )
+
+    # The DHCP case: a worker recorded "Found in line dhcp.log:L4" as a check and marked
+    # the slice irrelevant anyway. The collapse then dropped it and the brief asserted the
+    # opposite. A hit is a finding, and a finding needs citations -- so this is rejected
+    # and the retry turns it into one.
+    hits = [c.checked_for for c in report.checked_for if c.found]
+    if not report.relevant and hits:
+        problems.append(
+            f"relevant is false, but checked_for records a positive result for "
+            f"{', '.join(repr(h) for h in hits)}. If you found it, this slice IS relevant: "
+            f"set relevant to true and report it as a finding with line references. Use "
+            f"found=false only for things you looked for and did not see."
         )
 
     for index, finding in enumerate(report.findings):

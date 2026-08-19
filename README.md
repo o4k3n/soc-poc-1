@@ -105,11 +105,14 @@ Prompts are a courtesy. These four are structural, and they hold when the prompt
 2. **Every claim carries a citation, and citations are checked.** Guided decoding
    guarantees `representative_refs` is a list of strings; only Python can know whether
    `dns.log:L142` was in the slice *that particular grunt* was handed.
-   `validation/citations.py` checks exactly that, plus the reference cap and that
-   `match_count` is consistent with what was cited — a grammar constrains shape and
-   cannot count. A finding with no citation, or a fabricated one, is a validation failure:
-   the worker is re-prompted once with the specific error and then recorded as a failure.
-   Uncheckable claims do not reach the operator.
+   `validation/citations.py` checks exactly that, plus the reference cap, that
+   `match_count` is consistent with what was cited, and that a report claiming the slice
+   is irrelevant has not simultaneously recorded a hit — a grammar constrains shape and
+   cannot count or cross-check. A finding with no citation, or a fabricated one, is a
+   validation failure: the worker is re-prompted once with the specific error and then
+   recorded as a failure. At brief level, evidence written with no reference at all is
+   listed in `uncited_claims` — non-blocking, because some claims are legitimately
+   uncitable, but visible.
 3. **The alert's status never round-trips through a model.** `AlertRef` in the finished
    brief is built by `orchestrator._assemble_brief` copying the inbound alert. No model
    sees it as an output field.
@@ -271,6 +274,10 @@ out/<investigation_id>/
     run_meta.json           config snapshot, model ids, git sha, terminal state
 ```
 
+`brief.json` carries two audit fields worth reading first: `unresolved_citations`
+(references that do not resolve to a real line) and `uncited_claims` (evidence written
+with no reference at all).
+
 ### Watching a run
 
 `analyze.py` streams the commander's reasoning live to stderr as it plans and
@@ -391,42 +398,48 @@ to the detection system.
 
 ## What the real runs showed
 
-Typical timings on this box: commander plan 28–39 s, synthesis 84–119 s, grunt reports
-8–52 s, ~9 minutes for a full 8-task investigation over 2 drill-down rounds. The briefs
-are decent — competing hypotheses with evidence on both sides, concrete drill-downs, and
-coverage gaps that accurately name what went unread.
+Typical timings: commander directive ~20 s, drill-down plan ~31 s, synthesis ~95 s, grunt
+reports median 43 s. A 1 MB case (83 slices) is ~16 minutes end to end at 8-way batching.
 
-Four findings worth carrying into the next iteration. All of them are the kind of thing
-this skeleton exists to surface, and all of them are visible *because* claims have to
-cite something checkable.
+### The DNS-tunnel run, and what it cost to be wrong
 
-1. **The citation contract leaks at the commander level.** Grunts cite correctly —
-   across several runs, essentially every grunt report passed the citation validator on
-   its first attempt. The commander does not, and produces unresolvable references in at
-   least three shapes: *ranges* (`dns_resolver.log:L5-L24`), *pattern-summary ids*
-   (`ps-dns-beacon-interval`), and *alert-envelope fields* (`external_alert:domain`,
-   `proxy_events.jsonl:negative`). Mostly this is not the model's fault: the evidence
-   genuinely came from a precomputed statistic, an alert field, or a whole window, and
-   `raw_line_refs` is the only field on offer, so everything gets jammed into it. **The
-   brief schema needs an evidence-source union** — cite a line as a line, a summary as a
-   summary, the alert as the alert. This is the clearest next change.
-2. **An 8B grunt writes labels, not observations.** Descriptions came back as
-   `"DNS query record"`, `"Timestamps of beacon queries"` — schema-valid, correctly
-   cited, and informationally empty. Guided decoding guarantees a string; nothing
-   guarantees the string says anything.
-3. **A grunt emitted a confidently wrong negative finding**, reporting
-   `"Regular interval pattern between beacon queries — Not found"` for a slice in which
-   it had *simultaneously* listed the beacon timestamps five minutes apart. The commander
-   propagated it into the brief as contradicting evidence. Negative findings are
-   load-bearing for the operator, and this one was false — the most useful failure so far.
-4. **The commander reasons about its own constraints.** With reasoning streamed live, an
-   aborted run shows it working through *"the operator aborted before finishing
-   investigation; we need to note that remaining logs not examined"* — the abort notice
-   in the synthesis prompt reached it and shaped the coverage gaps. Encouraging, and also
-   the reason the structural `aborted_by_operator` flag exists: behaviour that good is
-   still behaviour, not a guarantee.
+`cases/dns-tunnel`, 81 slices, **zero task failures**, `DONE`. The sweep worked: 33 slices
+reported findings covering the tunnel, 52 correctly reported nothing, and only one decoy
+produced a grunt-level false positive that never reached the brief.
 
-Both abort paths have been exercised against the live endpoints. Graceful: four in-flight
-readers finished, `COLLECTING → ABORTING → SYNTHESIZING → DONE`, brief written with
-accurate gaps. Hard: four in-flight tasks cancelled and recorded with reason `aborted`,
-no brief, transcript intact.
+The brief still contained two confidently false statements, and **both were mine, not the
+model's**:
+
+1. *"DHCP logs contain no lease entry for 10.12.34.56."* The DHCP worker had found it, and
+   said so: `{"checked_for": "DHCP lease for 10.12.34.56", "result": "Found in line
+   dhcp.log:L4 and dhcp.log:L8"}` — but marked the slice `relevant: false`, and the
+   collapse rendered irrelevant slices as a bare slice id. A worker read the evidence
+   correctly and the aggregation layer inverted it. Fixed three ways: `CheckedFor.found`
+   makes the contradiction expressible, the validator rejects it, and the collapse
+   surfaces a stray positive rather than dropping it.
+2. *"No DNS response payloads were captured; the logs only contain query records."* Every
+   tunnel query carries a base32 TXT answer — the exfiltration channel itself. Zeek's
+   `#fields` preamble existed only in slice 1, so 78 of 79 slices were 23 anonymous
+   tab-separated columns. Fixed: the format header now rides on every slice, charged
+   against the token budget so reintroducing it cannot push slices over the context limit.
+
+Also observed, and the reason `uncited_claims` exists: **every false claim in the brief
+had `raw_line_refs: []`, and every cited claim was true.** The correlation was perfect.
+
+### Still open
+
+- **Grunts restate the indicator instead of describing what they saw.** ~30 findings
+  shared one near-identical sentence. Across every report: `base32` 0 mentions, `encod` 0,
+  `hex` 0, `burst` 0, `interval` 0. The "expensive grep" outcome the prompt warns against.
+- **The timeline had 2 entries**, both restating the alert's own timestamps, both uncited,
+  from 788 tunnel queries across 5 sessions. The narrative was 172 characters.
+- **`explicitly_irrelevant` suppressed the best evidence.** The directive excluded
+  "DNS queries of type A, AAAA, MX, CNAME, **NS**, SOA that are not to
+  api-sync-telemetry.net" — a qualifier a small model drops. The
+  NS → `ns1.` → `45.77.203.118` delegation chain at `dns.log:L975-976` is the strongest
+  evidence in the case; `dns-0013` cited L975 but described it as a TXT query, and the
+  nameserver IP appears in no report at all.
+- **22% grunt validation failure rate** (24 of 109), almost all refs-cap violations
+  (25–38 references against a cap of 5). All recovered on retry, at ~24 extra calls.
+- **Findings double-count within a slice** — totals came to 817 against a ground truth of
+  788.

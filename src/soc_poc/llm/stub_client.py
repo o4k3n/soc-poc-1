@@ -207,6 +207,7 @@ class StubClient:
                 "checked_for": [
                     {
                         "checked_for": "lines matching the directive's indicators",
+                        "found": False,
                         "result": "none present in this slice",
                     }
                 ],
@@ -238,6 +239,7 @@ class StubClient:
             "checked_for": [
                 {
                     "checked_for": "successful A-record responses with routable answers",
+                    "found": False,
                     "result": "none present in this slice",
                 }
             ],
