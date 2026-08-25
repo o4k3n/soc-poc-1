@@ -1,31 +1,37 @@
-"""Commander-side calls: write the sweep directive, request drill-downs, synthesize.
+"""Commander-side calls: decide the next action, and synthesize the brief.
 
-Like the grunt worker, these return values rather than raising across the agent
-boundary, and each gets exactly one feedback-carrying retry. The validation they apply is
-the part the grammar cannot: a directive must actually say something, and a drill-down
-plan must name slices that exist.
+Like the grunt worker, these return values rather than raising across the agent boundary,
+and each gets exactly one feedback-carrying retry. The validation they apply is the part
+the grammar cannot: an action must name a file that exists and carry the arguments its
+verb needs.
 
-What is deliberately absent: any code path that lets a commander response influence the
-alert's status, and any code path that puts a log line in front of the commander. The
-brief's AlertRef is stamped by the orchestrator from the inbound alert, and the prompts in
-prompting/commander.py carry the alert, the file inventory, and worker reports -- never
-raw data.
+The commander now reads log lines, which is a deliberate reversal. Under the sweep
+architecture it never saw data -- the argument being that a commander which picks what to
+read cannot produce a meaningful negative. That argument was sound and the implementation
+still failed, because the workers doing the reading did not reliably notice what they read.
+Coverage now comes from `corpus.count()`, which is exact and re-runnable by hand, so
+letting the analyst see its own evidence costs nothing it was actually buying.
+
+What remains deliberately absent: any code path that lets a commander response influence
+the alert's status. The brief's AlertRef is stamped by the orchestrator from the inbound
+alert and never passes through a model.
 """
 
 from __future__ import annotations
 
-from soc_poc.chunking import FileInventory
+from soc_poc.coercion import coerce_action_payload
 from soc_poc.config import RunConfig
+from soc_poc.evidence import Evidence
 from soc_poc.llm.base import LLMClient, LLMTransportError
-from soc_poc.messages import GruntOutcome, PlanningResult, TaskingResult
+from soc_poc.messages import ActionResult
 from soc_poc.parsing import ParseFailure, parse_model_json
+from soc_poc.profiling import CaseProfile
 from soc_poc.progress import NullProgress, ProgressSink
-from soc_poc.prompting import commander as prompts
+from soc_poc.prompting import investigate as prompts
+from soc_poc.schemas.action import InvestigativeAction, validate_action
 from soc_poc.schemas.alert import Alert
-from soc_poc.schemas.brief import BriefBody, CommanderPlan
+from soc_poc.schemas.brief import BriefBody
 from soc_poc.schemas.jsonschema import schema_for
-from soc_poc.schemas.slice import LogSlice
-from soc_poc.schemas.sweep import SweepDirective
 from soc_poc.states import InvestigationState
 from soc_poc.transcript import TranscriptLogger
 
@@ -41,8 +47,7 @@ def _truncation_hint(response) -> list[str]:
     ]
 
 
-TASKING_SCHEMA_NAME = "sweep_directive"
-PLAN_SCHEMA_NAME = "commander_plan"
+ACTION_SCHEMA_NAME = "investigative_action"
 BRIEF_SCHEMA_NAME = "investigation_brief"
 
 
@@ -58,6 +63,8 @@ async def _call_with_retry(
     run_config: RunConfig,
     validate,
     event_kind: str,
+    retry_builder=None,
+    coerce=None,
 ):
     """Shared shape: call, parse, validate, re-prompt once with the error, give up.
 
@@ -84,7 +91,7 @@ async def _call_with_retry(
         progress.call_finished("commander", response.latency_ms, attempt)
 
         try:
-            parsed = parse_model_json(response.text, model)
+            parsed = parse_model_json(response.text, model, coerce=coerce)
             problems = validate(parsed)
         except ParseFailure as exc:
             parsed, problems = None, _truncation_hint(response) + exc.problems
@@ -95,113 +102,84 @@ async def _call_with_retry(
         if parsed is not None and not problems:
             return parsed, [], ""
         if attempt < max_attempts:
-            messages = prompts.build_retry_messages(base, response.text, problems)
+            build = retry_builder or prompts.build_action_retry_messages
+            messages = build(base, response.text, problems)
 
     return None, problems, f"rejected after {max_attempts} attempt(s): {problems}"
 
 
-def _validate_directive(directive: SweepDirective) -> list[str]:
-    problems: list[str] = []
-    if not directive.relevance_criteria.strip():
-        problems.append(
-            "relevance_criteria is empty. It is the field the workers actually reason "
-            "with; without it they can only string-match."
-        )
-    if not directive.indicators and not directive.relevance_criteria.strip():
-        problems.append("give the workers at least one indicator or a relevance rule.")
-    return problems
-
-
-async def write_directive(
+async def decide_action(
     *,
     client: LLMClient,
     transcript: TranscriptLogger,
     run_config: RunConfig,
     alert: Alert,
-    inventory: list[FileInventory],
-    total_slices: int,
+    profile: CaseProfile,
+    evidence: Evidence,
+    file_names: list[str],
+    line_counts: dict[str, int],
+    steps_remaining: int,
+    steps_taken: int = 0,
+    min_steps: int = 0,
     progress: ProgressSink | None = None,
-) -> TaskingResult:
-    """TASKING: the alert goes in, a notion of relevance comes out. No log data."""
+) -> ActionResult:
+    """INVESTIGATING: alert + profile + everything seen so far goes in, one action comes out."""
     progress = progress or NullProgress()
-    base = prompts.build_tasking_messages(
-        alert=alert, inventory=inventory, total_slices=total_slices
-    )
-    directive, _, error = await _call_with_retry(
-        client=client,
-        transcript=transcript,
-        progress=progress,
-        base=base,
-        schema_name=TASKING_SCHEMA_NAME,
-        model=SweepDirective,
-        state=InvestigationState.TASKING,
-        run_config=run_config,
-        validate=_validate_directive,
-        event_kind="commander_directive_validation",
-    )
-    if directive is None:
-        return TaskingResult(ok=False, error=error)
-    return TaskingResult(ok=True, directive=directive)
-
-
-async def plan_drilldown(
-    *,
-    client: LLMClient,
-    transcript: TranscriptLogger,
-    run_config: RunConfig,
-    alert: Alert,
-    directive: SweepDirective,
-    catalog: dict[str, LogSlice],
-    outcomes: list[GruntOutcome],
-    iteration: int,
-    progress: ProgressSink | None = None,
-) -> PlanningResult:
-    """PLANNING: after the sweep, ask for closer reads of specific slices."""
-    progress = progress or NullProgress()
-    base = prompts.build_drilldown_messages(
+    base = prompts.build_investigate_messages(
         alert=alert,
-        directive=directive,
-        outcomes=outcomes,
-        iteration=iteration,
-        max_tasks=run_config.max_tasks_per_iteration,
-        remaining_iterations=run_config.max_iterations - iteration,
+        profile=profile,
+        evidence=evidence,
+        file_names=file_names,
+        line_counts=line_counts,
+        steps_remaining=steps_remaining,
     )
 
-    def validate(plan: CommanderPlan) -> list[str]:
-        problems: list[str] = []
-        if len(plan.tasks) > run_config.max_tasks_per_iteration:
-            problems.append(
-                f"plan requests {len(plan.tasks)} tasks but the limit for this round is "
-                f"{run_config.max_tasks_per_iteration}."
+    def validate(action: InvestigativeAction) -> list[str]:
+        # ActionProblem carries a field name the retry prompt uses; _call_with_retry
+        # speaks in plain strings, so flatten here and let the retry builder re-split.
+        return [
+            f"{problem.field}: {problem.message}"
+            for problem in validate_action(
+                action,
+                known_files=file_names,
+                steps_taken=steps_taken,
+                min_steps=min_steps,
             )
-        for index, task in enumerate(plan.tasks):
-            if task.slice_id not in catalog:
-                problems.append(
-                    f"tasks[{index}].slice_id {task.slice_id!r} is not a slice in this "
-                    f"case. Dispatch only against slice_ids that appear in the sweep "
-                    f"results."
-                )
-            if not task.commander_intent.strip():
-                problems.append(
-                    f"tasks[{index}].commander_intent is empty; state the hypothesis."
-                )
-        return problems
+        ]
 
-    plan, _, error = await _call_with_retry(
+    action, _, error = await _call_with_retry(
         client=client,
         transcript=transcript,
         progress=progress,
         base=base,
-        schema_name=PLAN_SCHEMA_NAME,
-        model=CommanderPlan,
-        state=InvestigationState.PLANNING,
+        schema_name=ACTION_SCHEMA_NAME,
+        model=InvestigativeAction,
+        state=InvestigationState.INVESTIGATING,
         run_config=run_config,
         validate=validate,
-        event_kind="commander_plan_validation",
+        event_kind="commander_action_validation",
+        retry_builder=_plain_retry,
+        coerce=coerce_action_payload,
     )
-    if plan is None:
-        return PlanningResult(ok=False, error=error)
-    return PlanningResult(ok=True, plan=plan)
+    if action is None:
+        return ActionResult(ok=False, error=error)
+    return ActionResult(ok=True, action=action)
+
+
+def _plain_retry(
+    base: list[dict[str, str]], previous_output: str, problems: list[str]
+) -> list[dict[str, str]]:
+    listed = "\n".join(f"  - {problem}" for problem in problems)
+    return base + [
+        {"role": "assistant", "content": previous_output},
+        {
+            "role": "user",
+            "content": (
+                "That action could not be executed:\n"
+                f"{listed}\n\nIssue a corrected action."
+            ),
+        },
+    ]
 
 
 async def synthesize_brief(
@@ -210,15 +188,18 @@ async def synthesize_brief(
     transcript: TranscriptLogger,
     run_config: RunConfig,
     alert: Alert,
-    directive: SweepDirective,
-    outcomes: list[GruntOutcome],
+    profile: CaseProfile,
+    evidence: Evidence,
     coverage_note: str,
     progress: ProgressSink | None = None,
 ) -> tuple[BriefBody | None, str]:
     """Return (body, error). Exactly one of the two is meaningful."""
     progress = progress or NullProgress()
     base = prompts.build_synthesis_messages(
-        alert=alert, directive=directive, outcomes=outcomes, coverage_note=coverage_note
+        alert=alert,
+        profile=profile,
+        evidence=evidence,
+        coverage_note=coverage_note,
     )
     body, _, error = await _call_with_retry(
         client=client,
@@ -231,5 +212,6 @@ async def synthesize_brief(
         run_config=run_config,
         validate=lambda _: [],
         event_kind="commander_brief_validation",
+        retry_builder=_plain_retry,
     )
     return body, error

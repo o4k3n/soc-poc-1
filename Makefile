@@ -15,7 +15,7 @@ COMPOSE := HF_CACHE_DIR=$(HF_CACHE_DIR) docker compose \
 
 VLLM_IMAGE := nvcr.io/nvidia/vllm:26.07-py3
 
-.PHONY: setup weights up down logs ps restart restart-grunt restart-commander health demo demo-offline abort test clean
+.PHONY: setup weights weights-qwen38 weights-qwen38-int4 up down logs ps restart restart-grunt restart-commander health demo demo-offline abort grade test clean
 
 setup:              ## create venv and install the package (editable) + dev deps
 	python3 -m venv .venv
@@ -48,29 +48,99 @@ snapshot_download('openai/gpt-oss-120b', ignore_patterns=['metal/*', 'original/*
 snapshot_download('Qwen/Qwen3-8B-FP8'); \
 print('weights ready')"
 
+# Deliberately a separate target, not folded into `weights`. It is 55.6 GB for a model
+# that is not the configured commander, so it should never be pulled as a side effect of
+# preparing an ordinary run.
+#
+# No ignore_patterns here: unlike gpt-oss-120b (which ships metal/ and original/ copies
+# vLLM never loads), this repo's 18 safetensors are all the ones that get loaded.
+#
+# See the "Alternative commander" blocks in config/config.toml and deploy/commander.env
+# for what to change after this lands, and why 131072 rather than the native 262144.
+weights-qwen38:     ## fetch Qwen/Qwen3.8-27B (~56 GB) to trial it as the commander
+	@echo ">> fetching Qwen/Qwen3.8-27B (~56 GB) into $(HF_CACHE_DIR)"
+	@echo ">> this is NOT the configured commander; see config/config.toml to switch"
+	@mkdir -p $(HF_CACHE_DIR)
+	docker run --rm \
+		-v $(HF_CACHE_DIR):/root/.cache/huggingface \
+		--entrypoint python3 $(VLLM_IMAGE) -c "\
+from huggingface_hub import snapshot_download; \
+snapshot_download('Qwen/Qwen3.8-27B'); \
+print('Qwen3.8-27B ready')"
+
+# The 4-bit build, and the one actually worth running on this box. Measured from the repo:
+# 21.0 GB of compressed-tensors W4A16 against the official checkpoint's 55.6 GB of BF16.
+#
+# Why this rather than the official Qwen/Qwen3.8-27B-FP8 (30.9 GB): that checkpoint ships
+# `weight_block_size: [128, 128]`, i.e. block-wise FP8 scales, which vLLM routes through
+# DeepGEMM -- the exact path that fails at weight load on GB10 with "Unknown SF
+# transformation" (see deploy/grunt.env). compressed-tensors uses Marlin kernels and never
+# touches DeepGEMM, so the faster option is also the safer one here.
+weights-qwen38-int4: ## fetch the 4-bit Qwen3.8-27B (~21 GB) -- the fast commander trial
+	@echo ">> fetching cyankiwi/Qwen3.8-27B-AWQ-INT4 (~21 GB) into $(HF_CACHE_DIR)"
+	@mkdir -p $(HF_CACHE_DIR)
+	docker run --rm \
+		-v $(HF_CACHE_DIR):/root/.cache/huggingface \
+		--entrypoint python3 $(VLLM_IMAGE) -c "\
+from huggingface_hub import snapshot_download; \
+snapshot_download('cyankiwi/Qwen3.8-27B-AWQ-INT4'); \
+print('Qwen3.8-27B-AWQ-INT4 ready')"
+
 up:                 ## start both vLLM instances (commander first, grunt gated on its health)
 	$(COMPOSE) up -d
 
 ps:                 ## service state, including health
 	$(COMPOSE) ps
 
-# Restarting one service is the common case after editing deploy/*.env: the commander
-# takes ~8 minutes to load 62 GB of weights, so bouncing the whole stack to change a
-# grunt flag wastes a quarter of an hour. `docker compose up -d <svc>` recreates only
-# that container and picks up the new env; the other keeps serving throughout.
+# Restarting the GRUNT alone is safe and is the common case: it is a ~9 GB model, the
+# commander is already resident, and there is room for both.
+#
+# Restarting the COMMANDER alone is NOT safe, and this target refuses to try. Its
+# checkpoint is 62 GB against 121 GB of unified memory that the GPU and the OS share. If
+# the grunt is resident it is holding ~28 GiB, which leaves less room than the checkpoint
+# needs: the kernel reclaims page cache faster than the loader can stream, and the load
+# thrashes forever. It does not crash, it does not OOM-kill, it does not restart -- it
+# sits at "Starting to load model" with memory sawtoothing between ~28 and ~60 GB, which
+# is a far worse failure than an error, because it looks like progress.
+#
+# The commander has to come up into an empty box, which is exactly the ordering `make up`
+# already enforces via the grunt's healthcheck gate. So: full cycle, no shortcut.
 restart:            ## restart one service, e.g. make restart SERVICE=grunt
-	@test -n "$(SERVICE)" || { echo "usage: make restart SERVICE=grunt|commander"; exit 2; }
+	@test -n "$(SERVICE)" || { echo "usage: make restart SERVICE=grunt"; exit 2; }
+	@if [ "$(SERVICE)" = "commander" ]; then \
+		echo "refusing: the commander cannot be restarted on its own."; \
+		echo "  Its 62 GB checkpoint does not fit alongside a resident grunt in 121 GB of"; \
+		echo "  unified memory. The load will thrash indefinitely rather than fail."; \
+		echo "  Use:  make restart-commander   (full ordered cycle, ~10 min)"; \
+		exit 2; \
+	fi
 	$(COMPOSE) up -d --force-recreate --no-deps $(SERVICE)
-	@echo ">> waiting for $(SERVICE) to come back healthy (Ctrl-C is safe)"
-	@until [ "$$($(COMPOSE) ps --format json $(SERVICE) | $(PY) -c 		'import sys,json;print(json.loads(sys.stdin.read() or "{}").get("Health",""))')" = "healthy" ]; do 		sleep 5; 	done
-	@echo ">> $(SERVICE) healthy"
+	@echo ">> waiting for $(SERVICE) to come back healthy"
+	@$(MAKE) --no-print-directory wait-healthy SERVICE=$(SERVICE)
 	@$(COMPOSE) exec -T $(SERVICE) sh -lc 'echo ">> serving: $$(cat /proc/1/cmdline | tr "\0" " ")"' 2>/dev/null || true
 
-restart-grunt:      ## shorthand: restart the grunt fleet only
+# Progress matters here: an 8-minute silent wait is indistinguishable from a hang, which
+# is how the thrashing load above got mistaken for a crash. Print what the loader is
+# doing every 15s.
+wait-healthy:
+	@while :; do \
+		state=$$($(COMPOSE) ps --format json $(SERVICE) | $(PY) -c \
+			'import sys,json;print(json.loads(sys.stdin.read() or "{}").get("Health",""))'); \
+		[ "$$state" = "healthy" ] && { echo ">> $(SERVICE) healthy"; break; }; \
+		printf '   [%s] %s — %s\n' "$$(date +%H:%M:%S)" "$$state" \
+			"$$($(COMPOSE) logs --tail 1 $(SERVICE) 2>/dev/null | tr '\r' '\n' | tail -1 | cut -c1-100)"; \
+		sleep 15; \
+	done
+
+restart-grunt:      ## restart the grunt fleet only (safe; commander keeps serving)
 	@$(MAKE) --no-print-directory restart SERVICE=grunt
 
-restart-commander:  ## shorthand: restart the commander only
-	@$(MAKE) --no-print-directory restart SERVICE=commander
+restart-commander:  ## restart the commander (full ordered cycle — see comment above)
+	@echo ">> the commander must load into an empty box; cycling the whole stack"
+	$(COMPOSE) down
+	$(COMPOSE) up -d
+	@$(MAKE) --no-print-directory wait-healthy SERVICE=commander
+	@$(MAKE) --no-print-directory wait-healthy SERVICE=grunt
 
 down:
 	$(COMPOSE) down
@@ -89,6 +159,13 @@ demo-offline:       ## same code path, stub LLM backend, no GPU required
 
 abort:              ## gracefully stop the running investigation (see ./abort.py --help)
 	$(PY) abort.py
+
+# Mechanical only: it checks whether each planted fact was reached, whether it was backed
+# by the right line reference, and whether any decoy was cited as evidence. Whether the
+# brief reads well is still a human call.
+grade:              ## grade a run against its case's ground truth, e.g. make grade RUN=out/inv-xxxx
+	@test -n "$(RUN)" || { echo "usage: make grade RUN=out/inv-xxxx"; exit 2; }
+	$(PY) scripts/grade.py $(RUN)
 
 test:
 	$(PY) -m pytest -q

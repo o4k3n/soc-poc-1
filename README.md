@@ -4,14 +4,21 @@ A lab proof of concept on a single NVIDIA DGX Spark (GB10, 128 GB unified memory
 ~273 GB/s). An external detection system raises an alert; this system investigates
 around it.
 
-A **commander** model reads the alert — and only the alert — and writes a sweep
-directive saying what would be relevant. Every slice of every log file is then read by a
-**grunt** worker carrying that directive. The commander reasons over what they bring
-back and synthesizes an investigation brief for a human SOC operator.
+A **commander** model reads the alert and a **computed profile** of the case — line-shape
+frequencies, rare shapes, high-entropy token groups, activity bursts, all counted in code
+with no model involved. It then investigates by issuing one search at a time against the
+raw logs, seeing each result before deciding the next question, and finally synthesizes an
+investigation brief for a human SOC operator.
 
-**The commander never sees a log line.** That is not a restriction, it is what makes the
-brief's coverage claim true: if the commander chose which slices to read, "we found
-nothing else" would only ever mean "nothing else in the part it picked".
+**Coverage is arithmetic, not attendance.** `count` over the corpus is exact and the
+operator can re-run it with `grep` in milliseconds. Every step lands in the brief's ledger
+with the shell command that reproduces it.
+
+The earlier design instead swept every slice of every file through a fleet of **grunt**
+workers, on the argument that if every line is read by a model then a negative means
+something. Six graded runs disproved the premise — reading is not noticing. See
+"Why the sweep is gone" below. Grunts survive as `close_read`: a bounded line range handed
+to a worker for one specific question the commander wrote, when counting cannot answer it.
 
 The brief supports the operator. **It never renders a verdict.**
 
@@ -30,42 +37,52 @@ that survives being ported to Elixir/OTP are.
     ┌──────────────────────────────────────────────────────────┐
     │  orchestrator  (explicit state machine, states.py)        │
     │                                                          │
-    │  RECEIVED → TASKING      alert in, sweep directive out    │
-    │                 │        (no log data reaches it here)    │
-    │                 ▼                                         │
-    │             SWEEPING     EVERY slice → a grunt            │
-    │                 │        bounded by concurrency, not      │
-    │                 ▼        by a coverage budget             │
-    │             COLLECTING ──┐                                │
-    │                 │        │ drill-down (commander names    │
-    │                 │        └─ slice_ids the sweep flagged)  │
-    │                 ▼                                         │
-    │             SYNTHESIZING → DONE                           │
-    │                 ▲                                         │
-    │  ./abort.py ─► ABORTING   ABORTED_BY_OPERATOR             │
-    │                (write up) (--hard: stop dead)             │
+    │  RECEIVED → PROFILING    count the corpus. No model runs  │
+    │                 │        here, so nothing it produces     │
+    │                 ▼        can be a hallucination.          │
+    │           INVESTIGATING ◄─┐  commander emits ONE action    │
+    │                 │         │                                │
+    │                 ▼         │  we execute it and append the  │
+    │             EXECUTING ────┘  result to the evidence ledger │
+    │                 │                                          │
+    │                 ▼  (conclude, or the step budget)          │
+    │             SYNTHESIZING → DONE                            │
+    │                 ▲                                          │
+    │  ./abort.py ─► ABORTING   ABORTED_BY_OPERATOR              │
+    │                (write up) (--hard: stop dead)              │
     └───────┬───────────────────────────────┬──────────────────┘
             │ typed messages only           │
             ▼                               ▼
-   commander (port 8000)            grunt fleet (port 8001)
+   commander (port 8000)            grunt (port 8001)
    gpt-oss-120b, MXFP4              Qwen3-8B-FP8, ONE instance
-   directive + synthesis            continuous batching, 8 at a time
+   actions + synthesis              close_read only, on demand
             │                               │
             └──────► every call ────────────┘
                      transcript.jsonl (full prompt + response, always)
 ```
 
-**Commander** sees: the alert, a bare file inventory (names, line counts, time ranges —
-never content), and its workers' reports, including their failures.
+**The six actions.** `search` (regex; exact total count plus up to 40 lines), `count`
+(the number alone — cheap, use it to test a guess), `context` (the lines around a
+reference), `read_lines` (a range verbatim), `close_read` (hand a bounded range to a
+worker with one question), `conclude` (stop and write the brief).
 
-**Each grunt** sees: the sweep directive and one fenced slice. Nothing else — no sibling
-reports, no alert envelope, no history. Isolation is what makes each task checkable and
-what makes it a supervised Task in the Elixir port.
+**The commander proposes; the orchestrator disposes.** An action is a JSON object the
+model emits and `actions.py` executes. The model never runs anything, and the set of
+things that *can* be run is those six verbs over files already in memory. Guided decoding
+against a flat schema, not native tool-calling: guided decoding has been the most reliable
+component of this stack, while every model-side parsing convention touched here has
+produced a silent failure at least once, and tool-calling would put the newest parser in
+the hot path of every step.
 
-**Reports are aggregates.** A grunt that matches 400 lines returns a count, the first and
-last reference, and at most five representative citations — never 400 refs. Slices that
-found nothing collapse into a single coverage line. That is what lets a sweep of any size
-land inside the commander's fixed context: ~80 reports become ~5k tokens instead of ~24k.
+**Commander** sees: the alert, the computed profile, the file names and line counts, and
+the evidence ledger — every question it has asked and the lines it was shown. Recent steps
+render in full; older ones collapse to their summary, keeping their exact counts. That
+bound is what makes the context flat: on the 1 MB DNS case, 4 steps cost ~6,350 tokens and
+24 steps cost ~6,930.
+
+**A close_read grunt** sees: one fenced line range, its column header, and the one question
+asked of it. Nothing else — no sibling reports, no history. Isolation is what makes each
+task checkable and what makes it a supervised Task in the Elixir port.
 
 Read `PORTING.md` next; it explains why several things are shaped the way they are.
 
@@ -75,15 +92,19 @@ Read `PORTING.md` next; it explains why several things are shaped the way they a
 |---|---|
 | `analyze.py` / `abort.py` | the two entry points; everything else is library code |
 | `src/soc_poc/casedir.py` | case-folder discovery and validation, with fixable errors |
-| `src/soc_poc/chunking.py` | token-aware chunking; every line lands in exactly one slice |
+| `src/soc_poc/corpus.py` | the case's log files, searchable by line; every result carries its ref |
+| `src/soc_poc/profiling.py` | the computed profile: rarities, entropy groups, bursts. No model |
+| `src/soc_poc/actions.py` | executing one action, plus the `grep` that reproduces it |
+| `src/soc_poc/evidence.py` | the append-only ledger: the run's memory *and* its audit trail |
+| `src/soc_poc/chunking.py` | token-aware chunking; still used for the inventory and injection scan |
 | `src/soc_poc/control.py` | run markers and the abort sentinel |
 | `src/soc_poc/progress.py` | the live-output sink; keeps I/O out of the state machine |
 | `src/soc_poc/states.py` | the state machine: states, legal transitions, terminal set |
 | `src/soc_poc/orchestrator.py` | the loop over an immutable `InvestigationContext` |
 | `src/soc_poc/messages.py` | every message crossing an agent boundary, failures included |
 | `src/soc_poc/grunt.py` | one isolated unit of work; always returns, never raises |
-| `src/soc_poc/commander.py` | directive, drill-down and synthesis calls |
-| `src/soc_poc/schemas/` | the contracts (alert, sweep directive, slices, grunt report, brief) |
+| `src/soc_poc/commander.py` | the decide-action and synthesis calls |
+| `src/soc_poc/schemas/` | the contracts (alert, action, slices, grunt report, brief) |
 | `src/soc_poc/validation/` | no-verdict guard, citation enforcement, injection post-pass |
 | `src/soc_poc/prompting/` | prompt construction; all untrusted content goes through `envelope.py` |
 | `src/soc_poc/llm/` | `LLMClient` protocol, vLLM client, offline stub |
@@ -102,9 +123,14 @@ Prompts are a courtesy. These four are structural, and they hold when the prompt
    model-facing schema at **import time** and refuses to start the process if one grows
    a decision-shaped field — so "just a severity hint, six months from now" fails the
    build rather than the review.
-2. **Every claim carries a citation, and citations are checked.** Guided decoding
-   guarantees `representative_refs` is a list of strings; only Python can know whether
-   `dns.log:L142` was in the slice *that particular grunt* was handed.
+2. **Every claim carries a citation, and citations are checked.** The brief's references
+   are validated against `Evidence.shown_refs()` — the exact set of lines that passed in
+   front of the commander — not against the corpus. A reference that resolves in the files
+   but was never displayed is not a citation, it is a plausible-looking guess, and that is
+   the failure mode worth catching now that the commander knows every file name and line
+   count. For a `close_read`, guided decoding guarantees `representative_refs` is a list of
+   strings; only Python can know whether
+   `dns.log:L142` was in the range *that particular worker* was handed.
    `validation/citations.py` checks exactly that, plus the reference cap, that
    `match_count` is consistent with what was cited, and that a report claiming the slice
    is irrelevant has not simultaneously recorded a hit — a grammar constrains shape and
@@ -219,11 +245,20 @@ make restart-grunt  # bounce one service after editing deploy/*.env
 make down           # when you want the GPU back
 ```
 
-`make restart SERVICE=grunt` (or the `restart-grunt` / `restart-commander` shorthands)
-recreates a single container, waits for it to come back healthy, and prints the command
+`make restart-grunt` recreates just the grunt, waits for health, and prints the command
 line it is actually serving with so you can confirm a flag took. Use it rather than
-`make down && make up` after an env edit: the commander takes ~8 minutes to load 62 GB of
-weights, and bouncing the stack to change a grunt flag throws that away for nothing.
+`make down && make up` after a grunt env edit: the commander takes ~8 minutes to load
+62 GB of weights, and bouncing the stack to change a grunt flag throws that away.
+
+**`make restart SERVICE=commander` refuses, and `make restart-commander` cycles the whole
+stack.** The commander cannot be restarted on its own. Its checkpoint is 62 GB against
+121 GB of unified memory shared with the OS; if the grunt is resident it holds ~28 GiB,
+leaving less room than the checkpoint needs. The kernel then reclaims page cache faster
+than the loader can stream it and the load thrashes indefinitely — no crash, no OOM kill,
+no container restart, just "Starting to load model" forever with memory sawtoothing
+between ~28 and ~60 GB. That is a worse failure than an error because it looks like
+progress. The commander has to come up into an empty box, which is the ordering `make up`
+already enforces through the grunt's healthcheck gate.
 
 `make weights` is not optional convenience. `openai/gpt-oss-120b` is 195.8 GB in full,
 but vLLM loads only the root `model-*-of-00014.safetensors` (~62 GB) — the rest is
@@ -253,24 +288,26 @@ cases/my-case/
     logs/           your raw logs, any text format — required
 ```
 
-That is it. There is nothing to hand-author and nothing to configure: every line of every
-file in `logs/` is read. `fixtures/` is itself a case folder, so `./analyze.py fixtures`
+That is it. There is nothing to hand-author and nothing to configure: every file in
+`logs/` becomes searchable. `fixtures/` is itself a case folder, so `./analyze.py fixtures`
 runs the bundled demo — that is all `make demo` and `make demo-offline` do now.
 
-**How logs become visible.** `chunking.py` packs every file into slices sized against
-the grunt's context, and each slice is read by one worker. Windows are variable-length,
-packed greedily by estimated tokens rather than a fixed line count: log files mix short
-routine lines with dense bursts, and a fixed window landing on a burst overflows the
-model's context even when the file's average is comfortable. That failure is total — an
-oversized slice is rejected by the server, so every grunt in the sweep fails.
+**How logs become visible.** `corpus.py` loads every file and indexes it by line, so every
+search result carries a `<file>:L<n>` reference that resolves back to the exact line. Then
+`profiling.py` counts the corpus — line-shape frequencies, shapes occurring only a handful
+of times, high-entropy token families with how many distinct hosts emit each, and
+contiguous activity bursts — and that profile is the commander's first page.
 
-Token estimation is deliberately pessimistic (1.4 chars/token, measured against the real
-tokenizer on high-entropy DNS labels). Cheaper log formats simply get smaller slices than
-they strictly need, which costs a few extra calls; erring the other way costs the run.
+Nothing there is inferred. On the bundled 1 MB DNS case the profile is built in 0.31 s and
+puts the NS delegation, which occurs once in 5,586 lines, on that page as the only rare
+shape in the file.
 
-`analyze.py` prints the slice count and an estimated wall-clock before starting, and asks
-to proceed. Nothing is skipped and nothing is sampled, so a large case is slow rather
-than partial — `./abort.py` is there when you change your mind.
+**Cost no longer scales with the corpus.** Searching is free; what is paid for is the
+commander's turn around each result. A 40 MB case costs roughly what a 1 MB case costs — a
+bigger corpus mostly means each search returns more. `analyze.py` prints the step budget
+and a worst-case wall-clock before starting, calibrated on observed seconds per step from
+the last real run on this machine, and asks to proceed. Most investigations end early with
+`conclude`; `./abort.py` is there when you change your mind.
 
 Output, one directory per run:
 
@@ -291,18 +328,23 @@ prompts: `\n` inside a string stays escaped however you format the document. Joi
 with `\n` to recover the canonical string.
 
 `stats.json` carries what you want when comparing runs: wall clock and time per phase,
-per-role call counts, retries and latency spread, token usage, grunt rejection rate broken
-down by reason, and — from vLLM's own `/metrics`, snapshotted before and after and
-reported as deltas — server-side tokens, mean end-to-end latency, time to first token and
-**prefix-cache hit rate**. That last one is the number to watch on a sweep: every grunt
-shares a long identical prefix, so a low rate means it is being recomputed per call.
+per-role call counts, retries and latency spread, token usage, rejection rate broken
+down by reason, `seconds_per_step` (which is what calibrates the next run's estimate), and
+— from vLLM's own `/metrics`, snapshotted before and after and reported as deltas —
+server-side tokens, mean end-to-end latency, time to first token and **prefix-cache hit
+rate**. That last one matters more than it did: consecutive commander turns share the
+alert, the profile and all but the newest steps, so the shared prefix is now most of the
+prompt rather than a tenth of it.
 Machine counters (GPU utilisation, power, temperature, host memory) are sampled every 5 s
 during the run. GPU memory is reported as `null` rather than zero — GB10 shares the host
 pool and `nvidia-smi` returns `[N/A]`, and an absent measurement is not a measurement of
 zero.
 
-`brief.json` carries two audit fields worth reading first: `unresolved_citations`
-(references that do not resolve to a real line) and `uncited_claims` (evidence written
+`brief.json` carries a `step_ledger`: every question the commander asked, why it asked,
+what it expected *before* seeing the result, what came back, and the shell command that
+reproduces it. Read that first — it is what makes the brief checkable without re-running a
+GPU. Then two audit fields: `unresolved_citations`
+(references to lines the commander was never actually shown) and `uncited_claims` (evidence written
 with no reference at all).
 
 ### Watching a run
@@ -365,6 +407,32 @@ the arbiter, so there is no point reasoning about which flag *should* work. If n
 them do, swap the commander model (commented fallback block in `config/config.toml`). The
 investigation loop does not care which model is behind the schema.
 
+**Guided decoding silently does not engage when the prompt looks like a tool menu.** The
+worst bug of the port, because there is no error: vLLM accepts `response_format`, returns
+200, puts `reasoning` in its own field, and hands back unconstrained text in `content`.
+
+Measured on the real dns-tunnel prompt, three requests per mode: `response_format` 0/3
+conformant, `structured_outputs` 0/3, legacy `guided_json` 0/3. The *same schema* on a
+short prompt, or on the retry turn, came back perfectly conformant every time — so it is
+not the schema and not the backend flag. What comes back instead is always a tool call:
+
+```json
+{"action": "count",  "action_input": "t\\.api-sync-telemetry\\.net"}
+{"action": "search", "action_args": {"regex": "...", "case_insensitive": true}}
+```
+
+The commander prompt lists six verbs, and gpt-oss reads a verb menu as an invitation to
+use its harmony tool-call channel — which the final-channel grammar never constrains.
+Adding one paragraph stating that there is no tool-calling interface and naming the nine
+expected keys took it to 2/2. That paragraph is `_NOT_A_TOOL_CALL` in
+`prompting/investigate.py`, and it is load-bearing rather than stylistic.
+
+Because a prompt is not a guarantee, `coercion.py` is the second line: it maps the
+tool-call envelopes above onto the action schema deterministically, and the result goes
+through `validate_action` like anything else. If you change the commander model or bump
+vLLM, re-run the check — the failure is invisible from the client's side, and the symptom
+is an investigation that ends after three steps for no stated reason.
+
 **If the commander OOMs** — `No available memory for the cache blocks`, which is what
 0.55 did — the ladder is: raise `COMMANDER_GPU_FRACTION` (taking it from
 `GRUNT_GPU_FRACTION`) → drop `COMMANDER_MAX_MODEL_LEN` → add `--kv-cache-dtype fp8` to
@@ -372,11 +440,10 @@ investigation loop does not care which model is behind the schema.
 profiler prints the exact shortfall, including a suggested fraction, so read it rather
 than guessing.
 
-Memory fractions are the one change where `make restart-<service>` is the wrong tool.
-Moving memory between the two instances means both must re-profile, and they must do it in
-order — the grunt cannot claim its share until the commander has taken its own, which is
-what the healthcheck gate exists for. Use `make down && make up` for a fraction change;
-single-service restarts are for everything else.
+Memory fractions, and anything touching the commander, need the full ordered cycle: both
+instances must re-profile, and the grunt cannot claim its share until the commander has
+taken its own. `make restart-commander` does this for you. Single-service restart is for
+the grunt only.
 
 Because a memory misconfiguration fails at engine init, both services use
 `restart: on-failure:3` rather than `unless-stopped` — otherwise the failure presents as
@@ -413,11 +480,11 @@ accepted rather than silently dropped.
 
 Explicitly not in this build, with the seam each one will land on:
 
-- **Telemetry pipeline.** Precomputed pattern summaries were in the original design and
-  have been **deliberately removed**: the commander must not read data, and summaries are
-  data. What a pipeline would still buy is prioritisation (sweep the interesting slices
-  first) and enrichment for the brief — not deciding what gets read, because that is the
-  choice this architecture exists to take away.
+- **Telemetry pipeline.** Precomputed pattern summaries were in the original design,
+  removed on the grounds that the commander must not read data, and have effectively
+  returned as `profiling.py` — with the difference that matters: the profile is computed
+  in code, so it is arithmetic rather than a model's opinion, and every number in it can
+  be re-derived with `grep` and `sort`.
 - **Eval harness.** Seam: the `LLMClient` protocol (`llm/base.py`) plus the
   `[models.evaluator]` config entry. The transcript corpus is the eval set.
 - **Synthetic scenario generation.** Seam: a case folder is just `alert.json` + `logs/`,
@@ -428,16 +495,152 @@ Explicitly not in this build, with the seam each one will land on:
   work is not interactive.
 - **Any UI.** The brief is JSON.
 
-Also not attempted: retrieval over the full log estate (grunts read only what the
-summaries point at), alert triage or correlation across alerts, and any write path back
+Also not attempted: retrieval over the full log estate (a case is a folder of files),
+embeddings or a vector index — spiked and rejected, since the questions here are
+"how many" and "which lines", which grep answers exactly and an embedding answers
+approximately — alert triage or correlation across alerts, and any write path back
 to the detection system.
+
+---
+
+## The first runs on the action loop
+
+`cases/dns-tunnel`, the same case the six sweeps were graded on, graded by
+`scripts/grade.py` against `GROUND_TRUTH.md`. REACHED means the brief states the fact;
+CITED means it states it *and* backs it with the right line reference.
+
+| | sweep, run 6 (best of six) | action loop, run 7 |
+|---|---|---|
+| wall clock | 12.4 min | 5.6 min |
+| model calls | 88 | 20 |
+| attribute traffic to `10.12.34.56` | ✅ | ✅ |
+| identify the host as `wks-2291` | ❌ | ✅ CITED |
+| find the NS delegation | ❌ (0 of 6 runs) | ✅ CITED |
+| name the nameserver `45.77.203.118` | ❌ | ✅ CITED |
+| answers carried the payload | ❌ | ✅ |
+| bursty timing, not periodic | ❌ | ✅ |
+| non-empty `coverage_gaps` | ❌ `[]` | ✅ 7 entries |
+| decoy false positives | 0 | 0 |
+| unresolved citations | 0 | 0 |
+
+**7/7, at a sixth of the model calls.** The run also produced a C2 hypothesis that ties
+`45.77.203.118` to the delegation — the connection no earlier run made — and kept all four
+decoys out of its supporting evidence.
+
+Runs 4 and 6 scored 5/7 and 6/7 on the same checklist. Progress across them came from three
+fixes, each bought by a specific failure:
+
+1. **A crash that cost an entire run.** Run 5 died at step 22: the commander emitted
+   `ref: "L978"` without the file prefix, a presence-only check let it through, and
+   `int("")` raised straight through the orchestrator loop — discarding 21 completed steps
+   and producing no brief. Reference *shape* is now validated, `reproduce_command` is
+   total, and `_step` routes any unexpected exception to a legal state instead of
+   unwinding. "Failures are values" had only ever been enforced at the worker boundary.
+2. **A brief built on its own broken regexes.** Run 6 searched
+   `\tTXT\t.*t\.api-sync-telemetry\.net`, got zero — Zeek puts the query *before* the
+   qtype, so it cannot match — and wrote that zero into the brief as *contradicting
+   evidence against the tunnel*. There are 649 such queries. The prompt already warned
+   that a zero is only a zero for the pattern you typed, and the model did it anyway, so
+   the check moved into code: `zero_result_hint` counts the longest literal in any empty
+   pattern and says so where it cannot be missed. A genuine absence stays silent.
+3. **A grader that under-read the briefs.** gpt-oss writes non-breaking hyphens
+   (`wks‑2291`), so ASCII matching reported MISSED on facts the brief had stated. Two
+   published grades were wrong because of it.
+
+### The loop, and why the ledger caused it
+
+A later run scored 5/7 and visibly looped — "no user or host, maybe in DHCP", twice. Steps
+3 and 8 were byte-identical actions; four more steps were near-duplicate counts of the same
+domain. The cause was `evidence.py`, and it was a rendering choice, not a model failure.
+
+`STEPS_RENDERED_IN_FULL = 4`, so by step 8 the earlier search had collapsed to:
+
+```
+3. search /10\.12\.34\.56/ in dhcp.log -> 2 match(es) in dhcp.log; all shown
+```
+
+The count survived. The answer did not — `wks-2291` was nowhere in the prompt. So the
+commander correctly concluded it still did not know the hostname and asked again, and that
+fresh answer would age out four steps later in turn. An unbounded loop by construction. The
+old justification in the module docstring ("counts are most of the value") is true of
+`count`, whose product IS a number, and false of `search`, where the lines are the answer.
+
+It nearly cost the brief the hostname too: `wks-2291` reached synthesis only because the
+loop happened to re-fetch it late enough to still be inside the window.
+
+Three fixes:
+
+1. **A collapsed step keeps a sample of its lines** (`COLLAPSED_LINE_SAMPLE = 3`, elided to
+   130 chars), and says how many it withheld. Over 24 steps against `cases/dns-tunnel` the
+   ledger goes from ~2,700 to ~5,400 tokens against a 24,384 context — the right trade,
+   since the whole point of a ledger is not having to ask twice.
+2. **An identical action is answered from the ledger** rather than re-run, with a summary
+   that names the earlier step. Defence in depth, and a repeat now costs no work.
+3. **A file-less reference is repaired, not fatal.** `{"ref": "L975", "file": "dns.log"}`
+   ended a run at step 9 with 16 of 24 steps unspent: rejected, repeated verbatim on the
+   retry, loop gave up. The correct reference was fully determined by the action's own
+   fields, so `coercion.repair_ref` concatenates it. When rejection is still necessary the
+   message is built from what the model actually wrote, not a fixed unrelated example.
+
+**Still wrong:** the brief cites computed facts (burst windows, exact counts) in
+`raw_line_refs` because the schema has nowhere else to put them — 7 entries in run 7,
+down from 22. Coercion still fires on some steps, and each one loses the model's stated
+`reasoning`. See the guided-decoding note under "Known issues".
+
+---
+
+## Why the sweep is gone
+
+The previous architecture read every slice of every log file with a worker model, on an
+argument that was sound: if every line is read, then "we found nothing else" means
+something. Six graded runs against `cases/dns-tunnel`, each about 4,300 GPU-seconds,
+established that the premise does not survive contact with the workers.
+
+**Reading is not noticing.** Two findings settled it:
+
+- Worker `dhcp-0001` was handed an eight-line DHCP file with the lease for the alerted
+  host on lines 4 *and* 8. It reported `"10.12.34.56" → found: false`, and the brief went
+  out saying the host could not be identified. `grep` finds it in 3 ms.
+- The NS delegation tying the tunnel domain to attacker infrastructure
+  (`dns.log:L975-976`, resolving `ns1.api-sync-telemetry.net` → `45.77.203.118`) appears
+  in **no worker output across all six complete sweeps**. It is the strongest single piece
+  of evidence in the case. `grep -n ' NS '` finds it in 0.003 s.
+
+Run 6 was the best of them — mechanically clean, zero rejections, zero failures, no decoy
+contamination — and still missed the host attribution, the NS delegation, the fact that
+the answers carried the payload, and the bursty timing. The mechanics were an A; the
+analysis was a C+, and the ceiling was the worker layer, not the commander.
+
+**What replaced the coverage claim.** `corpus.count()` is exact, instant, and re-runnable
+by anyone with the case folder. That is strictly more than "a model read it and did not
+mention it" was ever worth. The claim changed hands rather than weakening.
+
+**What the profile finds that six sweeps did not**, on the same 1 MB case, in 0.31 s:
+
+| | |
+|---|---|
+| rare shapes in `dns.log` | exactly one: the NS delegation at `L975` |
+| tunnel vs. decoys | `t.api-sync-telemetry.net` — 785 tokens, mean entropy 3.62, **1 source**, against `cdn-assets.example.com` (12 sources) and `vendor-cloud.example.net` (12 sources) at the same entropy |
+| activity bursts | the five planted sessions exactly: 96, 210, 64, 288, 130 events |
+
+`distinct_sources` is the field doing the work in the middle row. Encoded exfiltration and
+an antivirus reputation service are indistinguishable by entropy; one host versus twelve
+separates them without a model forming an opinion about either.
+
+**What the grunts kept.** `close_read` still exists, because some questions genuinely need
+reading rather than counting — "what do these 30 lines have in common?" is not a regex. It
+is now requested deliberately, at a bounded range, with a question the commander wrote,
+rather than issued 83 times at everything.
 
 ---
 
 ## What the real runs showed
 
-Typical timings: commander directive ~20 s, drill-down plan ~31 s, synthesis ~95 s, grunt
-reports median 43 s. A 1 MB case (83 slices) is ~16 minutes end to end at 8-way batching.
+The six runs below are the sweep architecture's history. They are kept because each one
+bought a fix that is still in the code, and because the case for replacing the sweep is
+made of them. Timings there: commander directive ~20 s, drill-down plan ~31 s, synthesis
+~95 s, grunt reports median 43 s; a 1 MB case (83 slices) ran ~11-16 minutes end to end at
+8-way batching, of which ~4,300 GPU-seconds was the sweep itself.
 
 ### The DNS-tunnel run, and what it cost to be wrong
 
@@ -463,6 +666,49 @@ model's**:
 
 Also observed, and the reason `uncited_claims` exists: **every false claim in the brief
 had `raw_line_refs: []`, and every cited claim was true.** The correlation was perfect.
+
+### Run 3: fast, and wrong
+
+The efficiency work landed — 34.6 min → **11.1 min**, 60 rejections → **0**, 18 task
+failures → **0**, p95 latency 338 s → 57 s. Then the brief concluded:
+
+> "No evidence of high-entropy labels, large TXT payloads, or repeated queries to the same
+> DNS server was found."
+
+All three false, against 788 tunnel queries with 28–40 character hex labels and a base32
+payload on every one. Those false negatives became the entire supporting case for a third
+hypothesis — *"the Suricata signature produced a false positive"*. Two causes, both mine:
+
+**The negative aggregate manufactured them.** The "checked for and did not find" section I
+added the session before rendered per-slice negatives without scope, without denominators,
+and without reconciling against the 38 slices that found exactly those things. Ten subjects
+were reported both found and not-found; only the not-found side was shown. Fixed: `scope`
+restored to `CheckedFor`, denominators on every line, per-file grouping, and any subject a
+worker found is struck from the negative list with the suppression stated out loud.
+
+**A worker described the directive instead of the line.** `dns.log:L244` — an antivirus
+reputation lookup — was reported as *"TXT queries from 10.12.34.56 to
+api-sync-telemetry.net"*, and became the brief's primary evidence for the tunnel. The
+reference resolved, so every check passed. The commander could not have caught it: it had
+the line *number* and nothing else.
+
+Two fixes, because one was not enough:
+
+- `validation/citations.py` now checks that a description's claims match its lines. The
+  directive's indicators are exact strings, so if a description names one, at least one
+  cited line must contain it. This catches `dns-0004` on the first attempt. It is
+  deliberately narrow — it only fires on indicators the description itself invokes, so a
+  worker describing something nobody asked about is untouched.
+- The commander is shown the lines. Replaying run 3's reports through the new renderer, it
+  now reads a 40-character hex label with a base32 answer payload directly above the claim
+  that no such labels exist.
+
+Worth being precise about what the suppression does *not* do: it caught 18 contradicted
+negatives on replay, but not those three, because no worker ever *described* entropy —
+there was nothing to contradict. Those now carry "looked for in 15 of 87 slices … says
+nothing about slices that did not look", the synthesis prompt forbids promoting a
+per-slice negative to a global one, and the evidence sample makes the contradiction
+visible. Layers, not a single catch.
 
 ### Still open
 

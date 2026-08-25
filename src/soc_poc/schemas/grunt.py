@@ -76,6 +76,13 @@ class CheckedFor(BaseModel):
 
     checked_for: str
     found: bool
+    # Where you looked. Restored after a run where the renderer aggregated scopeless
+    # negatives across the sweep and the commander read them as global: 15 slices of
+    # ordinary background truthfully reported "no high-entropy labels here", which became
+    # "no evidence of high-entropy labels was found" in the brief -- against 788 tunnel
+    # queries. A negative without its scope is not a finding, it is a lie with a citation
+    # shape.
+    scope: str
     result: str
 
 

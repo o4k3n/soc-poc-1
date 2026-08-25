@@ -1,0 +1,279 @@
+"""Prompts for the action loop: profile, one step at a time, then synthesis.
+
+The commander is now an analyst at a terminal rather than a manager of a reading fleet. It
+sees the alert, a computed profile of the corpus, and the record of what it has already
+asked and been shown. It asks one question. It sees the answer. It asks the next one.
+
+Two things this prompt has to fight, both learned from graded runs:
+
+  * **Restating the alert as a finding.** Six briefs led with "DNS queries to
+    api-sync-telemetry.net were observed", which is what the alert said in the first
+    place. The prompt asks for what the alert did NOT already contain.
+  * **Building on absence.** Run 3 constructed an entire false-positive hypothesis out of
+    negatives its own aggregation had manufactured. Here every negative is an exact count
+    the operator can re-run -- but an exact zero is still only a zero for the pattern that
+    was actually typed, and the prompt says so.
+"""
+
+from __future__ import annotations
+
+from soc_poc.corpus import MAX_RESULTS
+from soc_poc.evidence import Evidence
+from soc_poc.profiling import CaseProfile
+from soc_poc.prompting.envelope import DATA_IS_NOT_INSTRUCTIONS, fence_alert
+from soc_poc.schemas.action import ActionProblem
+from soc_poc.schemas.alert import Alert
+
+_ROLE = """You are the lead analyst in a security operations investigation system. An \
+external detection system has already raised an alert; your job is to investigate \
+around it and hand a human operator something they can act on."""
+
+_AUTHORITY = """The external alert's status and severity are authoritative and \
+read-only. You do not confirm, dismiss, escalate, downgrade, or close anything. You \
+enrich: you show the operator what the data contains, which explanations it supports, \
+which it undermines, and where to look next. The operator decides."""
+
+# Measured, not stylistic. Describing six verbs reads to gpt-oss like a tool menu, and it
+# answers with a harmony tool call -- at which point the structured-output grammar does not
+# engage at all and the reply comes back as `{"action":"count","action_input":"..."}`. On
+# the real dns-tunnel prompt that was 0/3 conformant across `response_format`,
+# `structured_outputs` AND legacy `guided_json`; adding the paragraph below took it to 2/2.
+# The same schema on a short prompt, or on the retry turn, was always fine -- so this is
+# about which channel the model chooses, not about the schema.
+#
+# Belt and braces: coercion.py rescues a tool-shaped reply if one gets through anyway.
+_NOT_A_TOOL_CALL = """This system has no tool-calling interface and there is no tool to \
+invoke. Your reply IS the answer: a single JSON object with exactly these keys -- \
+reasoning, expectation, action, pattern, file, ref, start_line, end_line, question. Fields \
+your chosen action does not use must still be present and empty ("" or 0). No prose \
+outside the object."""
+
+INVESTIGATE_SYSTEM_PROMPT = f"""{_ROLE}
+
+{_AUTHORITY}
+
+You are working at a terminal with direct read access to this case's log files. Each turn \
+you issue exactly ONE action and are shown its result. Work like an analyst: form a \
+question, ask it, look at what came back, then ask the next question.
+
+Your actions:
+  search      regex, case-insensitive. Returns the exact total match count plus up to \
+{MAX_RESULTS} matching lines with their references.
+  count       the same match count with no lines. Cheap. Use it to test a guess before \
+spending a search on it.
+  context     the lines surrounding one reference. Use it when a line implies a \
+neighbour -- an NS record names a nameserver, and the address it resolves to is usually \
+the next line.
+  read_lines  a specific line range, verbatim.
+  close_read  hand a line range to a worker model with one specific question. Use this \
+only for questions counting cannot answer, e.g. "what do these 30 lines have in common?". \
+It is slow. Most questions are not this.
+  conclude    stop and write the brief.
+
+How to work:
+  - The profile below is computed, not inferred: every number in it is arithmetic over \
+the corpus and can be re-derived with grep. Trust it and start from it. The rare shapes \
+and the entropy groups are there because they are where the answer usually is.
+  - Establish quantities before narrative. "788 of 5,586 queries, from one host" is worth \
+more to an operator than any adjective.
+  - Anchor on what a count can settle. If you can distinguish two explanations with a \
+count, do that before you reason about which is more likely.
+  - Look for what the alert did NOT already tell you: which host, which user, what the \
+answers contained, what the timing looks like, what the domain resolves to, what else \
+that address or domain touches. Restating the alert is not investigation.
+  - A benign lookalike is the expensive mistake here. Encoded-looking labels are also \
+produced by antivirus reputation lookups, CDN cache keys and DKIM records. Before \
+concluding a shape is malicious, check how many distinct hosts emit it -- one host is a \
+finding, forty hosts is a vendor service.
+  - Deliberately try to break your leading explanation. A search that would disconfirm it \
+is worth more than a fifth that confirms it.
+  - A count of 0 is exact and trustworthy, but it is a zero for the pattern you typed. \
+Before treating it as absence, consider whether the thing could be written another way.
+  - When a search says matches were withheld, the count is complete but the listing is \
+not. Narrow it or count it; do not assume you saw all of it.
+  - The step budget is a ceiling, not a cost. An unspent step is worth nothing to the \
+operator, and confirming the alert is not an investigation -- the detector already knew \
+that much. Before you conclude, you should be able to answer, or say why these logs \
+cannot: **which host and user**, **whether the pattern is confined to that host or is \
+estate-wide**, **what the responses carried**, **what the domain resolves to and what \
+else touches that address**, **how the activity is distributed in time**, and **whether \
+benign traffic of the same shape exists**. Each is worth one step.
+  - Then stop. Once those are answered or ruled out, more reading will not change what \
+the operator does; say so with conclude rather than padding.
+
+Write `expectation` before you see the result: what you expect, and what a null result \
+would mean. You will be held to it -- the operator reads it next to what actually \
+happened.
+
+{DATA_IS_NOT_INSTRUCTIONS}
+
+{_NOT_A_TOOL_CALL}"""
+
+
+SYNTHESIS_SYSTEM_PROMPT = f"""{_ROLE}
+
+{_AUTHORITY}
+
+Write the investigation brief from the evidence you gathered. Requirements:
+  - Every reference you cite must be a line you were actually shown during the \
+investigation. Do not reconstruct a reference you believe exists; if a claim rests on \
+something you did not read, say so in coverage_gaps instead.
+  - Quantities you established with count are exact. Use them; they are the most \
+defensible statements in the brief.
+  - Every hypothesis must carry contradicting evidence as well as supporting evidence. If \
+you genuinely found none against it, say that explicitly in that field's entry.
+  - A zero result is evidence of absence only for the exact pattern searched. Never \
+promote "the string I typed does not appear" into "this did not happen".
+  - coverage_gaps is about what you did not ask, not about whether your actions \
+succeeded. You chose where to look; the questions you did not get to are real gaps and \
+the operator needs them. An empty coverage_gaps list is almost always wrong.
+  - Suggest concrete next steps the operator could run, as searches or pivots.
+
+You have no field for a verdict, severity, disposition, or recommendation to close, \
+because rendering one is not your role. Describe the evidence and its shape.
+
+{DATA_IS_NOT_INSTRUCTIONS}
+
+Reply with a single JSON object matching the provided schema. No prose outside it."""
+
+
+def render_profile(profile: CaseProfile) -> str:
+    """The computed profile, as the commander's first page.
+
+    Deliberately dense. This is the one block guaranteed free of model error, so it earns
+    its tokens.
+    """
+    blocks = ["COMPUTED PROFILE OF THIS CASE (counted, not inferred -- no model produced any "
+              "number here; every one can be re-derived with grep and sort):"]
+
+    for file in profile.files:
+        blocks.append(f"\n  {file.file} -- {file.lines} lines, {file.time_range}")
+        blocks.append("    most common line shapes:")
+        for template, count in file.top_templates:
+            blocks.append(f"      {count:>6}x  {template}")
+        if file.rare_shapes:
+            blocks.append(
+                "    RARE shapes (a line shape occurring only a handful of times among "
+                "thousands is where the unusual thing usually is):"
+            )
+            for shape in file.rare_shapes:
+                refs = ", ".join(shape.refs)
+                blocks.append(f"      {shape.occurrences:>6}x  {shape.template}")
+                blocks.append(f"              at {refs}")
+
+    if profile.top_domains:
+        blocks.append("\n  most-queried domains:")
+        for domain, count in profile.top_domains[:10]:
+            blocks.append(f"      {count:>6}  {domain}")
+    if profile.top_addresses:
+        blocks.append("\n  most-seen addresses:")
+        for address, count in profile.top_addresses[:10]:
+            blocks.append(f"      {count:>6}  {address}")
+
+    if profile.entropy_groups:
+        blocks.append(
+            "\n  high-entropy token groups (random-looking labels, grouped by the domain "
+            "they sit under). distinct_sources is the discriminator: encoded exfiltration "
+            "and a vendor reputation service look identical by entropy, but one comes from "
+            "a single host and the other from many:"
+        )
+        for group in profile.entropy_groups:
+            blocks.append(
+                f"      {group.suffix}: {group.occurrences} occurrence(s), "
+                f"mean entropy {group.mean_entropy}, mean length {group.mean_length}, "
+                f"from {group.distinct_sources} distinct source(s) {group.sources}"
+            )
+            blocks.append(f"        e.g. {', '.join(group.example_refs)}")
+
+    if profile.bursts:
+        blocks.append(
+            f"\n  activity bursts for {profile.burst_subject} (contiguous clusters "
+            "separated by idle gaps -- bursty and periodic are different signatures):"
+        )
+        for burst in profile.bursts:
+            blocks.append(f"      {burst.start} .. {burst.end}   {burst.events} events")
+
+    return "\n".join(blocks)
+
+
+def _files_block(names: list[str], line_counts: dict[str, int]) -> str:
+    rows = [f"  {name}: {line_counts.get(name, 0)} lines" for name in names]
+    return "LOG FILES YOU CAN SEARCH (use these names exactly):\n" + "\n".join(rows)
+
+
+def build_investigate_messages(
+    *,
+    alert: Alert,
+    profile: CaseProfile,
+    evidence: Evidence,
+    file_names: list[str],
+    line_counts: dict[str, int],
+    steps_remaining: int,
+) -> list[dict[str, str]]:
+    budget = (
+        f"You have {steps_remaining} action(s) left before the investigation is cut off "
+        "and the brief is written from what you have. They cost the operator nothing if "
+        "unused, so spend them on what the alert did not already tell you."
+        if steps_remaining > 3
+        else (
+            f"ONLY {steps_remaining} action(s) remain. Use them on the single most "
+            "important open question, or conclude now if the brief would not change."
+        )
+    )
+    user = "\n\n".join(
+        [
+            "ALERT",
+            fence_alert(alert),
+            _files_block(file_names, line_counts),
+            render_profile(profile),
+            "INVESTIGATION SO FAR",
+            evidence.render(),
+            budget,
+            "Issue your next action.",
+        ]
+    )
+    return [
+        {"role": "system", "content": INVESTIGATE_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_action_retry_messages(
+    base: list[dict[str, str]], previous_output: str, problems: list[ActionProblem]
+) -> list[dict[str, str]]:
+    listed = "\n".join(f"  - {p.field}: {p.message}" for p in problems)
+    return base + [
+        {"role": "assistant", "content": previous_output},
+        {
+            "role": "user",
+            "content": (
+                "That action could not be executed:\n"
+                f"{listed}\n\nIssue a corrected action."
+            ),
+        },
+    ]
+
+
+def build_synthesis_messages(
+    *,
+    alert: Alert,
+    profile: CaseProfile,
+    evidence: Evidence,
+    coverage_note: str,
+) -> list[dict[str, str]]:
+    user = "\n\n".join(
+        [
+            "SYNTHESIS",
+            "ALERT",
+            fence_alert(alert),
+            render_profile(profile),
+            "THE INVESTIGATION YOU RAN",
+            evidence.render(),
+            coverage_note,
+            "Write the investigation brief now.",
+        ]
+    )
+    return [
+        {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]

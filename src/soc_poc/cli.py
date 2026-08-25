@@ -17,7 +17,7 @@ from soc_poc.chunking import chunk_logs
 from soc_poc.config import AppConfig, FixtureConfig, load_config
 from soc_poc.progress import ConsoleProgress, NullProgress, ProgressSink
 from soc_poc.runner import run_investigation
-from soc_poc.stats import estimate_sweep, format_summary
+from soc_poc.stats import estimate_investigation, format_summary
 from soc_poc.states import InvestigationState
 
 DEFAULT_CONFIG = "config/config.toml"
@@ -42,8 +42,11 @@ def _parser() -> argparse.ArgumentParser:
         "--stub", action="store_true", help="offline canned backend; no GPU needed"
     )
     parser.add_argument("--quiet", action="store_true", help="no live output")
-    parser.add_argument("--max-iterations", type=int, help="override the drill-down cap")
-    parser.add_argument("--max-tasks", type=int, help="override tasks per planning round")
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        help="override the cap on investigative steps (default 24)",
+    )
     parser.add_argument("--id", dest="investigation_id", help="name this run explicitly")
     parser.add_argument(
         "-y", "--yes", action="store_true", help="skip the cost confirmation"
@@ -59,8 +62,6 @@ def _apply_case(config: AppConfig, case: CaseLayout, args: argparse.Namespace) -
     run = config.run
     if args.max_iterations:
         run = run.model_copy(update={"max_iterations": args.max_iterations})
-    if args.max_tasks:
-        run = run.model_copy(update={"max_tasks_per_iteration": args.max_tasks})
     return config.model_copy(
         update={
             "run": run,
@@ -72,11 +73,14 @@ def _apply_case(config: AppConfig, case: CaseLayout, args: argparse.Namespace) -
 
 
 def _preview(config: AppConfig, case: CaseLayout, out) -> int:
-    """Show what the sweep will cost before it is spent.
+    """Show what the investigation will cost before it is spent.
 
-    Chunking here costs a file read and catches a broken case before any model is
-    involved. It is also the honest moment to tell someone that their 40 MB of logs is
-    two hours of GPU time.
+    Reading the case here costs a file read and catches a broken case before any model is
+    involved.
+
+    The headline number no longer scales with the corpus. Under the sweep, 40 MB of logs
+    was two hours of GPU time; searching is free, so the cost is the commander's turns and
+    a bigger case mostly just means each search returns more.
     """
     catalog, inventory = chunk_logs(
         case.logs_dir,
@@ -84,29 +88,25 @@ def _preview(config: AppConfig, case: CaseLayout, out) -> int:
         chars_per_token=config.run.chars_per_token,
     )
     total_lines = sum(item.line_count for item in inventory)
-    slices = len(catalog)
-    per_slice = max(1, total_lines // max(slices, 1))
-    concurrency = config.run.max_concurrent_grunts
-    minutes, basis = estimate_sweep(
-        config.path(config.run.output_dir), slices=slices, concurrency=concurrency
+    max_steps = config.run.max_iterations
+    minutes, basis = estimate_investigation(
+        config.path(config.run.output_dir), max_steps=max_steps
     )
 
     print(f"case      : {case.root}", file=out)
     print(f"logs      : {len(case.log_files)} file(s), {total_lines} lines", file=out)
     for item in inventory:
         print(
-            f"            {item.file}: {item.line_count} lines, "
-            f"{item.slice_count} slice(s), {item.time_range}",
+            f"            {item.file}: {item.line_count} lines, {item.time_range}",
             file=out,
         )
-    print(f"slices    : {slices} (~{per_slice} lines each)", file=out)
     print(
-        f"sweep     : {slices} slice(s), ~{minutes:.0f} min at {concurrency} "
-        f"concurrent — every line gets read",
+        f"budget    : up to {max_steps} investigative step(s), ~{minutes:.0f} min "
+        f"worst case — searching the logs is free, the commander's turns are not",
         file=out,
     )
     print(f"            estimate basis: {basis}", file=out)
-    return slices
+    return len(catalog)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -169,21 +169,22 @@ def main(argv: list[str] | None = None) -> int:
     if result.brief is not None:
         print(f"brief          : {paths.brief}")
         print(f"alert status   : {result.brief.alert_ref.status} (unchanged, detector-owned)")
-        print(f"slices swept   : {result.brief.slices_swept}")
-        print(f"tasks          : {len(result.brief.task_ledger)}")
-        failed = sum(1 for e in result.brief.task_ledger if e.outcome == "failure")
+        print(f"steps taken    : {result.brief.steps_taken} over {result.brief.lines_available} line(s)")
+        failed = sum(1 for e in result.brief.step_ledger if e.error)
         if failed:
-            # A brief synthesized entirely from failures is still a brief, and it is the
-            # kind of result that looks fine until you read it. Say so on the way out.
+            # A brief synthesized entirely from failed steps is still a brief, and it is
+            # the kind of result that looks fine until you read it. Say so on the way out.
             print(
-                f"FAILED TASKS   : {failed} of {len(result.brief.task_ledger)}"
-                + ("  — nothing was successfully read" if failed == len(result.brief.task_ledger) else ""),
+                f"FAILED STEPS   : {failed} of {len(result.brief.step_ledger)}"
+                + ("  — nothing was successfully read" if failed == len(result.brief.step_ledger) else ""),
                 file=sys.stderr,
             )
         if result.brief.aborted_by_operator:
             print("interrupted    : yes — this brief covers only what was read before the abort")
         if result.brief.unresolved_citations:
             print(f"unresolved refs: {len(result.brief.unresolved_citations)}")
+        if result.brief.malformed_citations:
+            print(f"malformed refs : {len(result.brief.malformed_citations)} (prose in a citation field)")
         if result.brief.uncited_claims:
             print(f"uncited claims : {len(result.brief.uncited_claims)} (see brief.json)")
         if result.brief.injection_signals:

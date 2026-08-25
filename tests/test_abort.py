@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 
@@ -17,13 +16,9 @@ from soc_poc.control import (
     stale_runs,
     write_marker,
 )
-from soc_poc.llm.stub_client import StubClient
-from soc_poc.loader import load_run_inputs, scan_catalog_for_injection
-from soc_poc.orchestrator import Orchestrator
 from soc_poc.progress import NullProgress
 from soc_poc.runner import make_paths, run_investigation
 from soc_poc.states import InvestigationState
-from soc_poc.transcript import TranscriptLogger
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -33,12 +28,15 @@ def _config(tmp_path: Path):
     return cfg.model_copy(update={"run": cfg.run.model_copy(update={"output_dir": str(tmp_path)})})
 
 
-class _AbortOnFirstOutcome(NullProgress):
-    """Requests an abort the moment the first grunt report lands.
+class _AbortOnFirstStep(NullProgress):
+    """Requests an abort the moment the first investigative step completes.
 
-    This is how the test reaches the interesting state: an abort that arrives when work
-    has been collected but the investigation is not finished. Using the progress sink as
-    the trigger keeps the orchestrator untouched by test scaffolding.
+    This is how the test reaches the interesting state: an abort that arrives when
+    evidence exists but the investigation is not finished. Using the progress sink as the
+    trigger keeps the orchestrator untouched by test scaffolding.
+
+    The orchestrator emits exactly one note per executed step, prefixed "  ->" with the
+    step's result; that prefix is the signal that a step has landed in the ledger.
     """
 
     def __init__(self, run_dir: Path, mode: AbortMode) -> None:
@@ -46,8 +44,8 @@ class _AbortOnFirstOutcome(NullProgress):
         self.mode = mode
         self.fired = False
 
-    def task_outcome(self, task_id: str, slice_id: str, summary: str, ok: bool) -> None:
-        if not self.fired:
+    def note(self, message: str) -> None:
+        if not self.fired and message.startswith("  ->"):
             self.fired = True
             request_abort(self.run_dir, self.mode, requested_by="test")
 
@@ -64,7 +62,7 @@ async def test_graceful_abort_still_produces_a_brief(tmp_path: Path) -> None:
         config,
         backend="stub",
         investigation_id="inv-abort-graceful",
-        progress=_AbortOnFirstOutcome(paths.run_dir, AbortMode.GRACEFUL),
+        progress=_AbortOnFirstStep(paths.run_dir, AbortMode.GRACEFUL),
     )
 
     assert result.terminal_state is InvestigationState.DONE
@@ -107,7 +105,7 @@ async def test_hard_abort_writes_no_brief_but_keeps_the_transcript(tmp_path: Pat
         config,
         backend="stub",
         investigation_id="inv-abort-hard",
-        progress=_AbortOnFirstOutcome(paths.run_dir, AbortMode.HARD),
+        progress=_AbortOnFirstStep(paths.run_dir, AbortMode.HARD),
     )
 
     assert result.terminal_state is InvestigationState.ABORTED_BY_OPERATOR
@@ -119,87 +117,32 @@ async def test_hard_abort_writes_no_brief_but_keeps_the_transcript(tmp_path: Pat
     assert any(r["kind"] == "abort_requested" for r in records)
 
 
-class _StaggeredStub(StubClient):
-    """Makes the second grunt task slow, so it is still running when the abort lands.
+async def test_hard_abort_keeps_the_evidence_already_gathered(tmp_path: Path) -> None:
+    """Unexamined ground must be visible as unexamined -- but examined ground must survive.
 
-    The delay is keyed to the task id rather than a call counter, because the timing
-    that matters is specific: the orchestrator drains its registry in order, and the
-    task it is *already awaiting* always runs to completion. Cancellation can only bite
-    a task later in the queue, so that is the one that has to still be in flight.
+    Under the sweep this test cancelled in-flight workers and checked that finished ones
+    kept their reports. There is no queue to cancel now: steps are executed one at a time
+    and each is appended to the ledger before the abort is polled. The guarantee that
+    still matters is the same one -- work already paid for is never discarded to make the
+    run easier to label.
     """
-
-    async def complete_json(self, **kwargs):  # type: ignore[override]
-        if str(kwargs.get("task_id", "")).endswith(("t1", "sweep-0002")):
-            await asyncio.sleep(30)  # cancelled long before this elapses
-        return await super().complete_json(**kwargs)
-
-
-async def test_hard_abort_records_cancelled_work_as_aborted(tmp_path: Path) -> None:
-    """Unexamined ground must be visible as unexamined, never as absence of evidence."""
     config = _config(tmp_path)
     paths = make_paths(config, "inv-abort-records")
-    paths.run_dir.mkdir(parents=True, exist_ok=True)
-
-    transcript = TranscriptLogger(paths.transcript, "inv-abort-records")
-    alert, inventory, catalog = load_run_inputs(
-        config.path(config.fixtures.alert),
-        config.path(config.fixtures.logs_dir),
-        slice_token_budget=config.run.slice_token_budget,
-        chars_per_token=config.run.chars_per_token,
-    )
-    orchestrator = Orchestrator(
-        config=config,
-        commander_client=_StaggeredStub(config.commander, transcript),
-        grunt_client=_StaggeredStub(config.grunt, transcript),
-        transcript=transcript,
-        alert=alert,
-        inventory=inventory,
-        catalog=catalog,
-        injection_signals=scan_catalog_for_injection(catalog),
-        investigation_id="inv-abort-records",
-        progress=_AbortOnFirstOutcome(paths.run_dir, AbortMode.HARD),
-        run_dir=paths.run_dir,
-    )
-    result = await orchestrator.run()
-    transcript.close()
-
-    assert result.terminal_state is InvestigationState.ABORTED_BY_OPERATOR
-    finished = [
-        json.loads(line)
-        for line in paths.transcript.read_text().splitlines()
-        if json.loads(line)["kind"] == "investigation_finished"
-    ][0]
-    assert "aborted" in finished["payload"]["failure_reasons"]
-
-
-async def test_work_that_already_finished_is_not_relabelled_as_aborted(tmp_path: Path) -> None:
-    """A hard abort must not discard a report a grunt had already produced.
-
-    The instant stub finishes every task before the orchestrator drains the registry, so
-    a naive implementation cancels completed tasks and files real reports as "aborted" --
-    losing evidence and lying about it in the ledger.
-    """
-    config = _config(tmp_path)
-    paths = make_paths(config, "inv-abort-nolie")
     paths.run_dir.mkdir(parents=True, exist_ok=True)
 
     result, paths = await run_investigation(
         config,
         backend="stub",
-        investigation_id="inv-abort-nolie",
-        progress=_AbortOnFirstOutcome(paths.run_dir, AbortMode.HARD),
+        investigation_id="inv-abort-records",
+        progress=_AbortOnFirstStep(paths.run_dir, AbortMode.HARD),
     )
 
-    finished = [
-        json.loads(line)
-        for line in paths.transcript.read_text().splitlines()
-        if json.loads(line)["kind"] == "investigation_finished"
-    ][0]
     assert result.terminal_state is InvestigationState.ABORTED_BY_OPERATOR
-    assert "aborted" not in finished["payload"]["failure_reasons"]
-    # The whole sweep completed before the abort was noticed, so every slice has a real
-    # report rather than a cancellation record.
-    assert finished["payload"]["outcomes"] == finished["payload"]["swept_slices"]
+    records = [json.loads(line) for line in paths.transcript.read_text().splitlines()]
+    executed = [r for r in records if r["kind"] == "action_executed"]
+    assert executed, "the completed step must still be in the transcript"
+    finished = [r for r in records if r["kind"] == "investigation_finished"][0]
+    assert finished["payload"]["steps_taken"] == len(executed)
 
 
 # -- control files ---------------------------------------------------------------------
@@ -246,7 +189,7 @@ async def test_the_brief_itself_records_that_the_run_was_interrupted(tmp_path: P
         config,
         backend="stub",
         investigation_id="inv-abort-flag",
-        progress=_AbortOnFirstOutcome(paths.run_dir, AbortMode.GRACEFUL),
+        progress=_AbortOnFirstStep(paths.run_dir, AbortMode.GRACEFUL),
     )
 
     assert result.brief is not None

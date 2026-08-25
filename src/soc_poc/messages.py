@@ -18,10 +18,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from soc_poc.schemas.brief import CommanderPlan
+from soc_poc.schemas.action import InvestigativeAction
+from soc_poc.schemas.directive import TaskDirective
 from soc_poc.schemas.grunt import GruntReport
 from soc_poc.schemas.slice import LogSlice
-from soc_poc.schemas.sweep import SweepDirective
 
 
 class GruntTasking(BaseModel):
@@ -37,10 +37,13 @@ class GruntTasking(BaseModel):
     # question it is serving without the commander's reasoning bleeding into the task
     # text -- and so the transcript records intent separately for later analysis.
     commander_intent: str
-    # What the commander decided is relevant, written from the alert alone. Identical
-    # across every task in a sweep round: the workers differ only in which slice they
-    # were handed, which is what makes their reports comparable.
-    directive: SweepDirective
+    # What counts as relevant for this task. Under the sweep architecture the commander
+    # wrote this once and every worker in the round shared it. A close_read is dispatched
+    # one at a time for one question, so it is now built per task by the orchestrator:
+    # indicators come from the alert's entities (exact strings by construction, which is
+    # what validation/citations.py needs to check a description against the line it cites)
+    # and relevance_criteria is the commander's question verbatim.
+    directive: TaskDirective
     data_slice: LogSlice
 
 
@@ -84,28 +87,18 @@ class GruntFailure(BaseModel):
 GruntOutcome = GruntSuccess | GruntFailure
 
 
-class PlanningResult(BaseModel):
-    """Result of one drill-down round: a plan, or a recorded reason there is none."""
+class ActionResult(BaseModel):
+    """Result of one INVESTIGATING call: the next action, or why there is none.
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    ok: bool
-    plan: CommanderPlan | None = None
-    error: str = ""
-    attempts: int = 0
-
-
-class TaskingResult(BaseModel):
-    """Result of the TASKING call: a sweep directive, or a recorded reason there is none.
-
-    A failure here is terminal for the investigation -- without a directive the workers
-    have no notion of relevance, and a sweep that reports everything is the same as a
-    sweep that reports nothing.
+    A failure here ends the investigation rather than degrading it. Unlike a failed
+    drill-down round under the old sweep architecture -- where the sweep had already
+    gathered everything the brief strictly needed -- there is no background pass here. If
+    the commander cannot say what to look at next, nothing has been looked at.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     ok: bool
-    directive: SweepDirective | None = None
+    action: InvestigativeAction | None = None
     error: str = ""
     attempts: int = 0

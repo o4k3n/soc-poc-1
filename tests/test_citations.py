@@ -133,7 +133,63 @@ def test_slice_id_mismatch_is_reported() -> None:
 
 def test_brief_level_audit_lists_unknown_refs_without_blocking() -> None:
     known = {"dns_resolver.log:L5"}
-    assert unresolved_brief_citations(["dns_resolver.log:L5"], known) == []
-    assert unresolved_brief_citations(
+    assert unresolved_brief_citations(["dns_resolver.log:L5"], known) == ([], [])
+    unresolved, malformed = unresolved_brief_citations(
         ["dns_resolver.log:L5", "dns_resolver.log:L900"], known
-    ) == ["dns_resolver.log:L900"]
+    )
+    assert unresolved == ["dns_resolver.log:L900"]
+    assert malformed == []
+
+
+def test_prose_in_a_citation_field_is_separated_from_unresolvable_refs() -> None:
+    """A real run emitted "... (representative sample) ..." into raw_line_refs.
+
+    Listing that beside a genuine unresolvable reference would imply a reader could go and
+    look it up.
+    """
+    unresolved, malformed = unresolved_brief_citations(
+        ["dns_resolver.log:L5", "dns_resolver.log:L900", "... (representative sample) ..."],
+        {"dns_resolver.log:L5"},
+    )
+    assert unresolved == ["dns_resolver.log:L900"]
+    assert malformed == ["... (representative sample) ..."]
+
+
+def test_a_reference_with_the_line_text_stuck_to_it_is_recovered() -> None:
+    """The evidence ledger renders each line as "<ref>  <text>", and the commander copies
+    the whole rendering into raw_line_refs -- 22 entries in one real run. That is a real
+    citation with debris attached, not prose in a citation field, and discarding it loses
+    a claim the operator could have checked."""
+    from soc_poc.validation.citations import normalise_ref, unresolved_brief_citations
+
+    assert normalise_ref("dhcp.log:L4  2026-08-14 07:44:57 ACK 10.12.34.56 wks-2291") == (
+        "dhcp.log:L4"
+    )
+    unresolved, malformed = unresolved_brief_citations(
+        ["dhcp.log:L4  2026-08-14 ACK wks-2291"], {"dhcp.log:L4"}
+    )
+    assert unresolved == [] and malformed == []
+
+
+def test_prose_in_a_citation_field_is_still_malformed() -> None:
+    """Normalisation must not launder a non-citation into a citation. A computed fact
+    (a profile burst, a step's count) is legitimate evidence but it is not a line."""
+    from soc_poc.validation.citations import unresolved_brief_citations
+
+    _, malformed = unresolved_brief_citations(
+        [
+            "activity bursts for t.api-sync-telemetry.net ... 288 events",
+            "count /10\\.12\\.34\\.56/ in suricata_eve_alert.json -> 4 match(es)",
+        ],
+        {"dhcp.log:L4"},
+    )
+    assert len(malformed) == 2
+
+
+def test_a_normalised_reference_that_was_never_shown_is_still_unresolved() -> None:
+    from soc_poc.validation.citations import unresolved_brief_citations
+
+    unresolved, malformed = unresolved_brief_citations(
+        ["dns.log:L99999  some text"], {"dhcp.log:L4"}
+    )
+    assert unresolved == ["dns.log:L99999"] and malformed == []

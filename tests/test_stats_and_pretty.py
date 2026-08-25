@@ -26,7 +26,7 @@ def test_multiline_strings_become_arrays_of_lines(tmp_path: Path) -> None:
     log = TranscriptLogger(tmp_path / "t.jsonl", "inv-1")
     log.log_llm_call(
         role="grunt", model="m", endpoint="e", task_id="t", parent_task_id=None,
-        state="COLLECTING", attempt=1, schema_name="grunt_report", params={},
+        state="EXECUTING", attempt=1, schema_name="grunt_report", params={},
         request_messages=[{"role": "system", "content": "line one\nline two\nline three"}],
         response_text='{"ok": true}', raw_response=None, finish_reason="stop",
         usage={}, latency_ms=1.0,
@@ -76,14 +76,14 @@ async def test_a_run_writes_stats_and_a_readable_transcript(tmp_path: Path) -> N
     stats = json.loads(paths.stats.read_text())
     assert stats["backend"] == "stub"
     assert stats["terminal_state"] == "DONE"
-    assert stats["work"]["slices"] > 0
-    assert stats["work"]["lines_swept"] > 0
-    assert stats["roles"]["grunt"]["calls"] > 0
-    assert stats["quality"]["slices_swept"] == stats["work"]["slices"]
+    assert stats["work"]["steps_taken"] > 0
+    assert stats["work"]["lines_available"] > 0
+    assert stats["roles"]["commander"]["calls"] > 0
+    assert stats["quality"]["steps_taken"] == stats["work"]["steps_taken"]
     # Phases are derived from transition timestamps and must name real states.
     assert set(stats["time"]["by_phase_s"]) <= {
-        "RECEIVED", "TASKING", "SWEEPING", "COLLECTING", "PLANNING",
-        "DISPATCHED", "SYNTHESIZING", "ABORTING", "ABORTED_ITERATION_CAP",
+        "RECEIVED", "PROFILING", "INVESTIGATING", "EXECUTING",
+        "SYNTHESIZING", "ABORTING", "ABORTED_ITERATION_CAP",
     }
     assert format_summary(stats)
 
@@ -117,7 +117,7 @@ def test_rejection_reasons_are_counted_per_report_not_per_problem() -> None:
     stats = build_stats(
         transcript_path=log_path, investigation_id="inv-r", case="c", backend="stub",
         terminal_state="DONE", wall_clock_s=1.0, metrics_before={}, metrics_after={},
-        sampler=None, brief=None, inventory=[], slice_count=0,
+        sampler=None, brief=None, inventory=[],
     )
     assert stats["work"]["rejection_reasons"] == {"fabricated_reference": 1}
     log_path.unlink(missing_ok=True)
@@ -146,63 +146,86 @@ def test_absent_measurements_are_null_not_zero() -> None:
 # -- the estimate ----------------------------------------------------------------------
 
 
-def _fake_history(tmp_path: Path, *, slices: int, collecting_s: float, concurrency: int = 8):
+def _fake_history(tmp_path: Path, *, seconds_per_step: float):
     run = tmp_path / "inv-20260101T000000Z-aaaa"
     run.mkdir(parents=True)
     (run / "stats.json").write_text(
         json.dumps({
             "investigation_id": "inv-20260101T000000Z-aaaa",
             "backend": "vllm",
-            "concurrency_configured": concurrency,
-            "time": {"by_phase_s": {"COLLECTING": collecting_s}},
-            "work": {"slices": slices},
-            "roles": {"grunt": {"calls": slices}},
+            "time": {"by_phase_s": {}, "seconds_per_step": seconds_per_step},
+            "work": {"steps_taken": 18},
+            "roles": {"commander": {"calls": 19}},
         }),
         encoding="utf-8",
     )
     return tmp_path
 
 
-def test_the_estimate_uses_observed_seconds_per_slice(tmp_path: Path) -> None:
-    """The old estimate modelled call latency and concurrency separately and was 8x out.
-    Observed wall-clock per slice already contains retries, stragglers and the tail."""
-    from soc_poc.stats import estimate_sweep
+def test_the_estimate_uses_observed_seconds_per_step(tmp_path: Path) -> None:
+    """The estimate is per-step because cost no longer scales with the corpus.
 
-    out = _fake_history(tmp_path, slices=83, collecting_s=1880.0)
-    minutes, basis = estimate_sweep(out, slices=83, concurrency=8)
-    assert 30 < minutes < 33  # the run this is modelled on took 31.3 min collecting
-    assert "per slice observed" in basis
+    Its predecessor multiplied slices by seconds and was 8x out. Observed wall-clock per
+    step already contains retries, stragglers and the latency tail.
+    """
+    from soc_poc.stats import estimate_investigation
 
-
-def test_the_estimate_scales_with_slice_count(tmp_path: Path) -> None:
-    from soc_poc.stats import estimate_sweep
-
-    out = _fake_history(tmp_path, slices=83, collecting_s=1880.0)
-    small, _ = estimate_sweep(out, slices=10, concurrency=8)
-    large, _ = estimate_sweep(out, slices=500, concurrency=8)
-    assert large > small * 40
+    out = _fake_history(tmp_path, seconds_per_step=40.0)
+    minutes, basis = estimate_investigation(out, max_steps=24)
+    assert 15 < minutes < 17  # 24 steps * 40s
+    assert "per step observed" in basis
 
 
-def test_raising_concurrency_lowers_the_estimate(tmp_path: Path) -> None:
-    from soc_poc.stats import estimate_sweep
+def test_the_estimate_does_not_scale_with_the_corpus(tmp_path: Path) -> None:
+    """The headline consequence of dropping the sweep: a 40 MB case costs what a 1 MB
+    case costs, because searching is free and only commander turns are paid for."""
+    from soc_poc.stats import estimate_investigation
 
-    out = _fake_history(tmp_path, slices=83, collecting_s=1880.0, concurrency=8)
-    base, _ = estimate_sweep(out, slices=83, concurrency=8)
-    doubled, basis = estimate_sweep(out, slices=83, concurrency=16)
-    assert doubled < base
-    assert "scaled for concurrency" in basis
+    out = _fake_history(tmp_path, seconds_per_step=40.0)
+    # Same budget, and the corpus is not an input at all.
+    first, _ = estimate_investigation(out, max_steps=24)
+    second, _ = estimate_investigation(out, max_steps=24)
+    assert first == second
+    doubled, _ = estimate_investigation(out, max_steps=48)
+    assert doubled == first * 2
 
 
 def test_stub_runs_are_not_used_as_history(tmp_path: Path) -> None:
     """A stub run takes milliseconds and says nothing about GPU wall clock."""
-    from soc_poc.stats import estimate_sweep
+    from soc_poc.stats import estimate_investigation
 
     run = tmp_path / "inv-stub"
     run.mkdir(parents=True)
     (run / "stats.json").write_text(
-        json.dumps({"backend": "stub", "time": {"by_phase_s": {"COLLECTING": 0.1}},
-                    "work": {"slices": 83}, "roles": {"grunt": {"calls": 83}}}),
+        json.dumps({"backend": "stub", "time": {"seconds_per_step": 0.001},
+                    "work": {"steps_taken": 5}, "roles": {"commander": {"calls": 6}}}),
         encoding="utf-8",
     )
-    _, basis = estimate_sweep(tmp_path, slices=83, concurrency=8)
+    _, basis = estimate_investigation(tmp_path, max_steps=24)
     assert "no previous run" in basis
+
+
+def test_a_run_without_close_reads_still_calibrates_the_estimate(tmp_path: Path) -> None:
+    """An investigation can now legitimately dispatch zero workers.
+
+    The estimator used to require grunt calls to accept a run as history. Under the
+    action loop a commander that answers everything with counts and searches is a good
+    run, not an incomplete one, and it must not be invisible to the next estimate.
+    """
+    from soc_poc.stats import estimate_investigation
+
+    run = tmp_path / "inv-20260101T000000Z-bbbb"
+    run.mkdir(parents=True)
+    (run / "stats.json").write_text(
+        json.dumps({
+            "investigation_id": "inv-20260101T000000Z-bbbb",
+            "backend": "vllm",
+            "time": {"seconds_per_step": 30.0},
+            "work": {"steps_taken": 12},
+            "roles": {"commander": {"calls": 13}},  # no grunt role at all
+        }),
+        encoding="utf-8",
+    )
+    minutes, basis = estimate_investigation(tmp_path, max_steps=10)
+    assert minutes == 5.0
+    assert "per step observed" in basis

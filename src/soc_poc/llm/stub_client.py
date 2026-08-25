@@ -11,9 +11,9 @@ prompt exactly as a model would, pulling slice ids and line references out of th
 fenced data block. If the prompt fails to carry the information a model needs, the
 stub fails too -- which is the point of testing against it.
 
-It also *deliberately fails once*: the first grunt report it produces cites a line that
-was never shown, so every offline run exercises the citation validator and the
-one-shot retry-with-feedback path. Look for it in the transcript.
+It also *deliberately fails twice*, so every offline run exercises both retry paths:
+the first action it emits names a log file that does not exist, and the first grunt
+report it produces cites a line that was never shown. Look for both in the transcript.
 """
 
 from __future__ import annotations
@@ -32,12 +32,16 @@ from soc_poc.transcript import Stopwatch, TranscriptLogger
 # is exactly the kind of near-miss a real model makes, but not what we want the stub
 # doing by accident.
 _SLICE_REF_RE = re.compile(r"^([\w.\-]+:L\d+)\t", re.MULTILINE)
-# In a synthesis prompt there is no raw data, only the refs grunts cited.
-_CITED_REF_RE = re.compile(r"^\s*refs: (.+)$", re.MULTILINE)
-# In a grunt prompt the slice is named in the header line; in a drill-down prompt the
-# only slice ids are the ones that reported findings.
+# In an investigate or synthesis prompt the lines the commander has been shown are
+# rendered by evidence.py as "     <ref>  <text>". This is how the stub cites only what
+# it was actually shown, which is exactly the constraint a real commander is under.
+_SHOWN_REF_RE = re.compile(r"^ +([\w.\-]+:L\d+)  ", re.MULTILINE)
+# In a grunt prompt the slice is named in the header line.
 _SLICE_ID_RE = re.compile(r"^SLICE (\S+)", re.MULTILINE)
-_FINDING_SLICE_RE = re.compile(r"^- (\S+) \(", re.MULTILINE)
+# The searchable files and their sizes, read out of the block the investigate prompt
+# renders. The stub picks the largest to close_read, the way an analyst would: the file
+# with the most lines is where the traffic is.
+_FILE_RE = re.compile(r"^  ([\w.\-]+): (\d+) lines$", re.MULTILINE)
 _DOMAIN_RE = re.compile(r"\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|local)\b")
 _IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
@@ -46,11 +50,8 @@ def _slice_refs(prompt: str) -> list[str]:
     return list(dict.fromkeys(_SLICE_REF_RE.findall(prompt)))
 
 
-def _cited_refs(prompt: str) -> list[str]:
-    refs: list[str] = []
-    for group in _CITED_REF_RE.findall(prompt):
-        refs.extend(ref.strip() for ref in group.split(",") if ref.strip())
-    return list(dict.fromkeys(refs))
+def _shown_refs(prompt: str) -> list[str]:
+    return list(dict.fromkeys(_SHOWN_REF_RE.findall(prompt)))
 
 
 class StubClient:
@@ -65,6 +66,7 @@ class StubClient:
         self.role = config.role
         self._transcript = transcript
         self._grunt_calls = 0
+        self._actions = 0
 
     async def complete_json(
         self,
@@ -125,10 +127,8 @@ class StubClient:
                 "in the slice. Re-reading the fenced lines and citing only those."
             )
         return {
-            "sweep_directive": "Reading the alert. The detector names a domain and a "
-            "host, so those are the indicators; but I should tell the workers to flag "
-            "periodicity and encoding too, or they will just grep.",
-            "commander_plan": "The sweep came back. One slice looks worth a closer read.",
+            "investigative_action": "The profile gives me exact counts to start from. "
+            "Establishing the quantity before I reason about what it means.",
             "grunt_report": "Reading the slice line by line. Recording what is literally "
             "present, and noting what I checked for and did not find.",
             "investigation_brief": "Assembling the timeline from cited lines, then stating "
@@ -139,50 +139,127 @@ class StubClient:
     # -- canned bodies ---------------------------------------------------------------
 
     def _respond(self, schema_name: str, prompt: str, attempt: int) -> dict[str, Any]:
-        if schema_name == "sweep_directive":
-            return self._directive(prompt)
-        if schema_name == "commander_plan":
-            return self._plan(prompt)
+        if schema_name == "investigative_action":
+            return self._action(prompt, attempt)
         if schema_name == "grunt_report":
             return self._report(prompt, attempt)
         if schema_name == "investigation_brief":
             return self._brief(prompt)
         raise ValueError(f"stub client has no canned response for schema {schema_name!r}")
 
-    def _directive(self, prompt: str) -> dict[str, Any]:
-        """Pull indicators straight out of the fenced alert, as a real commander would."""
-        domains = list(dict.fromkeys(_DOMAIN_RE.findall(prompt)))[:4]
-        ips = list(dict.fromkeys(_IP_RE.findall(prompt)))[:4]
-        return {
-            "alert_restatement": "An external detector flagged suspicious traffic; find "
-            "lines that bear on it.",
-            "indicators": domains + ips,
-            "relevance_criteria": "Any line involving the named hosts or domains, plus "
-            "anything showing unusual periodicity, volume, encoding or record types even "
-            "if it matches none of the indicators.",
-            "explicitly_irrelevant": ["routine internal name resolution"],
-            "time_window": "",
-        }
+    def _action(self, prompt: str, attempt: int) -> dict[str, Any]:
+        """A short fixed investigation, derived from the prompt the way a model would.
 
-    def _plan(self, prompt: str) -> dict[str, Any]:
-        """After a sweep the stub asks for one drill-down, then stops."""
-        slice_ids = list(dict.fromkeys(_FINDING_SLICE_RE.findall(prompt)))
-        is_followup = "DRILL-DOWN ROUND 2" in prompt
-        chosen = [] if is_followup else slice_ids[:1]
+        The sequence deliberately covers every verb, so an offline run exercises the
+        deterministic executor, the close_read worker path and the conclude exit.
+        """
+        files = sorted(
+            ((name, int(count)) for name, count in _FILE_RE.findall(prompt)),
+            key=lambda pair: -pair[1],
+        )
+        primary = files[0][0] if files else ""
+        domains = list(dict.fromkeys(_DOMAIN_RE.findall(prompt)))
+        shown = _shown_refs(prompt)
+
+        # A retry re-answers the same step rather than advancing: the loop asked for a
+        # correction, not for the next question.
+        if attempt == 1:
+            self._actions += 1
+        step = self._actions
+
+        if step == 1:
+            # Deliberately names a file that does not exist, on the first attempt only.
+            # validate_action rejects it, the loop re-prompts with the reason, and the
+            # corrected action goes through -- so the action-retry path runs every time.
+            return {
+                "reasoning": "Establishing how much traffic the alerted domain accounts "
+                "for before reasoning about it.",
+                "expectation": "A large share of one file. Zero would mean the alert "
+                "names something absent from these logs.",
+                "action": "count",
+                "pattern": domains[0] if domains else "example",
+                # Empty means every file. Scoping this to one file is how an earlier
+                # version searched a DHCP log for a domain and concluded on two zeroes.
+                "file": "nosuch.log" if attempt == 1 else "",
+                "ref": "",
+                "start_line": 0,
+                "end_line": 0,
+                "question": "",
+            }
+        if step == 2:
+            return {
+                "reasoning": "Pulling actual lines so I can see who the source is.",
+                "expectation": "A single source address, if this is one host.",
+                "action": "search",
+                "pattern": domains[0] if domains else "example",
+                "file": "",
+                "ref": "",
+                "start_line": 0,
+                "end_line": 0,
+                "question": "",
+            }
+        if step == 3 and shown:
+            return {
+                "reasoning": "Reading around the first hit for neighbouring records.",
+                "expectation": "Adjacent lines may resolve infrastructure the query "
+                "itself only names.",
+                "action": "context",
+                "pattern": "",
+                "file": "",
+                "ref": shown[0],
+                "start_line": 0,
+                "end_line": 0,
+                "question": "",
+            }
+        if step == 4 and domains:
+            return {
+                "reasoning": "Checking whether this shape is confined to one host or is "
+                "estate-wide -- one host is a finding, forty is a vendor service.",
+                "expectation": "If many distinct sources emit it, the alert is likelier "
+                "to be a benign lookalike.",
+                "action": "count",
+                "pattern": domains[0],
+                "file": "",
+                "ref": "",
+                "start_line": 0,
+                "end_line": 0,
+                "question": "",
+            }
+        if step == 5 and primary:
+            return {
+                "reasoning": "Reading a range verbatim to see what the responses carried.",
+                "expectation": "Answer payloads, or confirmation that none were logged.",
+                "action": "read_lines",
+                "pattern": "",
+                "file": primary,
+                "ref": "",
+                "start_line": 1,
+                "end_line": 8,
+                "question": "",
+            }
+        if step == 6 and primary:
+            return {
+                "reasoning": "Handing a bounded range to a worker for a question counting "
+                "cannot answer.",
+                "expectation": "A description of what these lines have in common.",
+                "action": "close_read",
+                "pattern": "",
+                "file": primary,
+                "ref": "",
+                "start_line": 1,
+                "end_line": 12,
+                "question": "What do these lines have in common, and what differs?",
+            }
         return {
-            "planning_rationale": "Re-reading the slice with the densest findings."
-            if chosen
-            else "The sweep is sufficient; going to synthesis.",
-            "tasks": [
-                {
-                    "instruction": f"Re-read {slice_id} closely and report the detail "
-                    "behind the aggregate.",
-                    "commander_intent": "Confirming the pattern the sweep flagged.",
-                    "slice_id": slice_id,
-                }
-                for slice_id in chosen
-            ],
-            "request_followup": False,
+            "reasoning": "The counts and the lines behind them are enough for the brief.",
+            "expectation": "Further reading would not change what the operator does.",
+            "action": "conclude",
+            "pattern": "",
+            "file": "",
+            "ref": "",
+            "start_line": 0,
+            "end_line": 0,
+            "question": "",
         }
 
     def _report(self, prompt: str, attempt: int) -> dict[str, Any]:
@@ -208,6 +285,7 @@ class StubClient:
                     {
                         "checked_for": "lines matching the directive's indicators",
                         "found": False,
+                        "scope": f"all lines of {slice_id}",
                         "result": "none present in this slice",
                     }
                 ],
@@ -240,19 +318,21 @@ class StubClient:
                 {
                     "checked_for": "successful A-record responses with routable answers",
                     "found": False,
+                    "scope": f"all lines of {slice_id}",
                     "result": "none present in this slice",
                 }
             ],
         }
 
     def _brief(self, prompt: str) -> dict[str, Any]:
-        refs = _cited_refs(prompt)
+        refs = _shown_refs(prompt)
         return {
             "investigation_narrative": (
-                "Grunt workers examined the resolver, proxy and endpoint slices linked to "
-                "the alert's pattern summaries. The periodic resolution pattern is "
-                "present in the raw lines; supporting egress context is thinner. This "
-                "brief enriches the external alert and reaches no disposition."
+                "Searches against the case corpus established the volume attributable to "
+                "the alerted domain and the lines behind it. The periodic resolution "
+                "pattern is present in the raw lines; supporting egress context is "
+                "thinner. This brief enriches the external alert and reaches no "
+                "disposition."
             ),
             "timeline": [
                 {
@@ -272,9 +352,12 @@ class StubClient:
                     ],
                     "contradicting_evidence": [
                         {
+                            # Deliberately uncited: an absence of evidence has no line to
+                            # point at, and every offline run must exercise the code that
+                            # flags unciteable claims on the brief.
                             "description": "No corresponding outbound session was "
-                            "confirmed in the proxy slice examined.",
-                            "raw_line_refs": refs[2:3],
+                            "confirmed in the traffic searched.",
+                            "raw_line_refs": [],
                         }
                     ],
                 }
@@ -288,7 +371,10 @@ class StubClient:
                 }
             ],
             "open_questions": ["Is the domain seen on any other host in the estate?"],
-            "coverage_gaps": ["Only the linked windows were read, not the full day."],
+            "coverage_gaps": [
+                "Only the patterns searched were examined; the rest of the corpus was "
+                "not read.",
+            ],
         }
 
     async def aclose(self) -> None:

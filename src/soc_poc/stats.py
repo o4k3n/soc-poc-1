@@ -267,7 +267,6 @@ def build_stats(
     sampler: ResourceSampler | None,
     brief: Any | None,
     inventory: list[Any],
-    slice_count: int,
     concurrency_configured: int = 0,
 ) -> dict[str, Any]:
     records = []
@@ -327,6 +326,10 @@ def build_stats(
                 seen.add("hit_recorded_as_check")
             elif "no representative_refs" in problem:
                 seen.add("uncited_finding")
+            elif "none of the lines it cites contain" in problem:
+                seen.add("description_not_supported_by_lines")
+            elif "slice_metadata.slice_id" in problem:
+                seen.add("wrong_slice_id")
             elif "not valid JSON" in problem:
                 seen.add("invalid_json")
             else:
@@ -337,7 +340,10 @@ def build_stats(
         (r["payload"] for r in records if r.get("kind") == "investigation_finished"), {}
     )
     grunt_latency = roles.get("grunt", {}).get("latency") or {}
-    sweep_seconds = _phase_durations(records).get("COLLECTING", 0.0)
+    # Worker time now happens inside EXECUTING (close_read only), not across a whole
+    # COLLECTING phase. On a run with no close_reads this is legitimately zero.
+    executing_seconds = _phase_durations(records).get("EXECUTING", 0.0)
+    steps = finished.get("steps_taken", 0)
 
     stats: dict[str, Any] = {
         "investigation_id": investigation_id,
@@ -351,16 +357,28 @@ def build_stats(
             "by_phase_s": _phase_durations(records),
             # Sum of worker time over the wall time they ran in: how much of the
             # configured concurrency was actually realised.
+            # Kept for continuity with earlier runs, but it means something narrower
+            # now: close_reads are issued one at a time, so this should sit near 1.0.
+            # The sweep architecture's 6-8x figure has no counterpart here, because
+            # there is no longer a fleet to run in parallel.
             "effective_parallelism": (
-                round(grunt_latency.get("total_s", 0) / sweep_seconds, 1)
-                if sweep_seconds
+                round(grunt_latency.get("total_s", 0) / executing_seconds, 1)
+                if executing_seconds
                 else None
+            ),
+            "seconds_per_step": (
+                round(wall_clock_s / steps, 1) if steps else None
             ),
         },
         "work": {
             "files": len(inventory),
-            "lines_swept": sum(getattr(i, "line_count", 0) for i in inventory),
-            "slices": slice_count,
+            # What was searchable, not what was read. Under the sweep this was
+            # lines_swept and claimed every line had been examined by a model; the
+            # honest version of the number is the size of the corpus.
+            "lines_available": sum(getattr(i, "line_count", 0) for i in inventory),
+            "steps_taken": steps,
+            "steps_with_errors": finished.get("steps_with_errors"),
+            "refs_shown": finished.get("refs_shown"),
             "llm_calls": len(calls),
             "grunt_validations": len(validations),
             "grunt_rejections": len(rejected),
@@ -373,7 +391,7 @@ def build_stats(
         },
         "roles": roles,
         "quality": {
-            "slices_swept": getattr(brief, "slices_swept", None),
+            "steps_taken": getattr(brief, "steps_taken", None),
             "unresolved_citations": len(getattr(brief, "unresolved_citations", []) or []),
             "uncited_claims": len(getattr(brief, "uncited_claims", []) or []),
             "timeline_events": len(getattr(getattr(brief, "body", None), "timeline", []) or []),
@@ -391,47 +409,38 @@ def build_stats(
 # Fallbacks for the very first run on a machine, before there is any history to learn
 # from. Deliberately pessimistic: an estimate that under-promises is a nuisance, one that
 # over-promises makes people walk away from a run that was about to finish.
-DEFAULT_SECONDS_PER_SLICE = 180.0
+DEFAULT_SECONDS_PER_STEP = 45.0
 
 
-def estimate_sweep(
-    output_dir: Path, *, slices: int, concurrency: int
-) -> tuple[float, str]:
-    """Estimate sweep minutes, calibrated from this machine's own last real run.
+def estimate_investigation(output_dir: Path, *, max_steps: int) -> tuple[float, str]:
+    """Estimate worst-case minutes, calibrated from this machine's own last real run.
 
-    The first version multiplied slices by a hardcoded 25 s and divided by the configured
-    concurrency. It predicted 4.3 minutes for a run that took 34.6 -- eight times out,
-    because it ignored retries (83 slices produced 136 calls), the gap between configured
-    and achieved concurrency (6.0 of 8), and the latency tail (median 41 s, p95 338 s).
+    Cost no longer scales with the corpus. A 1 MB case and a 40 MB case cost the same
+    here, because searching is free and the only thing being paid for is commander turns
+    -- which is the largest practical consequence of dropping the sweep.
 
-    Rather than model those separately and get each of them slightly wrong, this uses the
-    one number that already contains all of them: **wall-clock seconds per slice in the
-    COLLECTING phase of the last real run.** Retries, stragglers, queueing and the tail
-    are in it by construction. Returns (minutes, basis).
+    So the estimate is per-STEP, and it is a ceiling rather than a prediction: most
+    investigations conclude before the cap. Calibrated on wall-clock seconds per step
+    from the last real run, which carries retries and the latency tail by construction.
+    Returns (minutes, basis).
     """
     previous = _latest_stats(output_dir)
     if previous:
         try:
-            observed_slices = previous["work"]["slices"]
-            collecting = previous["time"]["by_phase_s"]["COLLECTING"]
-            per_slice = collecting / observed_slices
-            # If concurrency has been changed since, scale by it -- crudely, because
-            # throughput does not scale linearly, but it beats ignoring the change.
-            was = previous.get("concurrency_configured") or concurrency
-            scale = was / concurrency if concurrency else 1.0
-            return (
-                slices * per_slice * scale / 60,
-                f"last real run {previous['investigation_id']}: "
-                f"{per_slice:.0f}s per slice observed"
-                + (f", scaled for concurrency {was}->{concurrency}" if was != concurrency else ""),
-            )
+            per_step = previous["time"]["seconds_per_step"]
+            if per_step:
+                return (
+                    max_steps * per_step / 60,
+                    f"last real run {previous['investigation_id']}: "
+                    f"{per_step:.0f}s per step observed",
+                )
         except (KeyError, TypeError, ZeroDivisionError):
             pass
 
     # No history: deliberately pessimistic. An estimate that under-promises is a
     # nuisance; one that over-promises makes people kill a run that was about to finish.
     return (
-        slices * DEFAULT_SECONDS_PER_SLICE / concurrency / 60,
+        max_steps * DEFAULT_SECONDS_PER_STEP / 60,
         "defaults (no previous run on this machine)",
     )
 
@@ -447,7 +456,10 @@ def _latest_stats(output_dir: Path) -> dict[str, Any] | None:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if data.get("backend") == "vllm" and data.get("roles", {}).get("grunt", {}).get("calls"):
+        # Gated on commander calls, not grunt calls: a perfectly good investigation can
+        # now run without dispatching a single worker, and gating on grunts would make
+        # those runs invisible to the estimator.
+        if data.get("backend") == "vllm" and data.get("roles", {}).get("commander", {}).get("calls"):
             return data
     return None
 
@@ -458,7 +470,7 @@ def format_summary(stats: dict[str, Any]) -> str:
     work = stats["work"]
     lines = [
         f"  wall clock     : {time_block['wall_clock_s'] / 60:.1f} min",
-        f"  slices / lines : {work['slices']} / {work['lines_swept']}",
+        f"  steps / lines  : {work['steps_taken']} / {work['lines_available']}",
         f"  llm calls      : {work['llm_calls']}"
         + (
             f"  ({work['grunt_rejections']} rejected, "

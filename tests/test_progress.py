@@ -46,8 +46,9 @@ async def test_reasoning_tokens_reach_the_sink(tmp_path: Path) -> None:
     )
 
     assert any(channel == "reasoning" for channel, _ in recorder.tokens)
-    assert ("RECEIVED", "TASKING") in recorder.states
-    assert ("TASKING", "SWEEPING") in recorder.states
+    assert ("RECEIVED", "PROFILING") in recorder.states
+    assert ("PROFILING", "INVESTIGATING") in recorder.states
+    assert ("INVESTIGATING", "EXECUTING") in recorder.states
     assert recorder.outcomes, "grunt outcomes must be reported to the sink"
 
 
@@ -70,13 +71,13 @@ async def test_a_silent_sink_changes_nothing_about_the_record(tmp_path: Path) ->
 def test_console_writes_to_its_stream_and_wraps() -> None:
     buffer = io.StringIO()
     console = ConsoleProgress(buffer)
-    console.state_changed("PLANNING", "DISPATCHED", 0)
+    console.state_changed("INVESTIGATING", "EXECUTING", 0)
     console.token("reasoning", "word " * 80)
     console.token("content", '{"ignored": true}')
     console.task_outcome("t-1", "slice-1", "2 observations", ok=True)
 
     output = buffer.getvalue()
-    assert "PLANNING → DISPATCHED" in output
+    assert "INVESTIGATING → EXECUTING" in output
     assert "word" in output
     # Content is the artifact; it belongs in the brief, not scrolling past the operator.
     assert "ignored" not in output

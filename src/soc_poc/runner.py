@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict
 
 from soc_poc.config import AppConfig
 from soc_poc.control import clear_marker, write_marker
+from soc_poc.corpus import Corpus
 from soc_poc.llm.base import LLMClient
 from soc_poc.llm.stub_client import StubClient
 from soc_poc.llm.vllm_client import VLLMClient
@@ -110,6 +111,9 @@ async def run_investigation(
     progress = progress or NullProgress()
     transcript = TranscriptLogger(paths.transcript, investigation_id)
 
+    # The catalog (fixed-size slices) survives for two narrow jobs: the injection scan
+    # over all raw content, and the file inventory. Nothing dispatches against it any
+    # more -- the investigation reads the corpus directly.
     alert, inventory, catalog = load_run_inputs(
         config.path(config.fixtures.alert),
         config.path(config.fixtures.logs_dir),
@@ -119,12 +123,13 @@ async def run_investigation(
     # Injection scan runs once over all raw content at load time; hits ride along to
     # the brief because an attempt to address an AI system is itself a signal.
     injection_signals = scan_catalog_for_injection(catalog)
+    corpus = Corpus.from_dir(config.path(config.fixtures.logs_dir))
     transcript.log_event(
         "inputs_loaded",
         {
             "alert_id": alert.alert_id,
             "files": [item.model_dump() for item in inventory],
-            "slices": len(catalog),
+            "lines": sum(item.line_count for item in inventory),
             "injection_signals": [s.model_dump() for s in injection_signals],
             "backend": backend,
         },
@@ -165,8 +170,8 @@ async def run_investigation(
             grunt_client=grunt_client,
             transcript=transcript,
             alert=alert,
+            corpus=corpus,
             inventory=inventory,
-            catalog=catalog,
             injection_signals=injection_signals,
             investigation_id=investigation_id,
             progress=progress,
@@ -207,7 +212,6 @@ async def run_investigation(
                 sampler=sampler,
                 brief=result.brief,
                 inventory=inventory,
-                slice_count=len(catalog),
                 concurrency_configured=config.run.max_concurrent_grunts,
             ),
         )

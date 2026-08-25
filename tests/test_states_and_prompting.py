@@ -43,9 +43,10 @@ SLICE = LogSlice(
 def test_happy_path_transitions_are_legal() -> None:
     path = [
         InvestigationState.RECEIVED,
-        InvestigationState.TASKING,
-        InvestigationState.SWEEPING,
-        InvestigationState.COLLECTING,
+        InvestigationState.PROFILING,
+        InvestigationState.INVESTIGATING,
+        InvestigationState.EXECUTING,
+        InvestigationState.INVESTIGATING,
         InvestigationState.SYNTHESIZING,
         InvestigationState.DONE,
     ]
@@ -53,29 +54,49 @@ def test_happy_path_transitions_are_legal() -> None:
         assert_legal_transition(current, following)
 
 
-def test_drilldown_loop_is_legal() -> None:
-    assert_legal_transition(InvestigationState.COLLECTING, InvestigationState.PLANNING)
-    assert_legal_transition(InvestigationState.COLLECTING, InvestigationState.ABORTED_ITERATION_CAP)
-    assert_legal_transition(InvestigationState.ABORTED_ITERATION_CAP, InvestigationState.SYNTHESIZING)
+def test_the_action_loop_is_legal() -> None:
+    """INVESTIGATING <-> EXECUTING is the loop; the cap is the only forced exit."""
+    assert_legal_transition(
+        InvestigationState.INVESTIGATING, InvestigationState.EXECUTING
+    )
+    assert_legal_transition(
+        InvestigationState.EXECUTING, InvestigationState.INVESTIGATING
+    )
+    assert_legal_transition(
+        InvestigationState.EXECUTING, InvestigationState.ABORTED_ITERATION_CAP
+    )
+    assert_legal_transition(
+        InvestigationState.ABORTED_ITERATION_CAP, InvestigationState.SYNTHESIZING
+    )
 
 
 def test_skipping_states_is_rejected() -> None:
     with pytest.raises(IllegalTransitionError):
-        assert_legal_transition(InvestigationState.PLANNING, InvestigationState.DONE)
+        assert_legal_transition(InvestigationState.EXECUTING, InvestigationState.DONE)
     with pytest.raises(IllegalTransitionError):
-        assert_legal_transition(InvestigationState.RECEIVED, InvestigationState.COLLECTING)
-    # The commander must not reach the data-reading states without first writing a
-    # directive from the alert.
+        assert_legal_transition(
+            InvestigationState.RECEIVED, InvestigationState.INVESTIGATING
+        )
+    # Nothing reaches the data without the computed profile being built first: the
+    # profile is the commander's only starting point, and skipping it would put it in
+    # front of the corpus with nothing to orient on.
     with pytest.raises(IllegalTransitionError):
-        assert_legal_transition(InvestigationState.RECEIVED, InvestigationState.SWEEPING)
+        assert_legal_transition(
+            InvestigationState.RECEIVED, InvestigationState.EXECUTING
+        )
 
 
-def test_the_sweep_is_the_only_way_out_of_tasking() -> None:
-    """Coverage is not optional: TASKING cannot skip to synthesis or drill-down."""
-    for illegal in (InvestigationState.SYNTHESIZING, InvestigationState.PLANNING):
-        with pytest.raises(IllegalTransitionError):
-            assert_legal_transition(InvestigationState.TASKING, illegal)
-    assert_legal_transition(InvestigationState.TASKING, InvestigationState.SWEEPING)
+def test_executing_cannot_reach_synthesis_directly() -> None:
+    """Every step returns to the commander, even the last one.
+
+    The exit from the loop is a decision the commander makes in INVESTIGATING (conclude)
+    or the cap makes for it. If EXECUTING could jump to synthesis, a step's result would
+    reach the brief without the commander ever having seen it.
+    """
+    with pytest.raises(IllegalTransitionError):
+        assert_legal_transition(
+            InvestigationState.EXECUTING, InvestigationState.SYNTHESIZING
+        )
 
 
 def test_terminal_states_have_no_outgoing_edges() -> None:

@@ -1,4 +1,4 @@
-"""The commander's contracts: the plan it emits, and the brief it synthesizes.
+"""The commander's contract: the brief it synthesizes.
 
 Read this next to validation/no_verdict.py. The single most important property of
 `BriefBody` is a field that is *absent*: there is no verdict, disposition, severity,
@@ -15,37 +15,6 @@ validation/no_verdict.py::assert_no_verdict_fields.
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
-
-
-# --------------------------------------------------------------------------------
-# Planning
-# --------------------------------------------------------------------------------
-
-
-class PlannedTask(BaseModel):
-    """One narrow unit of work the commander wants a grunt to perform."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    instruction: str
-    # The hypothesis in play, kept as its own field rather than folded into the
-    # instruction: the grunt is told what the commander is trying to find out, so it
-    # can report a useful negative, and the transcript records intent separately from
-    # task text for later analysis of where the hierarchy loses information.
-    commander_intent: str
-    slice_id: str  # must name a slice from the catalog offered to the commander
-
-
-class CommanderPlan(BaseModel):
-    """Guided-decoding target for a planning round."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    planning_rationale: str
-    tasks: list[PlannedTask] = Field(default_factory=list)
-    # The commander may drill down further; the orchestrator decides whether it is
-    # allowed to, based on the iteration cap.
-    request_followup: bool
 
 
 # --------------------------------------------------------------------------------
@@ -122,18 +91,25 @@ class AlertRef(BaseModel):
     note: str = "Alert status and severity are owned by the external detector and are reproduced here unchanged."
 
 
-class TaskLedgerEntry(BaseModel):
-    """Audit row per dispatched grunt task, including the ones that failed."""
+class StepLedgerEntry(BaseModel):
+    """Audit row per investigative step: what was asked, why, and what came back.
+
+    `reproduce` is the point of this table. It is the shell command that re-runs the step
+    against the same files, so an operator can check any claim in the brief in seconds
+    rather than taking it on trust. Under the previous architecture the equivalent row said
+    "worker dns-0031 read slice 31 and reported 2 findings", which is only checkable by
+    reading the transcript and re-running a GPU.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    task_id: str
-    iteration: int
-    slice_id: str
-    instruction: str
-    commander_intent: str
-    outcome: str  # "report" | "failure"
-    detail: str = ""
+    step: int
+    action: str
+    reasoning: str
+    expectation: str
+    result: str
+    reproduce: str = ""
+    error: str = ""
 
 
 class InvestigationBrief(BaseModel):
@@ -145,15 +121,19 @@ class InvestigationBrief(BaseModel):
     generated_at: str
     alert_ref: AlertRef
     body: BriefBody
-    task_ledger: list[TaskLedgerEntry] = Field(default_factory=list)
+    step_ledger: list[StepLedgerEntry] = Field(default_factory=list)
     # Content in the logs that looked like it was addressing an AI system. An injection
     # attempt is itself a detection signal, so it is surfaced to the operator rather
     # than quietly filtered.
     injection_signals: list[dict[str, str]] = Field(default_factory=list)
     iterations_used: int = 0
-    # How many slices the sweep read. With total coverage this is the number that makes
-    # "we found nothing else" a claim rather than a hope.
-    slices_swept: int = 0
+    # How many actions the commander spent. Paired with the step ledger this is the whole
+    # cost of the investigation, and every one of them is reproducible from the ledger.
+    steps_taken: int = 0
+    # Lines in the case. Under the sweep architecture the comparable number was
+    # slices_swept, which claimed total coverage; this claims only the size of the corpus
+    # that was searchable, which is the honest version of the same statement.
+    lines_available: int = 0
     terminal_state: str = ""
     # Stamped by code, not written by the commander. A graceful abort ends in DONE --
     # synthesis really did complete -- so without this field the artifact looks like a
@@ -162,6 +142,11 @@ class InvestigationBrief(BaseModel):
     # this is.
     aborted_by_operator: bool = False
     unresolved_citations: list[str] = Field(default_factory=list)
+    # Entries that are not references at all -- a run emitted
+    # "... (representative sample) ..." into a raw_line_refs array. Kept apart from
+    # unresolved_citations because they are a different failure: an unresolvable reference
+    # is one a reader could try to chase, prose in a citation field is not.
+    malformed_citations: list[str] = Field(default_factory=list)
     # Evidence and timeline entries the commander wrote with no line reference at all.
     # Stamped by code, non-blocking: some claims are legitimately uncitable ("no
     # host-level telemetry was in scope"). But in the first real run the correlation was

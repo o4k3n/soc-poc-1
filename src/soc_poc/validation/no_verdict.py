@@ -86,10 +86,11 @@ def assert_no_verdict_fields(model: type[BaseModel]) -> None:
 
 def assert_all_output_schemas_clean() -> None:
     """Run the check over every schema this system hands to a model."""
-    from soc_poc.schemas.brief import BriefBody, CommanderPlan
+    from soc_poc.schemas.action import InvestigativeAction
+    from soc_poc.schemas.brief import BriefBody
     from soc_poc.schemas.grunt import GruntReport
 
-    for model in (BriefBody, CommanderPlan, GruntReport):
+    for model in (BriefBody, InvestigativeAction, GruntReport):
         assert_no_verdict_fields(model)
 
 

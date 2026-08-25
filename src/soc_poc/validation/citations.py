@@ -30,6 +30,18 @@ from soc_poc.schemas.slice import LogSlice
 
 # "<file>:L<n>" -- the only citation form this system accepts.
 LINE_REF_PATTERN = re.compile(r"^[\w.\-/]+:L\d+$")
+# The same reference when it has the line's text stuck to it. The evidence ledger renders
+# each line as "<ref>  <text>", and the commander copies the whole rendering into
+# raw_line_refs -- 22 of them in one run. That is a real citation with debris attached,
+# not prose in a citation field, and throwing it away loses a claim the operator could
+# otherwise have checked.
+_LEADING_REF = re.compile(r"^([\w.\-/]+:L\d+)(?:\s|$)")
+
+
+def normalise_ref(ref: str) -> str:
+    """Trim a citation down to the reference, if it starts with one."""
+    match = _LEADING_REF.match(ref.strip())
+    return match.group(1) if match else ref.strip()
 
 
 class CitationError(ValueError):
@@ -53,7 +65,47 @@ def _check_refs(
             )
 
 
-def validate_report_citations(report: GruntReport, log_slice: LogSlice) -> list[str]:
+def _check_description_matches_lines(
+    finding, indicators: list[str], label: str, log_slice: LogSlice, problems: list[str]
+) -> None:
+    """A citation that resolves is not the same as a citation that supports.
+
+    The failure this exists for: a worker reported `dns.log:L244` as "TXT-type DNS queries
+    from source IP 10.12.34.56 to domain api-sync-telemetry.net". L244 is an antivirus
+    reputation lookup -- different host, different domain. The reference resolved, so every
+    check passed, and the brief cited a decoy as its primary evidence for an intrusion.
+
+    The worker had matched "TXT query" and then described the *directive* instead of the
+    line. That is checkable in code precisely because the directive's indicators are exact
+    strings: if a description names one, at least one cited line had better contain it.
+
+    Deliberately narrow. It only fires on indicators the description itself invokes, so a
+    worker describing something the directive never mentioned is unaffected -- that is the
+    judgement the sweep is there to get, and this must not punish it.
+    """
+    described = [i for i in indicators if i and i.lower() in finding.description.lower()]
+    if not described:
+        return
+    cited_text = " ".join(
+        line.text.lower()
+        for line in log_slice.lines
+        if line.ref in set(finding.representative_refs)
+    )
+    if not cited_text:
+        return
+    missing = [i for i in described if i.lower() not in cited_text]
+    if missing:
+        problems.append(
+            f"{label} describes {', '.join(repr(m) for m in missing)} but none of the "
+            f"lines it cites contain that. Either cite lines that actually show what you "
+            f"are describing, or describe what those lines really are. Do not restate the "
+            f"indicators you were given as though you had observed them."
+        )
+
+
+def validate_report_citations(
+    report: GruntReport, log_slice: LogSlice, indicators: list[str] | None = None
+) -> list[str]:
     """Return a list of human-readable problems; empty means the report is citable."""
     problems: list[str] = []
 
@@ -102,6 +154,9 @@ def validate_report_citations(report: GruntReport, log_slice: LogSlice) -> list[
             log_slice,
             problems,
         )
+        _check_description_matches_lines(
+            finding, indicators or [], label, log_slice, problems
+        )
 
     if report.slice_metadata.slice_id != log_slice.slice_id:
         problems.append(
@@ -112,12 +167,29 @@ def validate_report_citations(report: GruntReport, log_slice: LogSlice) -> list[
     return problems
 
 
-def unresolved_brief_citations(refs: list[str], known: set[str]) -> list[str]:
-    """Brief-level citation audit.
+def unresolved_brief_citations(refs: list[str], known: set[str]) -> tuple[list[str], list[str]]:
+    """Brief-level citation audit. Returns (unresolved, malformed).
 
-    The commander never sees raw log lines, only grunt reports, so its citations are
-    second-hand. We do not block the brief on them -- an operator would rather have a
-    brief with a flagged bad reference than no brief -- but every unresolvable one is
-    listed on the artifact so the reader knows which claims cannot be checked.
+    The commander's citations are second-hand -- it works from what its workers reported,
+    plus a sample of their lines. We do not block the brief on a bad reference; an operator
+    would rather have a brief with a flagged citation than no brief. But the reader has to
+    be able to tell which claims they can chase.
+
+    Malformed entries are separated because they are a different failure. A real run
+    emitted these into a `raw_line_refs` array:
+
+        '... (additional line refs omitted for brevity, see full list in evidence sections) ...'
+        '... (representative sample) ...'
+
+    That is prose in a citation field. Listing it next to genuine unresolvable references
+    would suggest someone could go and look it up.
     """
-    return sorted({ref for ref in refs if ref not in known})
+    unresolved: set[str] = set()
+    malformed: set[str] = set()
+    for raw in refs:
+        ref = normalise_ref(raw)
+        if not LINE_REF_PATTERN.match(ref):
+            malformed.add(ref)
+        elif ref not in known:
+            unresolved.add(ref)
+    return sorted(unresolved), sorted(malformed)

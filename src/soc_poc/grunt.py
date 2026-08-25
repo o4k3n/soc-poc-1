@@ -16,6 +16,8 @@ worker is shown the validator's exact complaint once, and then it is done.
 
 from __future__ import annotations
 
+import re
+
 from soc_poc.config import RunConfig
 from soc_poc.llm.base import LLMClient, LLMTransportError
 from soc_poc.messages import GruntFailure, GruntOutcome, GruntSuccess, GruntTasking
@@ -48,6 +50,30 @@ def _truncation_hint(response) -> list[str]:
         f"report an aggregate (match_count plus at most a handful of "
         f"representative_refs) instead of enumerating lines."
     ]
+
+
+_FINDING_PROBLEM = re.compile(r"^findings\[(\d+)\]")
+
+
+def _drop_failed_findings(report: GruntReport, problems: list[str]) -> GruntReport | None:
+    """Return the report with the objectionable findings removed, or None if unsalvageable.
+
+    Only every problem being attributable to a specific finding makes a report salvageable.
+    A slice_id mismatch or a malformed envelope means the worker lost track of what it was
+    reading, and nothing in that report should be trusted.
+
+    `relevant` is recomputed rather than preserved: if every finding was dropped, the
+    honest statement is that this slice showed nothing, and its negatives still count.
+    """
+    indices = {int(m.group(1)) for p in problems if (m := _FINDING_PROBLEM.match(p))}
+    if not indices or len(indices) != len({p.split(" ")[0] for p in problems}):
+        # Some problem was not about a finding -- do not paper over it.
+        if any(not _FINDING_PROBLEM.match(p) for p in problems):
+            return None
+    kept = [f for i, f in enumerate(report.findings) if i not in indices]
+    if len(kept) == len(report.findings):
+        return None
+    return report.model_copy(update={"findings": kept, "relevant": bool(kept)})
 
 
 def _failure(
@@ -90,7 +116,7 @@ async def run_grunt_task(
                 messages=messages,
                 schema_name=GRUNT_SCHEMA_NAME,
                 json_schema=schema,
-                state=InvestigationState.COLLECTING.value,
+                state=InvestigationState.EXECUTING.value,
                 attempt=attempt,
                 task_id=tasking.task_id,
                 parent_task_id=tasking.investigation_id,
@@ -106,7 +132,9 @@ async def run_grunt_task(
 
         try:
             report = parse_model_json(response.text, GruntReport)
-            problems = validate_report_citations(report, tasking.data_slice)
+            problems = validate_report_citations(
+                report, tasking.data_slice, tasking.directive.indicators
+            )
         except ParseFailure as exc:
             problems = _truncation_hint(response) + exc.problems
             report = None  # type: ignore[assignment]
@@ -146,6 +174,42 @@ async def run_grunt_task(
 
         if attempt < max_attempts:
             messages = build_retry_messages(tasking, response.text, problems)
+
+    # Last attempt failed. Before writing the slice off, see whether the failure is
+    # confined to particular findings -- if it is, drop those and keep the rest.
+    #
+    # Discarding a whole report because one finding was fabricated throws away that
+    # worker's other findings AND its negatives, and turns 70 read lines into "unexamined
+    # ground" in the brief. In the run that motivated this, ten slices were lost that way.
+    # They happened to contain no tunnel traffic; nothing guaranteed that.
+    if report is not None:
+        salvaged = _drop_failed_findings(report, problems)
+        if salvaged is not None:
+            transcript.log_event(
+                "grunt_partial_accept",
+                {
+                    "task_id": tasking.task_id,
+                    "dropped_findings": len(report.findings) - len(salvaged.findings),
+                    "kept_findings": len(salvaged.findings),
+                    "problems": problems,
+                },
+            )
+            progress.task_outcome(
+                tasking.task_id,
+                tasking.data_slice.slice_id,
+                f"partial: {len(report.findings) - len(salvaged.findings)} finding(s) "
+                f"dropped as unsupported, rest kept",
+                ok=True,
+            )
+            return GruntSuccess(
+                task_id=tasking.task_id,
+                iteration=tasking.iteration,
+                slice_id=tasking.data_slice.slice_id,
+                instruction=tasking.instruction,
+                commander_intent=tasking.commander_intent,
+                report=salvaged,
+                attempts=max_attempts,
+            )
 
     reason = (
         "citations"

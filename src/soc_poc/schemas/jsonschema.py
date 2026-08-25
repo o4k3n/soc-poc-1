@@ -80,7 +80,24 @@ def _prune(node: Any) -> Any:
     if not isinstance(node, dict):
         return node
 
-    out = {k: _prune(v) for k, v in node.items() if k not in _STRIPPED_KEYWORDS}
+    # The keys of a `properties` map are FIELD NAMES, not schema keywords, and filtering
+    # them against _STRIPPED_KEYWORDS deletes fields. This cost a real run: the action
+    # schema has a field called `pattern` (the regex to search for), `pattern` is also a
+    # JSON Schema string constraint, and the field was silently removed from both
+    # `properties` and `required`. The grammar then correctly enforced a schema with no
+    # way to express a search term, the commander put its regex in whatever field was
+    # left, and the investigation failed on step one with an empty pattern.
+    #
+    # Any field named `format`, `default`, `examples`, `minimum`... would have done the
+    # same. Property names are recursed into, never filtered.
+    properties = node.get("properties")
+    out = {
+        key: _prune(value)
+        for key, value in node.items()
+        if key not in _STRIPPED_KEYWORDS or key == "properties"
+    }
+    if isinstance(properties, dict):
+        out["properties"] = {name: _prune(sub) for name, sub in properties.items()}
 
     if out.get("type") == "object":
         # Closed by construction: an open object is a place for a model to invent a

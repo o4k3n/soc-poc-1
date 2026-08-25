@@ -10,13 +10,24 @@
 
 [run]
 output_dir = "out"
-# Hard cap on PLANNING -> DISPATCHED -> COLLECTING cycles. Reaching it is not an
-# error: the orchestrator still synthesizes a brief from what it collected.
-max_iterations = 3
-# Cap on grunt tasks the commander may request in a single drill-down round. The sweep
-# itself is uncapped: every slice is read.
-max_tasks_per_iteration = 4
-# In-flight grunt tasks during a sweep. Match to the grunt server's --max-num-seqs.
+# Hard cap on INVESTIGATING -> EXECUTING cycles: the number of questions the commander
+# may ask. Reaching it is not an error -- the orchestrator still synthesizes a brief
+# from the evidence gathered, and the brief is told to record the cap as a coverage gap.
+#
+# This was 3 when it counted drill-down ROUNDS on top of a sweep that had already read
+# everything. It now counts individual questions, and three questions is not an
+# investigation. Most of them are searches costing milliseconds; the cost is the
+# commander turn around each one, so this is a ceiling and not a target -- a run that
+# has what it needs ends early with `conclude`.
+max_iterations = 24
+# Floor on steps before `conclude` is honoured. The first real run of the action loop
+# concluded at step 2 of 24 -- and then listed five unexamined avenues in coverage_gaps,
+# including "search for the domain across all hosts was not executed". It knew. Being
+# told the budget is available is not the same as being told an unspent step is worth
+# nothing, so a premature conclude is now rejected once with the questions still open.
+min_steps_before_conclude = 6
+# In-flight grunt tasks. Only close_read dispatches a worker and it does so one at a
+# time, so this no longer gates a fleet; it is kept as a bound on the client side.
 max_concurrent_grunts = 8
 # Tokens of the grunt's context reserved for the slice itself. See src/soc_poc/chunking.py.
 slice_token_budget = 10000
@@ -39,6 +50,52 @@ max_tokens = 6144
 request_timeout_s = 900.0  # latency is explicitly a non-goal on this box
 # Extra body merged into every request to this model (vLLM-specific knobs).
 extra_body = {}
+
+# --- Alternative commander: Qwen3.8-27B ---------------------------------------------
+# Measured from the repo's own config.json, not from the model card:
+#
+#   weights            55.6 GB, 18 BF16 safetensors (the "17 GB" figure circulating is a
+#                      4-bit community build, not Qwen/Qwen3.8-27B)
+#   architecture       Qwen3_5ForConditionalGeneration, dense, 64 layers
+#   context            262,144 native (the card claims 1M with extension)
+#   multimodal         image-text-to-text, ships a video preprocessor. We send text only,
+#                      so the vision tower is inert weight -- a cost, not a feature.
+#   vLLM support       PRESENT in 0.24.0, which is what the NGC 26.07 image ships. Checked
+#                      against the v0.24.0 tag, not main. This was the gating risk.
+#
+# KV is the expensive part: head_dim 256 x 64 layers x 4 KV heads = 256 KiB/token at BF16,
+# 128 KiB at FP8. So the advertised context is not purchasable --
+#
+#     context     KV BF16    KV FP8
+#      32,768        8.0G      4.0G
+#     131,072       32.0G     16.0G
+#     262,144       64.0G     32.0G     <- KV alone, before weights
+#
+# 131072 with --kv-cache-dtype fp8 lands around 70 GiB all-in against a 121 GB pool. That
+# is the point of the swap: 5x the current 24,384, which lets evidence.py stop collapsing
+# older steps (STEPS_RENDERED_IN_FULL) -- the collapse is why one graded run searched
+# dhcp.log three separate times for the same address.
+#
+# Trial sequence, and do not skip the middle step:
+#   1. make weights-qwen38   (~56 GB; separate target, never pulled by `make weights`)
+#   2. swap the blocks below and in deploy/commander.env
+#   3. make restart-commander
+#   4. make health           <- the arbiter. Benchmarks say nothing about whether xgrammar
+#                               constrains this model; gpt-oss silently ignored the grammar
+#                               on tool-menu-shaped prompts and returned 200 the whole time.
+#   5. ./analyze.py cases/dns-tunnel --yes && make grade RUN=out/<id>
+#      Baseline to beat: inv-greploop-07, 7/7 ground-truth items, 0 decoy false positives.
+#
+# [models.commander]
+# role = "commander"
+# base_url = "http://127.0.0.1:8000/v1"
+# model = "qwen3.8-27b"
+# api_key = "EMPTY"
+# temperature = 0.2
+# top_p = 0.95
+# max_tokens = 6144
+# request_timeout_s = 900.0
+# extra_body = {}
 
 # --- Fallback commander -------------------------------------------------------------
 # The seam that makes the commander model disposable. If gpt-oss-120b fails to load, OOMs

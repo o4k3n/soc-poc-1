@@ -50,8 +50,8 @@ class RunConfig(BaseModel):
     output_dir: str = "out"
     # Drill-down rounds AFTER the sweep. The sweep itself is not capped -- coverage is
     # total by construction, so these govern how much closer reading follows it.
-    max_iterations: int = Field(default=3, ge=1)
-    max_tasks_per_iteration: int = Field(default=4, ge=1)
+    max_iterations: int = Field(default=24, ge=1)
+    min_steps_before_conclude: int = Field(default=6, ge=0)
     max_validation_retries: int = Field(default=1, ge=0)
     # In-flight grunt tasks. Match it to the grunt server's --max-num-seqs: higher just
     # queues inside vLLM while holding sockets open, lower leaves the GPU idle.
