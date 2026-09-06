@@ -47,7 +47,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from soc_poc.corpus import Hit
-from soc_poc.schemas.action import ActionKind, InvestigativeAction
+from soc_poc.schemas.action import PATTERN_KINDS, ActionKind, InvestigativeAction
 
 # Recent steps are replayed with all their lines; older ones keep their summary and a
 # sample. Four is enough to hold a train of thought (search -> context -> count ->
@@ -95,6 +95,11 @@ class Step:
     error: str = ""
     # The shell command that reproduces this step, for the transcript and the brief.
     reproduce: str = ""
+    # An aggregate's product (tally/timeline/stats): pre-rendered rows of counted
+    # numbers, never log lines. Kept whole through collapse for the same reason count's
+    # summary is -- the numbers ARE the answer, and dropping them on age-out is exactly
+    # the rendering mistake that built the search loop this module documents.
+    table: str = ""
 
 
 @dataclass
@@ -135,6 +140,7 @@ class Evidence:
             )
             for step in self.steps[:cutoff]:
                 blocks.append(f"  {step.index}. {_headline(step)} -> {step.summary}")
+                blocks.extend(_table_lines(step, indent="       "))
                 blocks.extend(_collapsed_lines(step))
             blocks.append("")
 
@@ -145,6 +151,7 @@ class Evidence:
             blocks.append(f"     result:   {step.summary}")
             if step.error:
                 blocks.append(f"     ERROR:    {step.error}")
+            blocks.extend(_table_lines(step, indent="       "))
             blocks.extend(_render_lines(step))
         return "\n".join(blocks)
 
@@ -154,7 +161,7 @@ def _headline(step: Step) -> str:
     action = step.action
     kind = action.action
     scope = f" in {action.file}" if action.file else ""
-    if kind in (ActionKind.SEARCH, ActionKind.COUNT):
+    if kind in PATTERN_KINDS:
         return f"{kind.value} /{action.pattern}/{scope}"
     if kind is ActionKind.CONTEXT:
         return f"context around {action.ref}"
@@ -164,6 +171,17 @@ def _headline(step: Step) -> str:
             return f"close_read {span} -- {action.question}"
         return f"read_lines {span}"
     return kind.value
+
+
+def _table_lines(step: Step, *, indent: str) -> list[str]:
+    """An aggregate's table, rendered identically whether the step is recent or aged.
+
+    Deliberately exempt from collapse: it is counted numbers, bounded in size by
+    construction (aggregation.py caps its rows), and re-deriving it would cost a step.
+    """
+    if not step.table:
+        return []
+    return [f"{indent}{line}" for line in step.table.splitlines()]
 
 
 def _collapsed_lines(step: Step) -> list[str]:

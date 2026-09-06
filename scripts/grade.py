@@ -36,59 +36,128 @@ import re
 import sys
 from pathlib import Path
 
-# The planted facts, and what counts as having reached each one. A check passes if any
-# of its `needles` appears anywhere in the brief's prose; it is CITED if any of its
-# `refs` appears in a raw_line_refs array.
-CHECKS: list[dict] = [
-    {
-        "name": "attributes traffic to 10.12.34.56",
-        "needles": [r"10\.12\.34\.56"],
-        "refs": [],
-    },
-    {
-        "name": "identifies the host as wks-2291 (via dhcp.log)",
-        "needles": [r"wks-2291"],
-        "refs": ["dhcp.log:L4", "dhcp.log:L8"],
-    },
-    {
-        "name": "cites the NS delegation",
-        # Deliberately generous on wording: "an NS record for the domain is present" is
-        # reaching the fact even though it stops short of calling it a delegation. The
-        # `refs` requirement is what separates reaching it from citing it.
-        "needles": [r"\bNS\b[ -]?record|delegat|ns1\.api-sync-telemetry"],
-        "refs": ["dns.log:L975", "dns.log:L976"],
-    },
-    {
-        "name": "names the attacker nameserver 45.77.203.118",
-        "needles": [r"45\.77\.203\.118"],
-        "refs": ["dns.log:L976"],
-    },
-    {
-        "name": "notes the answers succeeded and carried payload",
-        "needles": [
-            r"answer.{0,60}(payload|data|base32|carr)",
-            r"(payload|base32).{0,60}answer",
-            r"TXT (record|response)s? .{0,40}(carr|contain).{0,40}(data|payload)",
+# The planted facts per case, and what counts as having reached each one. A check passes
+# if any of its `needles` appears anywhere in the brief's prose; it is CITED if any of its
+# `refs` appears in a raw_line_refs array. The registry is keyed by case-folder name
+# (cases/<name>), so a new scenario is a new entry here plus a generator -- no change to
+# the grading machinery below.
+#
+# The check whose name starts with "records what" is the coverage-gaps structural check,
+# handled specially in main(); its needles/refs are ignored. Every case should carry one.
+CASES: dict[str, dict] = {
+    "dns-tunnel": {
+        "checks": [
+            {
+                "name": "attributes traffic to 10.12.34.56",
+                "needles": [r"10\.12\.34\.56"],
+                "refs": [],
+            },
+            {
+                "name": "identifies the host as wks-2291 (via dhcp.log)",
+                "needles": [r"wks-2291"],
+                "refs": ["dhcp.log:L4", "dhcp.log:L8"],
+            },
+            {
+                "name": "cites the NS delegation",
+                # Deliberately generous on wording: "an NS record for the domain is
+                # present" is reaching the fact even though it stops short of calling it a
+                # delegation. The `refs` requirement separates reaching it from citing it.
+                "needles": [r"\bNS\b[ -]?record|delegat|ns1\.api-sync-telemetry"],
+                "refs": ["dns.log:L975", "dns.log:L976"],
+            },
+            {
+                "name": "names the attacker nameserver 45.77.203.118",
+                "needles": [r"45\.77\.203\.118"],
+                "refs": ["dns.log:L976"],
+            },
+            {
+                "name": "notes the answers succeeded and carried payload",
+                "needles": [
+                    r"answer.{0,60}(payload|data|base32|carr)",
+                    r"(payload|base32).{0,60}answer",
+                    # The example payload string a good brief quotes can sit between
+                    # "contain" and "payload"; keep the window wide enough to see past it.
+                    r"TXT (record|response)s? .{0,140}(carr|contain).{0,140}(data|payload)",
+                ],
+                "refs": [],
+            },
+            {
+                "name": "describes timing as bursty sessions, not a fixed interval",
+                "needles": [r"burst|session"],
+                "refs": [],
+            },
+            {
+                "name": "records what it could not determine (coverage gaps)",
+                "needles": [],  # structural, checked separately
+                "refs": [],
+            },
         ],
-        "refs": [],
+        "decoys": {
+            "DNSBL": r"spamhaus",
+            "AV reputation": r"vendor-cloud|avts",
+            "CDN cache keys": r"cdn-assets",
+            "DKIM": r"_domainkey|DKIM",
+        },
     },
-    {
-        "name": "describes timing as bursty sessions, not a fixed interval",
-        "needles": [r"burst|session"],
-        "refs": [],
+    "http-c2": {
+        "checks": [
+            {
+                "name": "attributes the beaconing to 10.12.34.72",
+                "needles": [r"10\.12\.34\.72"],
+                "refs": [],
+            },
+            {
+                "name": "identifies the host as wks-4471 (via dhcp.log)",
+                "needles": [r"wks-4471"],
+                "refs": ["dhcp.log:L4", "dhcp.log:L8"],
+            },
+            {
+                "name": "names the C2 destination and its rarity",
+                "needles": [r"185\.243\.115\.94|cdn-metric-collector"],
+                "refs": [],
+            },
+            {
+                # The scenario's whole point: periodic, NOT bursty. Either the correct
+                # vocabulary (beacon/periodic/regular interval) or a stated ~60 s cadence.
+                "name": "describes timing as periodic beaconing, not bursts",
+                "needles": [
+                    r"beacon|periodic|regular(ly)?[ -](interval|spaced|timed)|"
+                    r"fixed[ -]interval|every ?~?\d+ ?s|~?60 ?s|cadence|metronom"
+                ],
+                "refs": [],
+            },
+            {
+                "name": "flags the anomalous, constant User-Agent",
+                "needles": [
+                    r"user[- ]?agent|\bUA\b|MSIE|Trident|Mozilla/4\.0",
+                ],
+                "refs": [],
+            },
+            {
+                # Direction matters: exfil is large OUTBOUND request bodies, not just
+                # "large transfers" (the update-poller decoy has large downloads).
+                "name": "notes outbound POST volume (exfiltration direction)",
+                "needles": [
+                    r"POST.{0,80}(upload|exfil|outbound|large|body)",
+                    r"(exfil|outbound|upload).{0,80}POST",
+                    r"request[_ ]body.{0,40}(large|bytes|volume)",
+                ],
+                "refs": [],
+            },
+            {
+                "name": "records what it could not determine (coverage gaps)",
+                "needles": [],  # structural, checked separately
+                "refs": [],
+            },
+        ],
+        "decoys": {
+            # The killer decoy first: an internal heartbeat that is beacon-shaped and benign.
+            "monitoring agent": r"collector\.corp|10\.12\.34\.5\b|/heartbeat|corp-monitor",
+            "OCSP": r"ocsp|digicert",
+            "telemetry": r"data\.microsoft|OneCollector|delivery-optimization",
+            "update poller": r"windowsupdate|ctldl|Microsoft-BITS",
+        },
     },
-    {
-        "name": "records what it could not determine (coverage gaps)",
-        "needles": [],  # structural, checked separately
-        "refs": [],
-    },
-]
-
-DECOYS = {
-    "DNSBL": r"spamhaus",
-    "AV reputation": r"vendor-cloud|avts",
-    "CDN cache keys": r"cdn-assets",
-    "DKIM": r"_domainkey|DKIM",
 }
 
 
@@ -166,6 +235,14 @@ def main() -> int:
     if not brief_path.exists():
         print(f"no brief at {brief_path} — the run produced none", file=sys.stderr)
         return 2
+    case_name = args.case.name
+    if case_name not in CASES:
+        print(f"no grading rubric for case {case_name!r}; known: "
+              f"{', '.join(sorted(CASES))}", file=sys.stderr)
+        return 2
+    checks = CASES[case_name]["checks"]
+    decoys = CASES[case_name]["decoys"]
+
     brief = json.loads(brief_path.read_text())
     body = brief["body"]
     prose = _prose(body)
@@ -173,7 +250,7 @@ def main() -> int:
 
     print(f"grading {brief_path}  (against {args.case}/GROUND_TRUTH.md)\n")
     reached = 0
-    for check in CHECKS:
+    for check in checks:
         if check["name"].startswith("records what"):
             ok = bool(body.get("coverage_gaps"))
             cited = False
@@ -190,7 +267,7 @@ def main() -> int:
     print("\n  decoys (flagging one as evidence is a false positive):")
     false_positives = 0
     supporting = _supporting_prose(body)
-    for name, pattern in DECOYS.items():
+    for name, pattern in decoys.items():
         in_support = bool(re.search(pattern, supporting, re.I))
         mentioned = bool(re.search(pattern, prose, re.I))
         false_positives += in_support
@@ -208,7 +285,7 @@ def main() -> int:
     print(f"    {'terminal_state':<22} {brief.get('terminal_state')}")
     print(f"    {'alert status unchanged':<22} {brief['alert_ref']['status']}")
 
-    print(f"\n  {reached}/{len(CHECKS)} ground-truth items reached, "
+    print(f"\n  {reached}/{len(checks)} ground-truth items reached, "
           f"{false_positives} decoy false positive(s)")
     return 0
 

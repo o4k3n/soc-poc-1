@@ -16,9 +16,33 @@ from __future__ import annotations
 import re
 import shlex
 
+from soc_poc import aggregation
 from soc_poc.corpus import Corpus, SearchResult
 from soc_poc.evidence import Step
 from soc_poc.schemas.action import ActionKind, InvestigativeAction
+
+# The timestamp shapes profiling/aggregation recognise, as one grep -oE alternation, so
+# a timeline's reproduce command extracts the same stamps the code did.
+_TS_ANY = (
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"|[0-9]{10}\.[0-9]{3,6}"
+    r"|[A-Z][a-z]{2} +[0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2}"
+)
+
+
+def _has_group(pattern: str) -> bool:
+    try:
+        return re.compile(pattern).groups > 0
+    except re.error:
+        return False
+
+
+def _value_stream(action: InvestigativeAction, target: str) -> str:
+    """grep -o the matches; when the pattern captures, reduce each match to the group."""
+    stream = f"grep -hoiE {shlex.quote(action.pattern)} {target}"
+    if _has_group(action.pattern):
+        stream += f" | sed -E {shlex.quote(f's/{action.pattern}/\\1/I')}"
+    return stream
 
 
 def reproduce_command(action: InvestigativeAction, logs_dir: str = "logs") -> str:
@@ -33,6 +57,16 @@ def reproduce_command(action: InvestigativeAction, logs_dir: str = "logs") -> st
         return f"grep -niE {shlex.quote(action.pattern)} {target}"
     if action.action is ActionKind.COUNT:
         return f"grep -ciE {shlex.quote(action.pattern)} {target}"
+    if action.action is ActionKind.TALLY:
+        return f"{_value_stream(action, target)} | sort | uniq -c | sort -rn"
+    if action.action is ActionKind.STATS:
+        return f"{_value_stream(action, target)} | sort -n | uniq -c"
+    if action.action is ActionKind.TIMELINE:
+        # Stamp frequencies at native granularity; the burst arithmetic is over these.
+        return (
+            f"grep -hiE {shlex.quote(action.pattern)} {target} "
+            f"| grep -oE {shlex.quote(_TS_ANY)} | sort | uniq -c"
+        )
     if action.action is ActionKind.CONTEXT:
         name, _, number = action.ref.partition(":L")
         if not number.isdigit():
@@ -57,8 +91,8 @@ _ESCAPED_LITERALS = set(".^$*+?{}[]()|/-\\\"'`~@#%&=:;,_<> ")
 _MIN_LITERAL = 8
 
 
-def _longest_literal(pattern: str) -> str:
-    """The longest run of characters the data must contain verbatim.
+def _literal_runs(pattern: str) -> list[str]:
+    """Every maximal run of characters the data must contain verbatim, in pattern order.
 
     Splitting on backslashes is not enough: `\twks-2291` would yield `twks-2291`, taking
     the `t` from the tab escape into the literal and probing for a string that cannot
@@ -86,8 +120,44 @@ def _longest_literal(pattern: str) -> str:
             current.append(char)
         index += 1
     runs.append("".join(current))
+    return [run for run in runs if run]
+
+
+def longest_literal(pattern: str) -> str:
+    """The longest literal run, if it is long enough to mean anything."""
+    runs = _literal_runs(pattern)
     best = max(runs, key=len) if runs else ""
     return best if len(best) >= _MIN_LITERAL else ""
+
+
+# An anchor this short ("0", "F") is structure, not evidence; three characters ("TXT",
+# "udp", "ACK") is where a run starts identifying a field.
+_MIN_ANCHOR = 3
+
+
+def _co_occurrence(anchors: list[str], file: str, corpus: Corpus) -> tuple[int, int]:
+    """(lines containing every anchor, lines containing them in pattern order).
+
+    Substring containment, case-insensitive -- deliberately looser than the regex whose
+    zero we are diagnosing, because the question is "is the data there at all, and in
+    what order", not "does the pattern match".
+    """
+    lows = [anchor.lower() for anchor in anchors]
+    together = ordered = 0
+    for name in [file] if file else corpus.file_names:
+        for text in corpus.file_lines(name):
+            low = text.lower()
+            if not all(anchor in low for anchor in lows):
+                continue
+            together += 1
+            position = -1
+            for anchor in lows:
+                position = low.find(anchor, position + 1)
+                if position < 0:
+                    break
+            else:
+                ordered += 1
+    return together, ordered
 
 
 def zero_result_hint(pattern: str, file: str, corpus: Corpus) -> str:
@@ -104,7 +174,36 @@ def zero_result_hint(pattern: str, file: str, corpus: Corpus) -> str:
     literal in the pattern on its own. If the literal is there and the pattern is not, the
     pattern is what is wrong, and the step says so where the commander cannot miss it.
     """
-    literal = _longest_literal(pattern)
+    # With two or more anchors the diagnosis can be exact instead of general. A graded
+    # run burned 8 of 24 steps writing `TXT`-then-domain counts against a format that
+    # puts the query before the qtype -- reading real lines between attempts and
+    # re-emitting the wrong order anyway. "Check field order" was demonstrably not
+    # enough; "your anchors occur in the OPPOSITE order on 649 lines" is checkable
+    # arithmetic and names the one edit that fixes the pattern.
+    #
+    # This runs before the single-literal probe and without its 8-character floor: two
+    # anchors that must BOTH sit on one line are already specific ("TXT" alone is noise;
+    # "TXT" and "NOERROR" together on 649 lines is a finding), and any absent anchor
+    # zeroes `together`, which keeps a genuine absence silent.
+    anchors = [run for run in dict.fromkeys(_literal_runs(pattern)) if len(run) >= _MIN_ANCHOR]
+    if len(anchors) >= 2:
+        together, ordered = _co_occurrence(anchors, file, corpus)
+        named = " and ".join(repr(anchor) for anchor in anchors[:3])
+        if together and ordered * 4 < together:
+            return (
+                f" NOTE: this zero is about your PATTERN, not about the data: {named} "
+                f"all occur together on {together} line(s) here, but mostly NOT in the "
+                f"order your pattern requires -- the field order is different. Swap the "
+                f"anchors."
+            )
+        if together:
+            return (
+                f" NOTE: this zero is about your PATTERN, not about the data: {named} "
+                f"occur in this order on {ordered} line(s) here, so the mismatch is the "
+                f"text BETWEEN them. Join the anchors with .* and only tighten once it "
+                f"matches."
+            )
+    literal = longest_literal(pattern)
     if not literal:
         return ""
     probe = corpus.count(re.escape(literal), file=file)
@@ -117,12 +216,58 @@ def zero_result_hint(pattern: str, file: str, corpus: Corpus) -> str:
     )
 
 
+# The marker orchestrator.py greps a summary for to know the partial-coverage hint
+# fired. A shared constant, so the producer and the consumer cannot drift apart.
+OVER_ANCHORED_MARKER = "the pattern is over-anchored"
+
+
+def coverage_hint(pattern: str, file: str, corpus: Corpus, matched_lines: int) -> str:
+    """The aggregate-verb generalisation of zero_result_hint: partial coverage is a
+    result that must carry its own refutation.
+
+    This exists because of a graded run. A tally meant to answer "which hosts query this
+    domain" was over-anchored by one separator, matched exactly 1 of the 788 lines
+    containing the domain, and answered "1x 10.12.34.56" -- not zero, so the zero hint
+    stayed silent, and the ledger then held 788-vs-1 for the same question. The
+    commander spent six more steps re-asking it. A zero was protected; a wrong small
+    number was not.
+
+    Fires only when the pattern reaches under a quarter of the lines its own anchor
+    literal appears on. Moderate deliberate narrowing (649 TXT among 788 domain lines)
+    stays silent, because a warning printed on every narrowing is a warning nobody reads.
+    """
+    if matched_lines == 0:
+        return zero_result_hint(pattern, file, corpus)
+    literal = longest_literal(pattern)
+    if not literal:
+        return ""
+    probe = corpus.count(re.escape(literal), file=file)
+    if matched_lines * 4 >= probe.total_matches:
+        return ""
+    return (
+        f" NOTE: your pattern matched {matched_lines} of the {probe.total_matches} "
+        f"line(s) containing {literal!r}. If you meant all of them, "
+        f"{OVER_ANCHORED_MARKER} -- check the separators around the literal. If the "
+        f"narrowing is deliberate, ignore this."
+    )
+
+
 def _summarise(result: SearchResult, kind: ActionKind) -> str:
     if result.error:
         return f"failed: {result.error}"
     scope = result.file or f"{len(result.files_searched)} file(s)"
     if kind is ActionKind.COUNT:
-        return f"{result.total_matches} match(es) in {scope}"
+        base = f"{result.total_matches} match(es) in {scope}"
+        if 1 <= result.total_matches <= 3:
+            # A count this small is usually a rare, decisive line -- and a count cannot
+            # be cited, because nothing was shown. A graded run counted the attacker
+            # nameserver (1 match, twice) and never fetched it; the brief then could not
+            # cite the strongest evidence in the case.
+            base += (
+                " -- few enough to read: re-run this pattern as a search to see the "
+                "line(s); only lines you have been shown can be cited in the brief"
+            )
+        return base
     if result.total_matches == 0:
         # Worth stating in full every time. This is the negative the whole redesign exists
         # to make trustworthy, and it should read as a result, not as a silence.
@@ -135,11 +280,38 @@ def _summarise(result: SearchResult, kind: ActionKind) -> str:
     return f"{result.total_matches} match(es) in {scope}; all shown"
 
 
+# The aggregation skills, dispatched by verb. All deterministic, all reproducible; see
+# aggregation.py for why their product is a table rather than lines.
+_AGGREGATES = {
+    ActionKind.TALLY: aggregation.tally,
+    ActionKind.TIMELINE: aggregation.timeline,
+    ActionKind.STATS: aggregation.stats,
+}
+
+
 def execute_readonly(
     action: InvestigativeAction, corpus: Corpus, *, index: int, logs_dir: str = "logs"
 ) -> Step:
     """Run one deterministic action. Never raises: a bad request becomes a Step with an error."""
     kind = action.action
+    if kind in _AGGREGATES:
+        outcome = _AGGREGATES[kind](corpus, action.pattern, file=action.file)
+        summary = outcome.headline
+        if not outcome.error:
+            summary += coverage_hint(
+                action.pattern, action.file, corpus, outcome.matched_lines
+            )
+        return Step(
+            index=index,
+            action=action,
+            summary=summary,
+            # No lines on purpose: an aggregate produces numbers, and a number is not a
+            # citation. Nothing here may enter shown_refs().
+            table="\n".join(outcome.table),
+            total_matches=outcome.matched_lines,
+            error=outcome.error,
+            reproduce=reproduce_command(action, logs_dir),
+        )
     if kind is ActionKind.SEARCH:
         result = corpus.search(action.pattern, file=action.file)
     elif kind is ActionKind.COUNT:

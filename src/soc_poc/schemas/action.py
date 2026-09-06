@@ -39,14 +39,37 @@ class ActionKind(str, Enum):
     the operator can re-run any step by hand. `close_read` is the only one that spends a
     model: it hands a bounded line range to a worker for a question that counting cannot
     answer.
+
+    tally/timeline/stats are the aggregation skills (aggregation.py): numbers about a
+    pattern's matches without fetching the lines. They are gated by `run.enabled_skills`
+    so each can be trialled on its own; a disabled one is rejected by `validate_action`,
+    not by the grammar -- shape from the grammar, meaning from Python, as everywhere else.
     """
 
     SEARCH = "search"
     COUNT = "count"
+    TALLY = "tally"
+    TIMELINE = "timeline"
+    STATS = "stats"
     CONTEXT = "context"
     READ_LINES = "read_lines"
     CLOSE_READ = "close_read"
     CONCLUDE = "conclude"
+
+
+# The verbs run.enabled_skills may name, and the set the prompt only describes when
+# enabled. Config validates against this at startup so a typo fails with a path, and the
+# prompt and the validator draw from the same set so they can never disagree.
+OPTIONAL_SKILLS = frozenset({ActionKind.TALLY.value, ActionKind.TIMELINE.value, ActionKind.STATS.value})
+
+# Verbs whose argument is a regex in `pattern`.
+PATTERN_KINDS = (
+    ActionKind.SEARCH,
+    ActionKind.COUNT,
+    ActionKind.TALLY,
+    ActionKind.TIMELINE,
+    ActionKind.STATS,
+)
 
 
 class InvestigativeAction(BaseModel):
@@ -68,7 +91,11 @@ class InvestigativeAction(BaseModel):
 
     pattern: str = Field(
         default="",
-        description="Regex, for search and count. Case-insensitive. Empty otherwise.",
+        description=(
+            "Regex, for search/count/tally/timeline/stats. Case-insensitive. For tally "
+            "and stats the first capture group, if any, is the value extracted. Empty "
+            "otherwise."
+        ),
     )
     file: str = Field(
         default="",
@@ -118,10 +145,33 @@ def validate_action(
     known_files: list[str],
     steps_taken: int = 0,
     min_steps: int = 0,
+    enabled_skills: frozenset[str] | None = None,
 ) -> list[ActionProblem]:
-    """Everything the grammar cannot check. Messages are fed back verbatim on a retry."""
+    """Everything the grammar cannot check. Messages are fed back verbatim on a retry.
+
+    `enabled_skills` gates the optional aggregation verbs so they can be hooked up one at
+    a time; None means all of them are available (library use and tests). The grammar
+    still admits every verb -- a disabled one is rejected here, with a message that
+    redirects rather than merely refuses.
+    """
     problems: list[ActionProblem] = []
     kind = action.action
+
+    if (
+        enabled_skills is not None
+        and kind.value in OPTIONAL_SKILLS
+        and kind.value not in enabled_skills
+    ):
+        problems.append(
+            ActionProblem(
+                field="action",
+                message=(
+                    f"'{kind.value}' is not available in this run. Use the verbs your "
+                    f"instructions list -- a count or search usually answers the same "
+                    f"question, one value at a time."
+                ),
+            )
+        )
 
     # Concluding early is the loop's characteristic failure. The first real run stopped
     # after two steps -- having confirmed the alert and nothing else -- and then wrote
@@ -136,13 +186,16 @@ def validate_action(
                     f"you have taken only {steps_taken} step(s) and the budget is a "
                     f"ceiling, not a cost -- an unspent step is worth nothing. Before "
                     f"concluding, establish what the alert did NOT already tell you. "
-                    f"Open questions worth a step each: which host and user, whether the "
+                    f"Open questions worth a step each: which host and (if the logs "
+                    f"record one) which user, whether the "
                     f"pattern is confined to that host or estate-wide, what the RESPONSES "
                     f"carried, what the domain resolves to and what else touches that "
                     f"address, how the activity is distributed in time, and whether "
                     f"benign traffic of the same shape exists. Issue the most valuable of "
                     f"those instead, or conclude again only if every one is genuinely "
-                    f"answered or unanswerable from these logs."
+                    f"answered or unanswerable from these logs. A clean negative you "
+                    f"already established counts as answered; record it in "
+                    f"coverage_gaps rather than re-asking."
                 ),
             )
         )
@@ -151,7 +204,7 @@ def validate_action(
         if not value:
             problems.append(ActionProblem(field=field, message=message))
 
-    if kind in (ActionKind.SEARCH, ActionKind.COUNT):
+    if kind in PATTERN_KINDS:
         require(action.pattern, "pattern", f"{kind.value} needs a regex in 'pattern'.")
     if kind is ActionKind.CONTEXT:
         if not action.ref:

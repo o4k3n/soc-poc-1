@@ -121,6 +121,7 @@ async def decide_action(
     steps_remaining: int,
     steps_taken: int = 0,
     min_steps: int = 0,
+    enabled_skills: frozenset[str] = frozenset(),
     progress: ProgressSink | None = None,
 ) -> ActionResult:
     """INVESTIGATING: alert + profile + everything seen so far goes in, one action comes out."""
@@ -132,6 +133,7 @@ async def decide_action(
         file_names=file_names,
         line_counts=line_counts,
         steps_remaining=steps_remaining,
+        enabled_skills=enabled_skills,
     )
 
     def validate(action: InvestigativeAction) -> list[str]:
@@ -144,6 +146,7 @@ async def decide_action(
                 known_files=file_names,
                 steps_taken=steps_taken,
                 min_steps=min_steps,
+                enabled_skills=enabled_skills,
             )
         ]
 

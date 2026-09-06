@@ -66,6 +66,17 @@ that survives being ported to Elixir/OTP are.
 reference), `read_lines` (a range verbatim), `close_read` (hand a bounded range to a
 worker with one question), `conclude` (stop and write the brief).
 
+**The aggregation skills**, gated by `run.enabled_skills` so each can be trialled on its
+own graded runs: `tally` (distinct values of a regex with exact counts — a distribution
+in one step instead of one `count` per guess), `timeline` (span, gap statistics and burst
+structure of a pattern's matches, same gap arithmetic as the profile), `stats`
+(min/median/p95/max over a captured value; lengths when the values are not numeric). All
+three live in `aggregation.py`, spend no GPU, return numbers rather than lines — nothing
+they produce enters `shown_refs()`, because a number is not a citation — and print their
+`grep`/`sed`/`awk` equivalent in the step ledger like every other action. The prompt
+teaches the discipline they exist for: **aggregate before you fetch** — size a result set
+with numbers before spending context on its lines.
+
 **The commander proposes; the orchestrator disposes.** An action is a JSON object the
 model emits and `actions.py` executes. The model never runs anything, and the set of
 things that *can* be run is those six verbs over files already in memory. Guided decoding
@@ -95,6 +106,7 @@ Read `PORTING.md` next; it explains why several things are shaped the way they a
 | `src/soc_poc/corpus.py` | the case's log files, searchable by line; every result carries its ref |
 | `src/soc_poc/profiling.py` | the computed profile: rarities, entropy groups, bursts. No model |
 | `src/soc_poc/actions.py` | executing one action, plus the `grep` that reproduces it |
+| `src/soc_poc/aggregation.py` | the optional skills: tally, timeline, stats. Counted, never inferred |
 | `src/soc_poc/evidence.py` | the append-only ledger: the run's memory *and* its audit trail |
 | `src/soc_poc/chunking.py` | token-aware chunking; still used for the inventory and injection scan |
 | `src/soc_poc/control.py` | run markers and the abort sentinel |
@@ -110,6 +122,9 @@ Read `PORTING.md` next; it explains why several things are shaped the way they a
 | `src/soc_poc/llm/` | `LLMClient` protocol, vLLM client, offline stub |
 | `src/soc_poc/transcript.py` | the JSONL corpus — the PoC's actual deliverable |
 | `src/soc_poc/preflight.py` | the three endpoint checks that gate every run |
+| `scripts/make_*_case.py` | the seeded scenario generators (dns-tunnel, http-c2) |
+| `scripts/grade.py` | scores a brief against a case-keyed ground-truth rubric |
+| `deploy/flashnext/` | scripts to serve Qwen3.8-Flash-Next via SGLang (commander-only) |
 
 ---
 
@@ -292,6 +307,28 @@ That is it. There is nothing to hand-author and nothing to configure: every file
 `logs/` becomes searchable. `fixtures/` is itself a case folder, so `./analyze.py fixtures`
 runs the bundled demo — that is all `make demo` and `make demo-offline` do now.
 
+**Graded scenarios.** Two seeded generators write graded cases, each with a
+`GROUND_TRUTH.md` at the case root (which `analyze.py` never reads):
+
+- `scripts/make_dns_tunnel_case.py` → `cases/dns-tunnel` — a bursty DNS tunnel with
+  payload-bearing answers and four tunnel-shaped benign decoys.
+- `scripts/make_http_c2_case.py` → `cases/http-c2` — a **periodic** HTTP beacon (the
+  timing opposite of the tunnel: ~60 s jittered check-ins, not bursts), an anomalous
+  constant User-Agent, and outbound POST exfil. Its lead decoy is an internal monitoring
+  agent that heartbeats on a fixed interval from many hosts *including the victim*, so
+  "beacons periodically to one host" is benignly true — the case is built to prove the
+  commander's timing conclusions are evidence-driven, not templated.
+
+`scripts/grade.py` scores a brief against a case, keyed by folder name — a new scenario is
+one entry in its `CASES` registry plus a generator, no change to the grading machinery.
+`make grade RUN=out/<id> CASE=cases/http-c2` selects the rubric; the default is
+`cases/dns-tunnel`. On why the attack *patterns* being public does not skew results: every
+identifier — IPs, hosts, domains, User-Agents, timestamps, volumes — is novel and seeded,
+so pattern knowledge helps the model the way it helps a human analyst, and there is no
+specific case to memorize. Contamination that did leak in would degrade into a *visible*
+failure here rather than silent score inflation: a memorized fact the model was never
+shown cannot be cited, so it lands in `uncited_claims` (see "The four guarantees").
+
 **How logs become visible.** `corpus.py` loads every file and indexes it by line, so every
 search result carries a `<file>:L<n>` reference that resolves back to the exact line. Then
 `profiling.py` counts the corpus — line-shape frequencies, shapes occurring only a handful
@@ -384,6 +421,42 @@ would throw away the run's product.
 swappable without touching code — the contract is a JSON schema, not a model. There is a
 stubbed `[models.evaluator]` entry (`enabled = false`) as the seam for a future cloud
 frontier judge; nothing reads it yet beyond the config loader.
+
+The commander block carries commented alternates for each model that has been trialled —
+`Qwen3.8-27B` and `Qwen3.8-Flash-Next` — with the exact cutover and rollback steps inline.
+`make health`'s guided-JSON round trip is the arbiter for any swap; a served model that
+passes it satisfies the contract regardless of which engine is behind the endpoint.
+
+### Serving Qwen3.8-Flash-Next (SGLang, commander-only)
+
+An alternative to the co-located vLLM pair: run the 125B ultra-sparse MoE
+`Qwen3.8-Flash-Next` (6B active params) as the commander via **SGLang**, with the grunt
+disabled. `deploy/flashnext/` holds the scripts, adapted from single-spark-ai's DGX-Spark
+recipe. Cutover is `make down`, then `bash deploy/flashnext/probe-image.sh` (CPU-only,
+confirms the pinned image knows `qwen4_exp`), then `bash deploy/flashnext/launch-flash-next.sh`,
+then swap the commented `[models.commander]` / `[models.grunt]` blocks in `config.toml` to
+the Flash-Next pair and run `make health`. Rollback is `docker stop flashnext-commander &&
+make up` plus reverting the config. First graded run: 7/7 on `cases/dns-tunnel`, zero
+coercion, zero malformed citations.
+
+**Grunt-only-off, not gone.** The model's resident set (~80 GiB weights + KV + the mmap'd
+PLE table's page cache) leaves ~21 GiB, no room for a second model. Both roles point at the
+one endpoint; `close_read` has fired zero times in 10+ graded runs, so nothing real is lost.
+
+**Three GB10-specific pitfalls are baked into `launch-flash-next.sh` and must not be
+"optimized away"** — each cost a failed load to find:
+
+1. **The PLE n-gram table must be file-backed, not pinned.** Native `--ple-offload-embedding`
+   pins the ~48 GiB table in host memory, which on unified memory *is* the GPU pool —
+   80 + 48 OOMs the box at load. A 30-line patch (`deploy/flashnext/overlay-native/qwen4_exp.py`)
+   makes it a `MAP_SHARED` file-backed tensor instead: evictable page cache, and coherent
+   unified memory makes a pageable pointer as GPU-readable as a pinned one.
+2. **`ple_embedding_dtype=float8_e4m3fn` must be declared** via `--json-model-override-args`,
+   or the loader refuses the fp8→bf16 auto-switch under PLE offload (and the table balloons
+   to 95 GiB as bf16).
+3. **KV cache must stay bf16.** The image's native SM121 QSA kernel is gated to BF16 KV;
+   `--kv-cache-dtype fp8_e4m3` is rejected at CUDA-graph capture. At 131k tokens the cost of
+   bf16 KV is 1.5 GB — irrelevant here.
 
 ---
 
@@ -487,8 +560,11 @@ Explicitly not in this build, with the seam each one will land on:
   be re-derived with `grep` and `sort`.
 - **Eval harness.** Seam: the `LLMClient` protocol (`llm/base.py`) plus the
   `[models.evaluator]` config entry. The transcript corpus is the eval set.
-- **Synthetic scenario generation.** Seam: a case folder is just `alert.json` + `logs/`,
-  so a generator writes one and `./analyze.py` runs it unchanged.
+- **Synthetic scenario generation.** No longer a non-goal — `scripts/make_dns_tunnel_case.py`
+  and `scripts/make_http_c2_case.py` are the two generators, each writing a graded case
+  folder plus a `GROUND_TRUTH.md`, with `scripts/grade.py` scoring against a case-keyed
+  rubric. The seam held: a case folder is just `alert.json` + `logs/`, so a generator
+  writes one and `./analyze.py` runs it unchanged.
 - **Multi-machine serving.** Endpoints are per-role in config rather than assumed
   co-located, so a second box is a config edit.
 - **Latency and throughput tuning.** Deliberate. This box is bandwidth-bound and the
@@ -586,6 +662,34 @@ Three fixes:
 `raw_line_refs` because the schema has nowhere else to put them — 7 entries in run 7,
 down from 22. Coercion still fires on some steps, and each one loses the model's stated
 `reasoning`. See the guided-decoding note under "Known issues".
+
+### The tally-era loops, and the advisories that break them
+
+Enabling the `tally` skill surfaced a new loop, not in the ledger this time but in the
+*regex*. A run spent 8 of 24 steps re-asking one question — "which hosts query this
+domain?" — with eight different patterns, six of them over-anchored to a column layout
+that cannot match, because the log puts the query before the qtype. `zero_result_hint`
+fired every time and was ignored every time: a generic "check field order" is not enough
+when the model has already read real lines between attempts. So the advisories got
+specific, and they are advisory only — the action is always executed as written, and the
+note is appended to its result where the commander cannot miss it (the runtime disposes;
+it does not suppress a proposal). Four layers, each earned by a transcript:
+
+1. **Partial coverage carries its own refutation.** A tally that matches 1 of the 788
+   lines its own anchor literal appears on says so — the wrong-small-number case the
+   zero-only hint never saw. (`actions.coverage_hint`)
+2. **A multi-anchor zero is diagnosed exactly.** With two literals present, "your anchors
+   occur together on 649 lines but in the OPPOSITE order — swap them" replaces "check
+   field order", and the mirror case ("right order, the mismatch is BETWEEN them — join
+   with `.*`") is named too. Both are checkable arithmetic. (`actions.zero_result_hint`)
+3. **A failed re-ask names the step that already answered it.** Identity is the anchor
+   *literal*, not the pattern — the eight variants shared one — so the note points at the
+   earlier non-zero result, and from the third fruitless attempt escalates to "stop
+   varying the frame". (`orchestrator.same_literal_note`)
+4. **A tiny count is nudged toward fetching.** A `count` of 1–3 is usually the rare,
+   decisive line — and a count cannot be cited. The result says "few enough to read;
+   re-run as a search". (One graded run counted the attacker nameserver twice and never
+   fetched it, so the brief could not cite its strongest evidence.)
 
 ---
 

@@ -37,19 +37,30 @@ chars_per_token = 1.4
 # Grunts are re-prompted exactly once with the validation error, then give up and
 # return an explicit failure record.
 max_validation_retries = 1
+# Optional commander skills (src/soc_poc/aggregation.py), hooked up one at a time so
+# each can be judged on its own graded runs. Any of:
+#   "tally"     distinct values of a regex with exact counts -- a distribution in one
+#               step instead of one count per guess
+#   "timeline"  time span, gap statistics and burst structure of a pattern's matches
+#   "stats"     min/median/p95/max over a captured value (numeric or lengths)
+# All are computed in code, spend no GPU, and print their grep/sed/awk equivalent in the
+# step ledger like every other action. The core six verbs are always available; these
+# add aggregation so the commander can size a result set BEFORE fetching lines into its
+# context. An unknown name here fails at startup.
+enabled_skills = ["tally"]
 
-[models.commander]
-role = "commander"
-base_url = "http://127.0.0.1:8000/v1"
-# Must match --served-model-name in deploy/commander.env. health_check.py asserts this.
-model = "gpt-oss-120b"
-api_key = "EMPTY"          # vLLM ignores the value but the OpenAI client shape wants one
-temperature = 0.2
-top_p = 0.95
-max_tokens = 6144
-request_timeout_s = 900.0  # latency is explicitly a non-goal on this box
-# Extra body merged into every request to this model (vLLM-specific knobs).
-extra_body = {}
+# [models.commander]
+# role = "commander"
+# base_url = "http://127.0.0.1:8000/v1"
+# # Must match --served-model-name in deploy/commander.env. health_check.py asserts this.
+# model = "gpt-oss-120b"
+# api_key = "EMPTY"          # vLLM ignores the value but the OpenAI client shape wants one
+# temperature = 0.2
+# top_p = 0.95
+# max_tokens = 6144
+# request_timeout_s = 900.0  # latency is explicitly a non-goal on this box
+# # Extra body merged into every request to this model (vLLM-specific knobs).
+# extra_body = {}
 
 # --- Alternative commander: Qwen3.8-27B ---------------------------------------------
 # Measured from the repo's own config.json, not from the model card:
@@ -97,6 +108,52 @@ extra_body = {}
 # request_timeout_s = 900.0
 # extra_body = {}
 
+# --- Alternative commander: Qwen3.8-Flash-Next via SGLang ---------------------------
+# 125B ultra-sparse MoE (6B active), nvidia NVFP4 tree, served by SGLang using the
+# single-spark-ai DGX Spark recipe adapted in deploy/flashnext/. COMMANDER-ONLY: the
+# model's resident set (~77 GB weights + KV + mmap'd PLE page cache) leaves no room for
+# the grunt, so [models.grunt] must be pointed at this same endpoint for the duration
+# (close_read has fired 0 times in 10+ graded runs; nothing real is lost).
+#
+# Cutover sequence (deploy/flashnext/ has the scripts; docker steps need your shell):
+#   1. make down                                  # commander needs an empty box
+#   2. bash deploy/flashnext/probe-image.sh       # CPU-only: image knows qwen4_exp
+#   3. bash deploy/flashnext/launch-flash-next.sh # loads in minutes; watch docker logs
+#   4. swap this block in for [models.commander] AND repoint [models.grunt] at :18400
+#   5. make health                                # guided-JSON round trip = the arbiter
+#   6. ./analyze.py cases/dns-tunnel --yes && make grade RUN=out/<id>
+#      Baseline: inv-greploop-07 (7/7). Watch the first three steps for tool-call-shaped
+#      replies (coercion.py is the net) and for empty content (reasoning-parser class).
+# Rollback: docker stop flashnext-commander && make up, revert this file.
+#
+# Sampling: Qwen's instruct-mode recommendation (temp 0.7, top_p 0.8) -- NOT the 0.2
+# used for gpt-oss; Qwen MoEs repetition-loop at low temperature. Thinking disabled via
+# chat template: guided JSON and a think-block fight over the first token, and the
+# server runs --reasoning-parser qwen3 so any thinking that slips through lands in
+# reasoning_content, which the client already tolerates (llm/vllm_client.py).
+#
+[models.commander]
+role = "commander"
+base_url = "http://127.0.0.1:18400/v1"
+model = "qwen3.8-flash-next"
+api_key = "EMPTY"
+temperature = 0.7
+top_p = 0.8
+max_tokens = 6144
+request_timeout_s = 900.0
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+[models.grunt]  # while Flash-Next is the commander: same endpoint, same model
+role = "grunt"
+base_url = "http://127.0.0.1:18400/v1"
+model = "qwen3.8-flash-next"
+api_key = "EMPTY"
+temperature = 0.1
+top_p = 0.9
+max_tokens = 1400
+request_timeout_s = 600.0
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
 # --- Fallback commander -------------------------------------------------------------
 # The seam that makes the commander model disposable. If gpt-oss-120b fails to load, OOMs
 # against its memory fraction, or fails the guided-JSON check in `make health`, comment
@@ -115,30 +172,30 @@ extra_body = {}
 # request_timeout_s = 900.0
 # extra_body = { chat_template_kwargs = { enable_thinking = false } }
 
-[models.grunt]
-role = "grunt"
-base_url = "http://127.0.0.1:8001/v1"
-# Must match --served-model-name in deploy/grunt.env.
-model = "qwen3-8b"
-api_key = "EMPTY"
-temperature = 0.1
-top_p = 0.9
-# Measured, not guessed: across 112 successful sweep reports the median completion was
-# 313 tokens, p99 971, maximum 1125. 1400 leaves 25% headroom over the worst real report.
-#
-# The cap is a cost control, not a size limit. Guided decoding occasionally sends a small
-# model into a whitespace loop -- in the 83-slice run, 22 replies ran to the old 3072-token
-# ceiling emitting indentation (92% whitespace in the sample), each taking ~330s against a
-# 39s median, and all 22 were rejected. That single pathology burned 57% of all grunt
-# compute. A lower ceiling makes the failure cheap and fast; the real cure is
-# --structured-outputs-config.disable_any_whitespace on the grunt server.
-max_tokens = 1400
-request_timeout_s = 600.0
-# Qwen3 is a hybrid-reasoning model. Thinking blocks fight with guided decoding, so we
-# turn them off at the request level. VERIFY against your pinned vLLM/Qwen chat
-# template: if the template ignores this kwarg, serve with
-# --structured-outputs-config.enable_in_reasoning instead.
-extra_body = { chat_template_kwargs = { enable_thinking = false } }
+# [models.grunt]
+# role = "grunt"
+# base_url = "http://127.0.0.1:8001/v1"
+# # Must match --served-model-name in deploy/grunt.env.
+# model = "qwen3-8b"
+# api_key = "EMPTY"
+# temperature = 0.1
+# top_p = 0.9
+# # Measured, not guessed: across 112 successful sweep reports the median completion was
+# # 313 tokens, p99 971, maximum 1125. 1400 leaves 25% headroom over the worst real report.
+# #
+# # The cap is a cost control, not a size limit. Guided decoding occasionally sends a small
+# # model into a whitespace loop -- in the 83-slice run, 22 replies ran to the old 3072-token
+# # ceiling emitting indentation (92% whitespace in the sample), each taking ~330s against a
+# # 39s median, and all 22 were rejected. That single pathology burned 57% of all grunt
+# # compute. A lower ceiling makes the failure cheap and fast; the real cure is
+# # --structured-outputs-config.disable_any_whitespace on the grunt server.
+# max_tokens = 1400
+# request_timeout_s = 600.0
+# # Qwen3 is a hybrid-reasoning model. Thinking blocks fight with guided decoding, so we
+# # turn them off at the request level. VERIFY against your pinned vLLM/Qwen chat
+# # template: if the template ignores this kwarg, serve with
+# # --structured-outputs-config.enable_in_reasoning instead.
+# extra_body = { chat_template_kwargs = { enable_thinking = false } }
 
 # Stubbed seam for a future cloud frontier judge. Nothing reads this yet beyond the
 # config loader; it exists so the eval harness has a place to plug in without a

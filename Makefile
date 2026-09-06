@@ -163,9 +163,9 @@ abort:              ## gracefully stop the running investigation (see ./abort.py
 # Mechanical only: it checks whether each planted fact was reached, whether it was backed
 # by the right line reference, and whether any decoy was cited as evidence. Whether the
 # brief reads well is still a human call.
-grade:              ## grade a run against its case's ground truth, e.g. make grade RUN=out/inv-xxxx
-	@test -n "$(RUN)" || { echo "usage: make grade RUN=out/inv-xxxx"; exit 2; }
-	$(PY) scripts/grade.py $(RUN)
+grade:              ## grade a run against its case, e.g. make grade RUN=out/inv-xxxx [CASE=cases/http-c2]
+	@test -n "$(RUN)" || { echo "usage: make grade RUN=out/inv-xxxx [CASE=cases/<name>]"; exit 2; }
+	$(PY) scripts/grade.py $(RUN) $(if $(CASE),--case $(CASE))
 
 test:
 	$(PY) -m pytest -q

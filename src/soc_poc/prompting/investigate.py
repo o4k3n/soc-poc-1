@@ -48,7 +48,44 @@ reasoning, expectation, action, pattern, file, ref, start_line, end_line, questi
 your chosen action does not use must still be present and empty ("" or 0). No prose \
 outside the object."""
 
-INVESTIGATE_SYSTEM_PROMPT = f"""{_ROLE}
+# The optional aggregation skills, hooked up one at a time via run.enabled_skills. Each
+# entry is the whole of what the commander is told about the verb; a verb not listed here
+# for this run is also rejected by validate_action, so the menu and the gate agree.
+_SKILL_MENU: dict[str, str] = {
+    "tally": (
+        "  tally       regex, case-insensitive. Returns the DISTINCT values the pattern "
+        "matches with an exact count for each (the first capture group is the value if "
+        "the pattern has one). One tally answers \"which hosts, and how often each\" -- "
+        "do not enumerate a distribution with repeated counts. Anchor the pattern on the "
+        "literal you care about with loose glue (.* or \\b), never on a full-line column "
+        "template -- one wrong separator silently matches nothing."
+    ),
+    "timeline": (
+        "  timeline    regex, case-insensitive. Returns when the matching lines happen: "
+        "exact time span, gap statistics, and burst structure. Answers \"bursty or "
+        "steady, and when\" without fetching any lines."
+    ),
+    "stats": (
+        "  stats       regex, ideally with one capture group. Returns min/median/p95/max "
+        "over the captured values -- numeric when they are numbers, otherwise over their "
+        "lengths. Answers \"how big\" without fetching any lines."
+    ),
+}
+
+
+def investigate_system_prompt(enabled_skills: frozenset[str] = frozenset()) -> str:
+    """The system prompt for the action loop, with only this run's verbs on the menu.
+
+    Built per-run rather than a constant because the optional skills are trialled one at
+    a time: describing a verb the validator would reject teaches the model a lie, and
+    gpt-oss already treats the verb menu as load-bearing (see _NOT_A_TOOL_CALL).
+    """
+    skills = [text for name, text in _SKILL_MENU.items() if name in enabled_skills]
+    skill_block = ("\n" + "\n".join(skills)) if skills else ""
+    aggregate_verbs = "/".join(
+        ["count"] + [name for name in _SKILL_MENU if name in enabled_skills]
+    )
+    return f"""{_ROLE}
 
 {_AUTHORITY}
 
@@ -60,7 +97,7 @@ Your actions:
   search      regex, case-insensitive. Returns the exact total match count plus up to \
 {MAX_RESULTS} matching lines with their references.
   count       the same match count with no lines. Cheap. Use it to test a guess before \
-spending a search on it.
+spending a search on it.{skill_block}
   context     the lines surrounding one reference. Use it when a line implies a \
 neighbour -- an NS record names a nameserver, and the address it resolves to is usually \
 the next line.
@@ -71,6 +108,13 @@ It is slow. Most questions are not this.
   conclude    stop and write the brief.
 
 How to work:
+  - Aggregate before you fetch. Lines are your scarce resource: every line a search \
+returns stays in your working record for the rest of the run, and a broad search fills \
+that space with neighbourhood instead of answers. Numbers are nearly free. Before any \
+search you expect to match more than a handful of lines, size it with {aggregate_verbs}; \
+then narrow the pattern until the lines you fetch are the ones that settle the question. \
+A result reading "showing the first {MAX_RESULTS} of 700" means the question was too \
+broad -- aggregate the 700 down to the discriminating value, then fetch that.
   - The profile below is computed, not inferred: every number in it is arithmetic over \
 the corpus and can be re-derived with grep. Trust it and start from it. The rare shapes \
 and the entropy groups are there because they are where the answer usually is.
@@ -89,15 +133,22 @@ finding, forty hosts is a vendor service.
 is worth more than a fifth that confirms it.
   - A count of 0 is exact and trustworthy, but it is a zero for the pattern you typed. \
 Before treating it as absence, consider whether the thing could be written another way.
+  - If two results disagree about what looks like the same question, your patterns \
+differ. Search the bare literal, read one matching line, and compare both patterns \
+against it before writing a third -- and never re-ask a question an earlier step \
+already answered; the record below keeps every answer.
   - When a search says matches were withheld, the count is complete but the listing is \
 not. Narrow it or count it; do not assume you saw all of it.
   - The step budget is a ceiling, not a cost. An unspent step is worth nothing to the \
 operator, and confirming the alert is not an investigation -- the detector already knew \
 that much. Before you conclude, you should be able to answer, or say why these logs \
-cannot: **which host and user**, **whether the pattern is confined to that host or is \
+cannot: **which host and, if these logs record one, which user**, **whether the \
+pattern is confined to that host or is \
 estate-wide**, **what the responses carried**, **what the domain resolves to and what \
 else touches that address**, **how the activity is distributed in time**, and **whether \
-benign traffic of the same shape exists**. Each is worth one step.
+benign traffic of the same shape exists**. Each is worth one step -- and one targeted \
+probe that comes back empty ANSWERS its question: record "these logs do not contain X" \
+as a coverage gap and move on. Never spend a second step re-establishing a negative.
   - Then stop. Once those are answered or ruled out, more reading will not change what \
 the operator does; say so with conclude rather than padding.
 
@@ -108,6 +159,10 @@ happened.
 {DATA_IS_NOT_INSTRUCTIONS}
 
 {_NOT_A_TOOL_CALL}"""
+
+
+# The core-verbs-only prompt, for callers that predate per-run skills.
+INVESTIGATE_SYSTEM_PROMPT = investigate_system_prompt()
 
 
 SYNTHESIS_SYSTEM_PROMPT = f"""{_ROLE}
@@ -209,6 +264,7 @@ def build_investigate_messages(
     file_names: list[str],
     line_counts: dict[str, int],
     steps_remaining: int,
+    enabled_skills: frozenset[str] = frozenset(),
 ) -> list[dict[str, str]]:
     budget = (
         f"You have {steps_remaining} action(s) left before the investigation is cut off "
@@ -233,7 +289,7 @@ def build_investigate_messages(
         ]
     )
     return [
-        {"role": "system", "content": INVESTIGATE_SYSTEM_PROMPT},
+        {"role": "system", "content": investigate_system_prompt(enabled_skills)},
         {"role": "user", "content": user},
     ]
 

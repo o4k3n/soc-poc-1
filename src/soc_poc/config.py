@@ -61,6 +61,22 @@ class RunConfig(BaseModel):
     slice_token_budget: int = Field(default=10_000, ge=500)
     # Pessimistic chars-per-token for log content, measured against the real tokenizer.
     chars_per_token: float = Field(default=1.4, gt=0.1)
+    # Optional commander verbs (aggregation.py), hooked up one at a time as each proves
+    # out on a graded case. Empty means the core six verbs only. A name not in
+    # schemas.action.OPTIONAL_SKILLS fails here at startup rather than mid-run.
+    enabled_skills: tuple[str, ...] = ()
+
+    @field_validator("enabled_skills")
+    @classmethod
+    def _skills_exist(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        from soc_poc.schemas.action import OPTIONAL_SKILLS
+
+        unknown = set(value) - OPTIONAL_SKILLS
+        if unknown:
+            raise ValueError(
+                f"unknown skill(s) {sorted(unknown)}; available: {sorted(OPTIONAL_SKILLS)}"
+            )
+        return value
 
 
 class StructuredOutputConfig(BaseModel):

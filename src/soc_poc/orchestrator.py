@@ -30,13 +30,19 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
 from soc_poc import commander as commander_agent
-from soc_poc.actions import execute_readonly, reproduce_command
+from soc_poc.actions import (
+    OVER_ANCHORED_MARKER,
+    execute_readonly,
+    longest_literal,
+    reproduce_command,
+)
 from soc_poc.chunking import FileInventory
 from soc_poc.config import AppConfig
 from soc_poc.control import AbortMode, read_abort
@@ -47,7 +53,7 @@ from soc_poc.llm.base import LLMClient
 from soc_poc.messages import GruntFailure, GruntSuccess, GruntTasking
 from soc_poc.profiling import CaseProfile, build_profile
 from soc_poc.progress import NullProgress, ProgressSink
-from soc_poc.schemas.action import ActionKind, InvestigativeAction
+from soc_poc.schemas.action import PATTERN_KINDS, ActionKind, InvestigativeAction
 from soc_poc.schemas.alert import Alert
 from soc_poc.schemas.brief import (
     AlertRef,
@@ -402,6 +408,7 @@ class Orchestrator:
             steps_remaining=remaining,
             steps_taken=len(self._evidence.steps),
             min_steps=self._run.min_steps_before_conclude,
+            enabled_skills=frozenset(self._run.enabled_skills),
             progress=self._progress,
         )
 
@@ -480,6 +487,11 @@ class Orchestrator:
         else:
             step = execute_readonly(action, self._corpus, index=self._evidence.next_index)
 
+        if repeat is None and action.action in PATTERN_KINDS:
+            note = same_literal_note(self._evidence, action, step)
+            if note:
+                step = replace(step, summary=step.summary + note)
+
         self._evidence.add(step)
         self._transcript.log_event(
             "action_executed",
@@ -487,6 +499,7 @@ class Orchestrator:
                 "step": step.index,
                 "action": action.action.value,
                 "summary": step.summary,
+                "table": step.table,
                 "total_matches": step.total_matches,
                 "lines_shown": len(step.lines),
                 "truncated": step.truncated,
@@ -836,6 +849,93 @@ class Orchestrator:
         )
 
 
+def same_literal_precedent(
+    evidence: Evidence, action: InvestigativeAction
+) -> Step | None:
+    """The latest earlier step that anchored on the same literal in the same file and
+    got a non-zero answer.
+
+    "Same question" cannot be detected from pattern equality: a graded run asked "which
+    hosts query this domain" eight times with eight different regexes, six of them
+    over-anchored to zero. What the variants shared was the anchor literal -- the string
+    the data must contain verbatim -- and the one step that answered the question shared
+    it too. So the literal, not the pattern, is the identity of the question.
+    """
+    literal = longest_literal(action.pattern)
+    if not literal:
+        return None
+    found: Step | None = None
+    for step in evidence.steps:
+        prior = step.action
+        if (
+            not step.error
+            and step.total_matches > 0
+            and prior.action in PATTERN_KINDS
+            and prior.file == action.file
+            and longest_literal(prior.pattern) == literal
+        ):
+            found = step
+    return found
+
+
+def same_literal_attempts(evidence: Evidence, action: InvestigativeAction) -> int:
+    """How many earlier steps already got zero for this file-and-literal question."""
+    literal = longest_literal(action.pattern)
+    if not literal:
+        return 0
+    return sum(
+        1
+        for step in evidence.steps
+        if not step.error
+        and step.total_matches == 0
+        and step.action.action in PATTERN_KINDS
+        and step.action.file == action.file
+        and longest_literal(step.action.pattern) == literal
+    )
+
+
+def same_literal_note(
+    evidence: Evidence, action: InvestigativeAction, step: Step
+) -> str:
+    """The advisory appended to a failed re-ask of an already-answered question.
+
+    Advisory only, by deliberate decision: the action was executed exactly as written
+    and its result stands -- the commander proposes, the orchestrator disposes, and
+    nothing here suppresses a proposal. What this adds is what the ledger already knows,
+    rendered where it cannot be missed: the step that answered the same-literal question,
+    and, from the third fruitless attempt, an instruction to stop varying the frame.
+    Six ignored zero-hints in one run showed that generic advice does not break the
+    loop; naming a concrete earlier answer is the strongest true statement available.
+    """
+    if step.error:
+        return ""
+    hinted = step.total_matches == 0 or OVER_ANCHORED_MARKER in step.summary
+    if not hinted:
+        return ""
+    parts: list[str] = []
+    precedent = same_literal_precedent(evidence, action)
+    if precedent is not None:
+        parts.append(
+            f" NOTE: step {precedent.index} anchored on the same literal and returned: "
+            f"{precedent.summary}"
+        )
+    if step.total_matches == 0:
+        attempts = same_literal_attempts(evidence, action) + 1
+        if attempts >= 3:
+            use_answer = (
+                f"either use step {precedent.index}'s answer or "
+                if precedent is not None
+                else ""
+            )
+            parts.append(
+                f" This is zero-match attempt #{attempts} on this literal. Stop varying "
+                f"the frame: {use_answer}search for the bare literal and read one "
+                f"matching line to see the actual separators before writing another "
+                f"pattern."
+            )
+    return "".join(parts)
+
+
 def _fit_token_budget(hits: list, budget_tokens: int, chars_per_token: float) -> list:
     """The longest prefix of `hits` that fits the worker's slice budget.
 
@@ -857,7 +957,7 @@ def _fit_token_budget(hits: list, budget_tokens: int, chars_per_token: float) ->
 def _action_line(action: InvestigativeAction) -> str:
     kind = action.action
     scope = f" in {action.file}" if action.file else ""
-    if kind in (ActionKind.SEARCH, ActionKind.COUNT):
+    if kind in PATTERN_KINDS:
         return f"{kind.value} /{action.pattern}/{scope}"
     if kind is ActionKind.CONTEXT:
         return f"context around {action.ref}"

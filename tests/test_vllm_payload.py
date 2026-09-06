@@ -46,8 +46,12 @@ def test_structured_outputs_mode_uses_the_vllm_native_shape(tmp_path: Path) -> N
 
 def test_model_extra_body_is_merged(tmp_path: Path) -> None:
     """Qwen3 thinking mode is turned off per request, from config, not in code."""
+    config = load_config(ROOT / "config" / "config.toml")
     client = _client(tmp_path, "response_format")
     payload = client._payload([{"role": "user", "content": "x"}], "grunt_report", {})
 
+    # The point under test is that a model's extra_body reaches the payload; assert
+    # against the configured grunt rather than a hardcoded name, so swapping the served
+    # model (as the Flash-Next trial does) is not a spurious test failure.
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-    assert payload["model"] == "qwen3-8b"
+    assert payload["model"] == config.grunt.model

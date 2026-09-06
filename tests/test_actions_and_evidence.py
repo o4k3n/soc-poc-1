@@ -455,16 +455,16 @@ def test_a_genuine_zero_is_left_to_stand(corpus: Corpus) -> None:
 def test_a_pattern_with_no_meaningful_literal_gets_no_hint(corpus: Corpus) -> None:
     """`\\tTXT\\t` reduces to "TXT", which occurs in every DNS log ever written. A hint on
     every miss is noise, and noise is how a real warning stops being read."""
-    from soc_poc.actions import _longest_literal
+    from soc_poc.actions import longest_literal
 
-    assert _longest_literal(r"\t\d+\t") == ""
-    assert _longest_literal(r"\tTXT\t") == ""  # too short to be evidence of anything
+    assert longest_literal(r"\t\d+\t") == ""
+    assert longest_literal(r"\tTXT\t") == ""  # too short to be evidence of anything
     # `\.` is a literal dot and stays in the run; `\t` is a tab and ends one.
-    assert _longest_literal(r"t\.api-sync-telemetry\.net") == "t.api-sync-telemetry.net"
-    assert _longest_literal(r"\tTXT\t.*t\.api-sync\.net") == "t.api-sync.net"
+    assert longest_literal(r"t\.api-sync-telemetry\.net") == "t.api-sync-telemetry.net"
+    assert longest_literal(r"\tTXT\t.*t\.api-sync\.net") == "t.api-sync.net"
     # Splitting on backslashes alone took the `t` out of `\t` into the literal, probing
     # for `twks-2291` — a string that cannot occur — and silently suppressing the hint.
-    assert _longest_literal(r"\twks-2291\t.*ACK") == "wks-2291"
+    assert longest_literal(r"\twks-2291\t.*ACK") == "wks-2291"
 
 
 # --- the collapse must not erase the answer -----------------------------------------------

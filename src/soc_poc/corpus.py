@@ -78,6 +78,10 @@ class Corpus:
         """Lines per file. What the commander uses to pick a legal line range."""
         return {name: len(lines) for name, lines in self._files.items()}
 
+    def file_lines(self, name: str) -> list[str]:
+        """One file's lines, for code that aggregates over them (aggregation.py)."""
+        return self._files.get(name, [])
+
     def line(self, ref: str) -> str | None:
         return self._by_ref.get(ref)
 
