@@ -50,7 +50,7 @@ max_validation_retries = 1
 # step ledger like every other action. The core six verbs are always available; these
 # add aggregation so the commander can size a result set BEFORE fetching lines into its
 # context (extremes then fetches the top of it). An unknown name here fails at startup.
-enabled_skills = ["tally"]
+enabled_skills = ["tally","extremes","timeline","stats"]
 
 # [models.commander]
 # role = "commander"
