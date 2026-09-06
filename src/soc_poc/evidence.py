@@ -61,9 +61,12 @@ COLLAPSED_LINE_MAX_CHARS = 130
 # caps that) and says so; this bounds the characters those 40 can spend. Sized so the ten
 # rows of an extremes over 300-char Zeek lines (~303 chars each after eliding) all fit;
 # at 3_000 the tenth ranked line was the one dropped.
-STEP_LINE_BUDGET_CHARS = 3_300
-LINE_MAX_CHARS = 260
-LINE_HEAD_CHARS = 150
+# Sized again for JSON-lines host events (400-600 chars, the command line near the end):
+# ten extremes rows or ~10 search hits at ~380 chars each, while a 24-step ledger still
+# fits the token ceiling test_the_ledger_grows_sublinearly_with_the_sample pins.
+STEP_LINE_BUDGET_CHARS = 4_000
+LINE_MAX_CHARS = 360
+LINE_HEAD_CHARS = 180
 
 
 def elide(text: str, max_chars: int = LINE_MAX_CHARS) -> str:

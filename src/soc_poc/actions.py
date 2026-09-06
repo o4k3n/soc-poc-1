@@ -57,18 +57,35 @@ def _awk_var(regex: str) -> str:
     return shlex.quote(regex.replace("\\b", "\\y").replace("\\", "\\\\"))
 
 
-def _value_stream(action: InvestigativeAction, target: str) -> str:
+def _jq_path(field: str) -> str:
+    """A dotted key path as a jq path expression, each segment quoted so keys with odd
+    characters (`id.orig_h` is a single Zeek key, not a path) still resolve when the
+    caller means one level."""
+    return "".join(f'."{part.strip()}"' for part in field.split("."))
+
+
+def _is_json_target(action: InvestigativeAction, json_files: frozenset[str]) -> bool:
+    return bool(action.field) and action.file in json_files
+
+
+def _value_stream(
+    action: InvestigativeAction, target: str, json_files: frozenset[str] = frozenset()
+) -> str:
     """The pipeline that isolates the aggregated value, matching `_extract`'s three modes.
 
     * extract: grep the matching lines, then grep -o the entity shape out of them.
     * field:   grep the matching lines (dropping comments), then awk the column -- by
-               1-based number directly, or by resolving a #fields name in the header.
+               1-based number directly, or by resolving a #fields name in the header; on
+               a JSON-lines file, jq the key instead (`// empty` also drops false/null,
+               a small divergence from the code, which counts them as words).
     * capture group / whole match: the original grep -o (+ sed for the group).
     """
     matching = f"grep -hE {shlex.quote(action.pattern)} {target}"
     if action.extract:
         entity = _EXTRACT_GREP.get(action.extract, r"\S+")
         return f"{matching} | grep -oE {shlex.quote(entity)}"
+    if _is_json_target(action, json_files):
+        return f"{matching} | jq -r {shlex.quote(_jq_path(action.field) + ' // empty')}"
     if action.field:
         body = f"{matching} | grep -v '^#'"
         if action.field.strip().isdigit():
@@ -92,11 +109,25 @@ def _value_stream(action: InvestigativeAction, target: str) -> str:
 # awk's numeric test for extremes. Stricter than /^[0-9.]+$/ on purpose so an IP like
 # 1.2.3.4 ranks by length, as aggregation._NUMERIC does; the mode is decided at run time
 # from the data, so the shell equivalent has to decide it per value.
-_AWK_KEY = 'k=(v~/^-?[0-9]+(\\.[0-9]+)?$/)?v:length(v)'
+_AWK_KEY = (
+    'k=(v~/^-?[0-9]+(\\.[0-9]+)?$/)?v:(v~/^0[xX][0-9a-fA-F]+$/)?strtonum(v):length(v)'
+)
 _AWK_EMIT = 'print k, FILENAME":L"FNR, $0'
 
+# The same three-way key in jq, for JSON-lines files: decimal, 0x-hex (folded by hand;
+# jq has no hex parser), else the value's length. `$v` is the selected value as text.
+_JQ_KEY = (
+    '(if ($v|test("^-?[0-9]+(\\\\.[0-9]+)?$")) then ($v|tonumber) '
+    'elif ($v|test("^0[xX][0-9a-fA-F]+$")) then '
+    '($v|ascii_downcase|ltrimstr("0x")|explode'
+    '|map(if . > 96 then .-87 else .-48 end)|reduce .[] as $d (0; .*16+$d)) '
+    'else ($v|length) end)'
+)
 
-def _extremes_command(action: InvestigativeAction, target: str) -> str:
+
+def _extremes_command(
+    action: InvestigativeAction, target: str, json_files: frozenset[str] = frozenset()
+) -> str:
     """The pipeline behind extremes: value, reference and line per match, largest first.
 
     Unlike `_value_stream`, this has to keep the LINE and its number, so every mode is one
@@ -104,10 +135,21 @@ def _extremes_command(action: InvestigativeAction, target: str) -> str:
     from the Python, stated rather than hidden: awk's `$0 ~ pat` is case-sensitive where
     the code matches case-insensitively (pre-existing in the field-mode awk of
     `_value_stream`), and in extract mode this prints one row per value where the code
-    keeps one row per line.
+    keeps one row per line. On a JSON-lines file the pass is jq in raw mode (`-R`), which
+    matches the raw line case-insensitively like the code and numbers lines from 1.
     """
-    pat = _awk_var(action.pattern)
     head = f"| sort -rn | head -{aggregation.EXTREMES_SHOWN}"
+    if _is_json_target(action, json_files):
+        prog = (
+            'select(test($pat;"i")) | (fromjson? // empty) as $o | '
+            f'($o | {_jq_path(action.field)} | tostring) as $v | {_JQ_KEY} as $k | '
+            '"\\($k)\\t\\(input_filename):L\\(input_line_number)\\t\\(.)"'
+        )
+        return (
+            f"jq -rR --arg pat {shlex.quote(action.pattern)} {shlex.quote(prog)} "
+            f"{target} {head}"
+        )
+    pat = _awk_var(action.pattern)
     if action.field:
         if action.field.strip().isdigit():
             prog = f"!/^#/&&$0~pat{{v=${int(action.field)};{_AWK_KEY};{_AWK_EMIT}}}"
@@ -138,12 +180,18 @@ def _extremes_command(action: InvestigativeAction, target: str) -> str:
     return f"awk -v pat={pat} {shlex.quote(prog)} {target} {head}"
 
 
-def reproduce_command(action: InvestigativeAction, logs_dir: str = "logs") -> str:
+def reproduce_command(
+    action: InvestigativeAction,
+    logs_dir: str = "logs",
+    *,
+    json_files: frozenset[str] = frozenset(),
+) -> str:
     """The shell equivalent, so a reader can check the machine's work.
 
     Printed into the transcript for every step. An investigation whose evidence can be
     re-derived with grep is auditable in a way that "a language model read it and said so"
-    is not, and that difference is the deliverable.
+    is not, and that difference is the deliverable. `json_files` names the case's
+    JSON-lines files, whose field= selectors reproduce with jq rather than awk.
     """
     target = f"{logs_dir}/{action.file}" if action.file else f"{logs_dir}/*"
     if action.action is ActionKind.SEARCH:
@@ -151,11 +199,11 @@ def reproduce_command(action: InvestigativeAction, logs_dir: str = "logs") -> st
     if action.action is ActionKind.COUNT:
         return f"grep -ciE {shlex.quote(action.pattern)} {target}"
     if action.action is ActionKind.TALLY:
-        return f"{_value_stream(action, target)} | sort | uniq -c | sort -rn"
+        return f"{_value_stream(action, target, json_files)} | sort | uniq -c | sort -rn"
     if action.action is ActionKind.STATS:
-        return f"{_value_stream(action, target)} | sort -n | uniq -c"
+        return f"{_value_stream(action, target, json_files)} | sort -n | uniq -c"
     if action.action is ActionKind.EXTREMES:
-        return _extremes_command(action, target)
+        return _extremes_command(action, target, json_files)
     if action.action is ActionKind.TIMELINE:
         # Stamp frequencies at native granularity; the burst arithmetic is over these.
         return (
@@ -421,7 +469,7 @@ def execute_readonly(
             table="\n".join(outcome.table),
             total_matches=outcome.matched_lines,
             error=outcome.error,
-            reproduce=reproduce_command(action, logs_dir),
+            reproduce=reproduce_command(action, logs_dir, json_files=corpus.json_files),
         )
     if kind is ActionKind.SEARCH:
         result = corpus.search(action.pattern, file=action.file)
@@ -459,5 +507,5 @@ def execute_readonly(
         total_matches=result.total_matches,
         truncated=result.truncated if kind is not ActionKind.COUNT else 0,
         error=result.error,
-        reproduce=reproduce_command(action, logs_dir),
+        reproduce=reproduce_command(action, logs_dir, json_files=corpus.json_files),
     )

@@ -58,13 +58,14 @@ No prose outside the object."""
 _SKILL_MENU: dict[str, str] = {
     "tally": (
         "  tally       regex, case-insensitive. Returns the DISTINCT values with an exact "
-        "count for each. Choose the value with (a) field=\"<name-or-number>\" to take a "
+        "count for each. Choose the value with (a) field=\"<name-or-number-or-JSON-key>\" to take a "
         "delimited column -- the surest way, the pattern then only has to MATCH the line; "
         "or (b) extract=\"ip|domain|hash|email\" to pull every such entity from the line "
         "(this is how you list the IOCs in a set of lines); or (c) a capture group in the "
         "pattern. One tally answers \"which hosts, and how often each\" -- do not enumerate "
         "a distribution with repeated counts, and prefer field= over a full-line column "
-        "regex, which silently matches nothing on one wrong separator."
+        "regex, which silently matches nothing on one wrong separator. On a .jsonl file "
+        "field= names a JSON key from its keys: line (nested via dots)."
     ),
     "timeline": (
         "  timeline    regex, case-insensitive. Returns when the matching lines happen: "
@@ -72,13 +73,13 @@ _SKILL_MENU: dict[str, str] = {
         "steady, and when\" without fetching any lines."
     ),
     "stats": (
-        "  stats       regex, plus field=\"<name-or-number>\" (or a capture group) to pick "
+        "  stats       regex, plus field=\"<name-or-number-or-JSON-key>\" (or a capture group) to pick "
         "the value. Returns min/median/p95/max over it -- numeric when the values are "
         "numbers (e.g. field=\"response_body_len\"), otherwise over their lengths. Answers "
         "\"how big\" without fetching any lines."
     ),
     "extremes": (
-        "  extremes    regex, plus field=\"<name-or-number>\", extract=\"...\" or a capture "
+        "  extremes    regex, plus field=\"<name-or-number-or-JSON-key>\", extract=\"...\" or a capture "
         "group to pick the value, exactly as for stats. Returns the 10 matching LINES with "
         "the largest value -- numeric when the values are numbers, otherwise the longest -- "
         "each with a reference you can cite, plus where those ten sit in the whole "
@@ -289,6 +290,7 @@ def _files_block(
     names: list[str],
     line_counts: dict[str, int],
     field_headers: dict[str, list[str]] | None = None,
+    json_files: frozenset[str] = frozenset(),
 ) -> str:
     field_headers = field_headers or {}
     rows: list[str] = []
@@ -297,8 +299,10 @@ def _files_block(
         fields = field_headers.get(name)
         if fields:
             # The column names the field= selector references. Shown only when a selector
-            # skill is on (the caller decides), so a run without them is unchanged.
-            rows.append(f"      fields: {', '.join(fields)}")
+            # skill is on (the caller decides), so a run without them is unchanged. A
+            # JSON-lines file has keys rather than columns, and says so.
+            label = "keys (JSON lines)" if name in json_files else "fields"
+            rows.append(f"      {label}: {', '.join(fields)}")
     return "LOG FILES YOU CAN SEARCH (use these names exactly):\n" + "\n".join(rows)
 
 
@@ -312,6 +316,7 @@ def build_investigate_messages(
     steps_remaining: int,
     enabled_skills: frozenset[str] = frozenset(),
     field_headers: dict[str, list[str]] | None = None,
+    json_files: frozenset[str] = frozenset(),
 ) -> list[dict[str, str]]:
     # Field names are only useful, and only shown, when a selector skill is available.
     shown_headers = field_headers if (enabled_skills & _SELECTOR_SKILLS) else None
@@ -329,7 +334,7 @@ def build_investigate_messages(
         [
             "ALERT",
             fence_alert(alert),
-            _files_block(file_names, line_counts, shown_headers),
+            _files_block(file_names, line_counts, shown_headers, json_files),
             render_profile(profile),
             "INVESTIGATION SO FAR",
             evidence.render(),

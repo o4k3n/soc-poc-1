@@ -101,6 +101,15 @@ commander from ~8 zero-result regex steps to 1, with it reaching for `field=` un
 The named-column reproduce command is a self-resolving `awk` one-liner, so the result is
 still re-derivable by hand.
 
+On a **JSON-lines** file (`*.jsonl`, one object per line — the shape Windows host events
+take in `cases/wmi-lsass`) there are no columns; `field=` names a **key** instead, dotted
+for nesting (`field="Details.User"`), matched case-insensitively. The commander is shown
+each JSON file's keys under it, the way a Zeek header's fields are shown, labelled
+`keys (JSON lines):`. Values keep their JSON type, so a numeric key stays numeric for
+`stats`/`extremes` and a hex access mask like `0x1010` is ranked by its value, not its
+length. The reproduce command becomes a `jq` one-liner rather than `awk`, so a JSON
+aggregate is re-derivable by hand too.
+
 **The commander proposes; the orchestrator disposes.** An action is a JSON object the
 model emits and `actions.py` executes. The model never runs anything, and the set of
 things that *can* be run is those six verbs over files already in memory. Guided decoding
@@ -146,7 +155,7 @@ Read `PORTING.md` next; it explains why several things are shaped the way they a
 | `src/soc_poc/llm/` | `LLMClient` protocol, vLLM client, offline stub |
 | `src/soc_poc/transcript.py` | the JSONL corpus — the PoC's actual deliverable |
 | `src/soc_poc/preflight.py` | the three endpoint checks that gate every run |
-| `scripts/make_*_case.py` | the seeded scenario generators (dns-tunnel, http-c2) |
+| `scripts/make_*_case.py` | the seeded scenario generators (dns-tunnel, http-c2, wmi-lsass) |
 | `scripts/grade.py` | scores a brief against a case-keyed ground-truth rubric |
 | `deploy/flashnext/` | scripts to serve Qwen3.8-Flash-Next via SGLang (commander-only) |
 
@@ -342,6 +351,20 @@ runs the bundled demo — that is all `make demo` and `make demo-offline` do now
   agent that heartbeats on a fixed interval from many hosts *including the victim*, so
   "beacons periodically to one host" is benignly true — the case is built to prove the
   commander's timing conclusions are evidence-driven, not templated.
+- `scripts/make_wmi_lsass_case.py` → `cases/wmi-lsass` — Windows **host** telemetry
+  (Security + Sysmon as JSON lines, not network logs), a WMI lateral-movement into an
+  LSASS credential dump. The timing is a **single ~80 s chain**, the opposite again of
+  both a beacon and a burst. It is derived from two public EVTX attack samples
+  (sbousseaden/EVTX-ATTACK-SAMPLES, GPL-3.0) with every identifier re-seeded; run
+  `make case-wmi-lsass` to fetch the samples and build it (needs the `cases` extra:
+  `pip install -e ".[cases]"`). Its killer decoy is an SCCM agent that runs the *exact*
+  `WmiPrvSE.exe → cmd.exe` pair the alert matches, on every host all day — so the shallow
+  signature the alert fires on is benignly true estate-wide, and the intrusion is only
+  visible by pivoting to the logon source, the account, and the lsass access. The
+  discriminators live in named fields (`LogonType`, `IpAddress`, `GrantedAccess`,
+  `SubjectLogonId`), which the `field=` selector reads on a `.jsonl` file exactly as it
+  reads a Zeek `#fields` column — a JSON key, dotted for nesting; the commander is shown
+  each JSON file's keys the way it is shown a Zeek header.
 
 `scripts/grade.py` scores a brief against a case, keyed by folder name — a new scenario is
 one entry in its `CASES` registry plus a generator, no change to the grading machinery.

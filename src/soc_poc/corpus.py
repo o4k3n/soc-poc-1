@@ -16,6 +16,7 @@ unchanged: the commander now cites lines it has actually been shown.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,9 @@ class Corpus:
             for name, lines in files.items()
             for n, text in enumerate(lines, start=1)
         }
+        # JSON-lines files, parsed once on first use: None marks "not JSON". Every
+        # tally/stats/extremes in a run shares this, so a 5,000-line file is decoded once.
+        self._json_cache: dict[str, list[dict | None] | None] = {}
 
     @classmethod
     def from_dir(cls, logs_dir: Path) -> Corpus:
@@ -186,6 +190,61 @@ class Corpus:
                 names = line.split(sep)[1:]  # drop the "#fields" label
                 return {name.strip().lower(): index for index, name in enumerate(names)}
         return {}
+
+    # -- JSON lines ---------------------------------------------------------------------
+    #
+    # A `.jsonl` file has no #fields header; its columns are its keys. These give the
+    # field= selector, the `keys:` line the commander is shown, and the jq reproduce
+    # commands one shared view of the file, without touching the TSV path above.
+
+    def json_objects(self, file: str) -> list[dict | None] | None:
+        """Every line parsed as JSON, or None if the file is not JSON lines.
+
+        Index i is line i+1, so a value found here cites `file:L{i+1}` exactly like a
+        search hit does. Blank, unparseable and non-object lines are None: they carry no
+        value but still count as matches for the line filter, the way a short TSV row does.
+        A file is JSON lines when its first non-blank line is a JSON object.
+        """
+        if file in self._json_cache:
+            return self._json_cache[file]
+        lines = self._files.get(file, [])
+        first = next((line for line in lines if line.strip()), "")
+        parsed: list[dict | None] | None = None
+        if first.lstrip().startswith("{"):
+            try:
+                probe = json.loads(first)
+            except ValueError:
+                probe = None
+            if isinstance(probe, dict):
+                parsed = []
+                for line in lines:
+                    try:
+                        obj = json.loads(line) if line.strip() else None
+                    except ValueError:
+                        obj = None
+                    parsed.append(obj if isinstance(obj, dict) else None)
+        self._json_cache[file] = parsed
+        return parsed
+
+    def is_json(self, file: str) -> bool:
+        return self.json_objects(file) is not None
+
+    @property
+    def json_files(self) -> frozenset[str]:
+        return frozenset(name for name in self.file_names if self.is_json(name))
+
+    def json_keys(self, file: str) -> list[tuple[str, int]]:
+        """Top-level keys of a JSON-lines file with how many lines carry each, most
+        common first (ties keep first-seen order). Empty for a non-JSON file."""
+        objects = self.json_objects(file)
+        if not objects:
+            return []
+        counts: dict[str, int] = {}
+        for obj in objects:
+            if obj:
+                for key in obj:
+                    counts[key] = counts.get(key, 0) + 1
+        return sorted(counts.items(), key=lambda kv: -kv[1])
 
     def slice_lines(self, file: str, start: int, end: int) -> list[Hit]:
         """A contiguous range, for handing to a worker for a close read."""

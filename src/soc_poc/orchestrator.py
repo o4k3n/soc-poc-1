@@ -82,6 +82,20 @@ TASK_TIMEOUT_MARGIN_S = 30.0
 # dns.log:L1-L5586" would reinstate the sweep one action at a time.
 MAX_CLOSE_READ_LINES = 120
 
+# Keys of a JSON-lines file shown under it in the files block. Windows Security plus Sysmon
+# unions to 30-40 keys; the tail is summarised so the model knows the list is not closed.
+JSON_KEYS_SHOWN = 24
+
+
+def json_key_display(keys: list[tuple[str, int]]) -> list[str]:
+    shown = [key for key, _ in keys[:JSON_KEYS_SHOWN]]
+    if len(keys) > JSON_KEYS_SHOWN:
+        shown.append(
+            f"+{len(keys) - JSON_KEYS_SHOWN} more (any key on a line works; nested via "
+            f"dots, e.g. field=\"Details.User\")"
+        )
+    return shown
+
 
 class InvestigationContext(BaseModel):
     """The whole investigation, in one immutable value."""
@@ -151,12 +165,16 @@ class Orchestrator:
         # The Registry: in-flight work, addressable by task id. At most one close_read.
         self._registry: dict[str, asyncio.Task[GruntSuccess | GruntFailure]] = {}
         # Column names per file that declares a #fields header, ordered by index, for the
-        # field= selector. Computed once; empty for files with no header.
+        # field= selector; for a JSON-lines file, its keys by frequency. Computed once;
+        # empty for files with neither.
         self._field_headers: dict[str, list[str]] = {}
+        self._json_files: frozenset[str] = corpus.json_files
         for name in corpus.file_names:
             field_map = corpus.field_map(name)
             if field_map:
                 self._field_headers[name] = sorted(field_map, key=lambda k: field_map[k])
+            elif name in self._json_files:
+                self._field_headers[name] = json_key_display(corpus.json_keys(name))
 
     # -- driver -----------------------------------------------------------------------
 
@@ -417,6 +435,7 @@ class Orchestrator:
             min_steps=self._run.min_steps_before_conclude,
             enabled_skills=frozenset(self._run.enabled_skills),
             field_headers=self._field_headers,
+            json_files=self._json_files,
             progress=self._progress,
         )
 
@@ -457,7 +476,7 @@ class Orchestrator:
                 "ref": action.ref,
                 "lines": f"{action.start_line}-{action.end_line}",
                 "question": action.question,
-                "reproduce": reproduce_command(action),
+                "reproduce": reproduce_command(action, json_files=self._json_files),
             },
         )
         self._progress.note(f"step {self._evidence.next_index}: {action.reasoning}")
@@ -605,7 +624,7 @@ class Orchestrator:
                 action=action,
                 summary="no lines in that range",
                 error=f"{action.file} has no lines {action.start_line}-{action.end_line}",
-                reproduce=reproduce_command(action),
+                reproduce=reproduce_command(action, json_files=self._json_files),
             )
 
         # A line cap alone is not a context bound. 120 Zeek dns.log lines are ~17k tokens
@@ -687,7 +706,7 @@ class Orchestrator:
                 action=action,
                 summary=f"close_read failed ({outcome.reason})",
                 error=f"{outcome.reason}: {outcome.detail}",
-                reproduce=reproduce_command(action),
+                reproduce=reproduce_command(action, json_files=self._json_files),
             )
 
         report = outcome.report
@@ -722,7 +741,7 @@ class Orchestrator:
             summary=summary,
             lines=shown,
             total_matches=len(hits),
-            reproduce=reproduce_command(action),
+            reproduce=reproduce_command(action, json_files=self._json_files),
         )
 
     async def _on_aborting(self, context: InvestigationContext) -> InvestigationContext:

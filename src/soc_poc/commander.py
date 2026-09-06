@@ -123,6 +123,7 @@ async def decide_action(
     min_steps: int = 0,
     enabled_skills: frozenset[str] = frozenset(),
     field_headers: dict[str, list[str]] | None = None,
+    json_files: frozenset[str] = frozenset(),
     progress: ProgressSink | None = None,
 ) -> ActionResult:
     """INVESTIGATING: alert + profile + everything seen so far goes in, one action comes out."""
@@ -136,6 +137,7 @@ async def decide_action(
         steps_remaining=steps_remaining,
         enabled_skills=enabled_skills,
         field_headers=field_headers,
+        json_files=json_files,
     )
 
     def validate(action: InvestigativeAction) -> list[str]:

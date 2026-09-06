@@ -167,6 +167,68 @@ CASES: dict[str, dict] = {
             "update poller": r"windowsupdate|ctldl|Microsoft-BITS",
         },
     },
+    "wmi-lsass": {
+        "checks": [
+            {
+                "name": "names the source of the type-3 logon (10.12.34.71 / WKS-2208)",
+                "needles": [r"10\.12\.34\.71", r"WKS-2208"],
+                "refs": ["dhcp.log:L6"],
+                # The attacker's source IP appears on exactly one 4624 in the estate.
+                "ref_lines": {"file": "security.jsonl",
+                              "pattern": r'"IpAddress":"10\.12\.34\.71"'},
+            },
+            {
+                "name": "names the account svc_deploy and that it is privileged/out of place",
+                "needles": [r"svc[_-]?deploy"],
+                "refs": [],
+                "ref_lines": {"file": "security.jsonl", "pattern": r'"TargetUserName":"svc_deploy"'},
+            },
+            {
+                # The logon id is what joins the 4624 to the 4688; a brief that makes the
+                # link either names the id or says it tied logon to process.
+                "name": "ties the logon to the WmiPrvSE->cmd process (shared logon id)",
+                "needles": [r"logon\s?id|SubjectLogonId|TargetLogonId|same session|"
+                            r"\b0x0*[0-9a-f]{4,}\b.*(logon|session)"],
+                "refs": [],
+                "ref_lines": {"file": "security.jsonl", "pattern": r"comsvcs\.dll, MiniDump"},
+            },
+            {
+                "name": "quotes the WmiPrvSE->cmd command line (comsvcs MiniDump of lsass)",
+                "needles": [r"comsvcs|MiniDump|WmiPrvSE.{0,40}cmd|cmd.{0,40}WmiPrvSE"],
+                "refs": [],
+                "ref_lines": {"file": "security.jsonl", "pattern": r"comsvcs\.dll, MiniDump"},
+            },
+            {
+                # 0x1010 alone is not the tell (svchost uses it too); the SourceImage is.
+                "name": "identifies the lsass access (0x1010 by the dumper), distinct from AV",
+                "needles": [r"lsass.{0,60}(0x1010|granted)", r"(0x1010|granted).{0,60}lsass",
+                            r"rundll32.{0,60}lsass|lsass.{0,60}rundll32"],
+                "refs": [],
+                "ref_lines": {"file": "sysmon.jsonl",
+                              "pattern": r'"SourceImage":"[^"]*rundll32\.exe".*"GrantedAccess":"0x1010"'},
+            },
+            {
+                # The scenario's timing tell: one short chain, the opposite of the other
+                # two cases' periodic/bursty signatures.
+                "name": "describes the timing as a single short chain, not periodic/repeating",
+                "needles": [r"single|one[- ]off|once|one short|a short chain|~?\d+\s?s(ec)?\b|"
+                            r"not (periodic|repeating|recurring)|in (one|a single)"],
+                "refs": [],
+            },
+            {
+                "name": "records what it could not determine (coverage gaps)",
+                "needles": [],  # structural
+                "refs": [],
+            },
+        ],
+        "decoys": {
+            # The killer decoy first: the exact WmiPrvSE->cmd pair the alert matches, benign.
+            "SCCM management agent": r"svc_sccm|SRV-SCCM01|10\.12\.34\.8\b|quickfixengineering|CCM\\\\inventory",
+            "antivirus lsass access": r"MsMpEng|Windows Defender",
+            "admin RDP": r"SRV-JUMP01|10\.12\.34\.9\b|t\.admin",
+            "backup service": r"SRV-FS01|10\.12\.34\.10\b",
+        },
+    },
 }
 
 

@@ -15,7 +15,7 @@ COMPOSE := HF_CACHE_DIR=$(HF_CACHE_DIR) docker compose \
 
 VLLM_IMAGE := nvcr.io/nvidia/vllm:26.07-py3
 
-.PHONY: setup weights weights-qwen38 weights-qwen38-int4 up down logs ps restart restart-grunt restart-commander health demo demo-offline abort grade test clean
+.PHONY: setup weights weights-qwen38 weights-qwen38-int4 up down logs ps restart restart-grunt restart-commander health demo demo-offline abort grade test clean case-wmi-lsass
 
 setup:              ## create venv and install the package (editable) + dev deps
 	python3 -m venv .venv
@@ -169,6 +169,10 @@ grade:              ## grade a run against its case, e.g. make grade RUN=out/inv
 
 test:
 	$(PY) -m pytest -q
+
+case-wmi-lsass:     ## fetch the EVTX samples and (re)generate cases/wmi-lsass (needs the 'cases' extra)
+	bash scripts/fetch_evtx_samples.sh
+	$(PY) scripts/make_wmi_lsass_case.py
 
 clean:
 	rm -rf out/*

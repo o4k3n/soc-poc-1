@@ -10,6 +10,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+# Only scripts/make_wmi_lsass_case.py needs this, to parse the EVTX attack samples. The
+# orchestrator never imports it, so it stays out of the runtime and dev sets.
+cases = ["python-evtx>=0.8"]
 
 [project.scripts]
 soc-poc = "soc_poc.cli:main"
