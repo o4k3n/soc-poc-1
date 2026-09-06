@@ -77,12 +77,28 @@ _SKILL_MENU: dict[str, str] = {
         "numbers (e.g. field=\"response_body_len\"), otherwise over their lengths. Answers "
         "\"how big\" without fetching any lines."
     ),
+    "extremes": (
+        "  extremes    regex, plus field=\"<name-or-number>\", extract=\"...\" or a capture "
+        "group to pick the value, exactly as for stats. Returns the 10 matching LINES with "
+        "the largest value -- numeric when the values are numbers, otherwise the longest -- "
+        "each with a reference you can cite, plus where those ten sit in the whole "
+        "distribution. This is the bridge from a number to its evidence: after stats says "
+        "\"max request_body_len 46392\" or a tally shows 790 distinct labels, extremes hands "
+        "you the lines behind the top end in one step instead of a hand-built digit-range "
+        "regex. Unlike the other aggregates it DOES fetch lines (ten of them) into your "
+        "record, so narrow the filter first, and mind the direction of a size column: the "
+        "largest response bodies are downloads, the largest request bodies are uploads."
+    ),
 }
 
+# The verbs that size a result set without fetching lines. extremes is on the menu but not
+# in this list: it fetches ten lines, so "aggregate before you fetch" must not name it.
+_SIZING_SKILLS = frozenset({"tally", "timeline", "stats"})
+
 # The selectors are usable only when the commander knows the column names; those are shown
-# in the files block, but only when tally or stats is on -- so this gates that display and
+# in the files block, but only when a selector verb is on -- so this gates that display and
 # keeps a run without the aggregation skills byte-for-byte as it was.
-_SELECTOR_SKILLS = frozenset({"tally", "stats"})
+_SELECTOR_SKILLS = frozenset({"tally", "stats", "extremes"})
 
 
 def investigate_system_prompt(enabled_skills: frozenset[str] = frozenset()) -> str:
@@ -95,7 +111,8 @@ def investigate_system_prompt(enabled_skills: frozenset[str] = frozenset()) -> s
     skills = [text for name, text in _SKILL_MENU.items() if name in enabled_skills]
     skill_block = ("\n" + "\n".join(skills)) if skills else ""
     aggregate_verbs = "/".join(
-        ["count"] + [name for name in _SKILL_MENU if name in enabled_skills]
+        ["count"]
+        + [name for name in _SKILL_MENU if name in enabled_skills and name in _SIZING_SKILLS]
     )
     return f"""{_ROLE}
 
@@ -344,7 +361,9 @@ def build_action_retry_messages(
 
 # Characters the fetched-lines recap may spend. Big enough to hold every citable line of a
 # normal run flat and uncollapsed; a runaway is truncated with the count said out loud.
-_ON_RECORD_BUDGET_CHARS = 5_000
+# Sized for a run that used extremes: one such step puts ten ~240-char rows here (~2.4k),
+# and at 5_000 two of them pushed every later search's lines into "not repeated here".
+_ON_RECORD_BUDGET_CHARS = 8_000
 
 
 def _evidence_on_record(evidence: Evidence) -> str:
@@ -357,8 +376,9 @@ def _evidence_on_record(evidence: Evidence) -> str:
     requirement to reconcile against this list. Every fetched line was a question the
     commander judged worth a step, so it is either in the brief or named in coverage_gaps.
 
-    Only steps that fetched real lines appear (search/context/read_lines/close_read).
-    Aggregates carry numbers, not citable lines, and are already emphasised in the ledger.
+    Only steps that fetched real lines appear (search/context/read_lines/close_read, and
+    extremes, whose ranked rows are real lines with references). The number-only
+    aggregates carry no citable lines and are already emphasised in the ledger.
     """
     rows: list[str] = []
     spent = 0

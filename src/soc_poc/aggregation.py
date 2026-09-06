@@ -11,10 +11,17 @@ Everything here is counted, not inferred, exactly like profiling.py: no model pr
 any number, and every result can be re-derived with grep, sort and awk. The shell
 equivalent is printed in the step ledger by actions.reproduce_command.
 
-None of these return log lines, so nothing here enters `shown_refs()` -- an aggregate is
-not a citation and must never be mistaken for one. Its product is the number itself,
-which survives ledger collapse in full for the same reason `count`'s summary does: the
-number IS the answer, and keeping it is what stops the commander asking twice.
+tally, timeline and stats return no log lines, so nothing they produce enters
+`shown_refs()` -- a number is not a citation and must never be mistaken for one. Their
+product is the number itself, which survives ledger collapse in full for the same reason
+`count`'s summary does: the number IS the answer, and keeping it is what stops the
+commander asking twice.
+
+`extremes` is the deliberate exception. Its product is the lines BEHIND a number -- the
+ten matches with the largest value -- and those lines are returned with their references
+precisely so they can be cited. It is the bridge from "max request_body_len is 46392" to
+the line that says so; without it the transcripts show the commander hand-rolling
+digit-range regexes for four steps to fetch "the big ones".
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from soc_poc.corpus import Corpus
+from soc_poc.corpus import Corpus, Hit
 from soc_poc.profiling import _DOMAIN, _IP, _LONG_TOKEN, BURST_GAP_FACTOR, _humanise, _timestamp
 
 # Entity recognisers for `extract=`, reusing the exact shapes profiling.py already counts,
@@ -50,6 +57,11 @@ TALLY_RARE_SHOWN = 5
 VALUE_MAX_CHARS = 80
 # Sessions reported by timeline. More than this is not session structure, it is noise.
 TIMELINE_MAX_SESSIONS = 12
+# Lines extremes returns. These are real lines entering the ledger, so the cap is a
+# context cost, not a rendering nicety: ten is enough to see the shape of a tail (the 14
+# exfil POSTs in http-c2 fill it with one signal) and small enough to fit a step's line
+# budget in evidence.py.
+EXTREMES_SHOWN = 10
 
 _NUMERIC = re.compile(r"^-?\d+(\.\d+)?$")
 
@@ -76,10 +88,11 @@ def _resolve_field(selector: str, field_map: dict[str, int]) -> int | None:
     return None
 
 
-def _extract(
+def _selected_rows(
     corpus: Corpus, pattern: str, file: str, *, field: str = "", extract: str = ""
-) -> tuple[list[str], int, str] | tuple[None, int, str]:
-    """Every selected value in corpus order, plus how many lines the pattern matched.
+) -> tuple[list[tuple[str, Hit]], int, str] | tuple[None, int, str]:
+    """Every selected value in corpus order, each paired with the line it came from, plus
+    how many lines the pattern matched.
 
     `pattern` is always the line filter. What it selects as the *value* depends on the
     selector, in precedence order:
@@ -94,6 +107,9 @@ def _extract(
 
     Comment/header lines are skipped only in the selector modes, where splitting the
     `#fields` line into columns would otherwise pollute the result.
+
+    The `Hit` is built exactly as `corpus.search` builds one, so a reference from here
+    resolves like any other. tally/stats discard it (see `_extract`); extremes keeps it.
     """
     if file and file not in corpus.file_names:
         return None, 0, f"no such file {file!r}; this case has {', '.join(corpus.file_names)}"
@@ -107,7 +123,7 @@ def _extract(
         return None, 0, f"bad regex: {exc}"
 
     selecting = bool(field or extract)
-    values: list[str] = []
+    rows: list[tuple[str, Hit]] = []
     matched_lines = 0
     for name in [file] if file else corpus.file_names:
         index = None
@@ -123,22 +139,36 @@ def _extract(
                        else "this file has no #fields header, so name a 1-based column number")
                 )
             separator = corpus.separator(name)
-        for text in corpus.file_lines(name):
+        for number, text in enumerate(corpus.file_lines(name), start=1):
             if selecting and text.startswith("#"):
                 continue
             if not regex.search(text):
                 continue
             matched_lines += 1
+            hit = Hit(f"{name}:L{number}", text)
             if extract:
-                values.extend(ENTITY_PATTERNS[extract].findall(text))
+                rows.extend((v, hit) for v in ENTITY_PATTERNS[extract].findall(text))
             elif field:
                 columns = text.split(separator)
                 if index is not None and 0 <= index < len(columns):
-                    values.append(columns[index])
+                    rows.append((columns[index], hit))
             else:
                 group = 1 if regex.groups else 0
-                values.extend(m.group(group) or "" for m in regex.finditer(text))
-    return values, matched_lines, ""
+                rows.extend((m.group(group) or "", hit) for m in regex.finditer(text))
+    return rows, matched_lines, ""
+
+
+def _extract(
+    corpus: Corpus, pattern: str, file: str, *, field: str = "", extract: str = ""
+) -> tuple[list[str], int, str] | tuple[None, int, str]:
+    """`_selected_rows` without the references: the values alone, for the verbs whose
+    product is a number. Byte-for-byte the pre-extremes behaviour."""
+    rows, matched_lines, error = _selected_rows(
+        corpus, pattern, file, field=field, extract=extract
+    )
+    if rows is None:
+        return None, matched_lines, error
+    return [value for value, _ in rows], matched_lines, ""
 
 
 @dataclass(frozen=True)
@@ -154,6 +184,9 @@ class Aggregate:
     matched_lines: int = 0
     table: tuple[str, ...] = field(default=())
     error: str = ""
+    # Only extremes fills this. Its rows are real lines with references, and actions.py
+    # puts them on the Step as `lines` so they enter shown_refs() and can be cited.
+    hits: tuple[Hit, ...] = field(default=())
 
 
 def tally(
@@ -340,4 +373,82 @@ def stats(
         ),
         matched_lines=matched_lines,
         table=rows,
+    )
+
+
+def _rank_key(values: list[str]) -> tuple[str, bool]:
+    """The mode stats and extremes share: numeric when every value is a number, else
+    lengths, and the caller says which."""
+    if all(_NUMERIC.match(value) for value in values):
+        return "numeric value", True
+    return "value length in characters (values are not all numeric)", False
+
+
+def extremes(
+    corpus: Corpus, pattern: str, *, file: str = "", field: str = "", extract: str = ""
+) -> Aggregate:
+    """The matching lines with the largest selected value, with references: the evidence
+    behind a stats maximum or a tally's long tail, in one step.
+
+    Same selectors as stats. Numeric when every selected value is a number (byte counts,
+    ports); otherwise ranked by the value's LENGTH, stated as such -- the mode that hands
+    over the longest DNS labels or the longest TXT answers. One row per line: a line that
+    yields several values contributes its largest, so the ten rows are ten distinct
+    citations. Ties keep corpus order.
+
+    This is the one aggregate that returns lines. It is also the one that costs context,
+    so the table ends with where the top ten sit in the whole distribution (the next
+    value, median, min) -- the commander should be able to tell from that whether the
+    tail it fetched is a cliff or a slope without fetching more.
+    """
+    rows, matched_lines, error = _selected_rows(
+        corpus, pattern, file, field=field, extract=extract
+    )
+    if rows is None:
+        return Aggregate(headline=f"failed: {error}", error=error)
+    scope = file or f"{len(corpus.file_names)} file(s)"
+    if not rows:
+        return Aggregate(
+            headline=f"0 matches in {scope} -- this pattern does not occur there"
+        )
+
+    mode, numeric = _rank_key([value for value, _ in rows])
+    measure = (lambda v: float(v)) if numeric else (lambda v: float(len(v)))
+
+    # Best value per line, in corpus order, so a sort (stable) breaks ties by position.
+    best: dict[str, tuple[float, str, Hit]] = {}
+    for value, hit in rows:
+        key = measure(value)
+        if hit.ref not in best or key > best[hit.ref][0]:
+            best[hit.ref] = (key, value, hit)
+    ranked = sorted(best.values(), key=lambda item: item[0], reverse=True)
+    top = ranked[:EXTREMES_SHOWN]
+    series = [item[0] for item in ranked]
+
+    def fmt(key: float) -> str:
+        return f"{key:g}"
+
+    # Value first, ref last: the stub client cites anything that starts with a ref, and
+    # these rows are a table, not the lines themselves (those follow via Step.lines).
+    table = [f"ranked by: {mode}, largest first"]
+    for rank, (key, value, hit) in enumerate(top, start=1):
+        shown = fmt(key) if numeric else f"{fmt(key)} chars  {_clip(value)}"
+        table.append(f"#{rank:<2} {shown}  <- {hit.ref}")
+    tail = f"n={len(ranked)} line(s)"
+    if len(ranked) > len(top):
+        tail += (
+            f", showing top {len(top)}; next value {fmt(series[len(top)])}, "
+            f"median {fmt(statistics.median(series))}, min {fmt(series[-1])}"
+        )
+    else:
+        tail += f", all {len(ranked)} shown; min {fmt(series[-1])}"
+    table.append(tail)
+
+    return Aggregate(
+        headline=(
+            f"top {len(top)} of {len(ranked)} line(s) in {scope} by {mode.split(' (')[0]}"
+        ),
+        matched_lines=matched_lines,
+        table=tuple(table),
+        hits=tuple(hit for _, _, hit in top),
     )

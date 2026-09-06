@@ -58,8 +58,10 @@ STEPS_RENDERED_IN_FULL = 4
 COLLAPSED_LINE_SAMPLE = 3
 COLLAPSED_LINE_MAX_CHARS = 130
 # Per-step line budget. A step that matched 800 lines shows the first 40 (corpus.MAX_RESULTS
-# caps that) and says so; this bounds the characters those 40 can spend.
-STEP_LINE_BUDGET_CHARS = 3_000
+# caps that) and says so; this bounds the characters those 40 can spend. Sized so the ten
+# rows of an extremes over 300-char Zeek lines (~303 chars each after eliding) all fit;
+# at 3_000 the tenth ranked line was the one dropped.
+STEP_LINE_BUDGET_CHARS = 3_300
 LINE_MAX_CHARS = 260
 LINE_HEAD_CHARS = 150
 
@@ -95,10 +97,11 @@ class Step:
     error: str = ""
     # The shell command that reproduces this step, for the transcript and the brief.
     reproduce: str = ""
-    # An aggregate's product (tally/timeline/stats): pre-rendered rows of counted
-    # numbers, never log lines. Kept whole through collapse for the same reason count's
-    # summary is -- the numbers ARE the answer, and dropping them on age-out is exactly
-    # the rendering mistake that built the search loop this module documents.
+    # An aggregate's product (tally/timeline/stats/extremes): pre-rendered rows of
+    # counted numbers, kept whole through collapse for the same reason count's summary
+    # is -- the numbers ARE the answer, and dropping them on age-out is exactly the
+    # rendering mistake that built the search loop this module documents. extremes also
+    # puts its ranked lines in `lines`, where they are cited and rendered like a search's.
     table: str = ""
 
 
@@ -156,13 +159,23 @@ class Evidence:
         return "\n".join(blocks)
 
 
+def selector_suffix(action: InvestigativeAction) -> str:
+    """` field=x` / ` extract=ip` when set. Two aggregates over the same filter but
+    different columns are different questions and must read differently in the ledger."""
+    if action.field:
+        return f" field={action.field}"
+    if action.extract:
+        return f" extract={action.extract}"
+    return ""
+
+
 def _headline(step: Step) -> str:
     """The action as a one-liner, in the vocabulary the commander used to write it."""
     action = step.action
     kind = action.action
     scope = f" in {action.file}" if action.file else ""
     if kind in PATTERN_KINDS:
-        return f"{kind.value} /{action.pattern}/{scope}"
+        return f"{kind.value} /{action.pattern}/{scope}{selector_suffix(action)}"
     if kind is ActionKind.CONTEXT:
         return f"context around {action.ref}"
     if kind in (ActionKind.READ_LINES, ActionKind.CLOSE_READ):
@@ -185,7 +198,8 @@ def _table_lines(step: Step, *, indent: str) -> list[str]:
 
 
 def _collapsed_lines(step: Step) -> list[str]:
-    """The sample an aged-out step keeps. `count` has no lines and needs none."""
+    """The sample an aged-out step keeps. `count` and the number-only aggregates have no
+    lines and need none; a search or an extremes keeps its first few with their refs."""
     if not step.lines:
         return []
     out = [

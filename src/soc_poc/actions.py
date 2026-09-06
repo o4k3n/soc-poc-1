@@ -19,7 +19,7 @@ import shlex
 from soc_poc import aggregation
 from soc_poc.corpus import Corpus, SearchResult
 from soc_poc.evidence import Step
-from soc_poc.schemas.action import ActionKind, InvestigativeAction
+from soc_poc.schemas.action import SELECTOR_KINDS, ActionKind, InvestigativeAction
 
 # The timestamp shapes profiling/aggregation recognise, as one grep -oE alternation, so
 # a timeline's reproduce command extracts the same stamps the code did.
@@ -46,6 +46,17 @@ _EXTRACT_GREP = {
 }
 
 
+def _awk_var(regex: str) -> str:
+    """A regex as an `awk -v` value, shell-quoted.
+
+    awk applies escape processing to -v assignments, so `\\.` arrives as `.` and `\\?` as
+    `?` (with a warning) and the pattern silently matches something else. Doubling the
+    backslashes survives that pass intact. grep's `\\b` is a backspace to gawk's regex
+    engine; its word boundary is `\\y`.
+    """
+    return shlex.quote(regex.replace("\\b", "\\y").replace("\\", "\\\\"))
+
+
 def _value_stream(action: InvestigativeAction, target: str) -> str:
     """The pipeline that isolates the aggregated value, matching `_extract`'s three modes.
 
@@ -70,12 +81,61 @@ def _value_stream(action: InvestigativeAction, target: str) -> str:
         )
         return (
             f"awk -F'\\t' -v name={shlex.quote(action.field.strip())} "
-            f"-v pat={shlex.quote(action.pattern)} {shlex.quote(prog)} {target}"
+            f"-v pat={_awk_var(action.pattern)} {shlex.quote(prog)} {target}"
         )
     stream = f"grep -hoiE {shlex.quote(action.pattern)} {target}"
     if _has_group(action.pattern):
         stream += f" | sed -E {shlex.quote(f's/{action.pattern}/\\1/I')}"
     return stream
+
+
+# awk's numeric test for extremes. Stricter than /^[0-9.]+$/ on purpose so an IP like
+# 1.2.3.4 ranks by length, as aggregation._NUMERIC does; the mode is decided at run time
+# from the data, so the shell equivalent has to decide it per value.
+_AWK_KEY = 'k=(v~/^-?[0-9]+(\\.[0-9]+)?$/)?v:length(v)'
+_AWK_EMIT = 'print k, FILENAME":L"FNR, $0'
+
+
+def _extremes_command(action: InvestigativeAction, target: str) -> str:
+    """The pipeline behind extremes: value, reference and line per match, largest first.
+
+    Unlike `_value_stream`, this has to keep the LINE and its number, so every mode is one
+    awk pass printing `key  file:Ln  line`, then `sort -rn | head`. Two known divergences
+    from the Python, stated rather than hidden: awk's `$0 ~ pat` is case-sensitive where
+    the code matches case-insensitively (pre-existing in the field-mode awk of
+    `_value_stream`), and in extract mode this prints one row per value where the code
+    keeps one row per line.
+    """
+    pat = _awk_var(action.pattern)
+    head = f"| sort -rn | head -{aggregation.EXTREMES_SHOWN}"
+    if action.field:
+        if action.field.strip().isdigit():
+            prog = f"!/^#/&&$0~pat{{v=${int(action.field)};{_AWK_KEY};{_AWK_EMIT}}}"
+            return f"awk -F'\\t' -v pat={pat} {shlex.quote(prog)} {target} {head}"
+        prog = (
+            f"/^#fields/{{for(i=2;i<=NF;i++)if($i==name)c=i-1}} "
+            f"!/^#/&&$0~pat{{v=$c;{_AWK_KEY};{_AWK_EMIT}}}"
+        )
+        return (
+            f"awk -F'\\t' -v name={shlex.quote(action.field.strip())} -v pat={pat} "
+            f"{shlex.quote(prog)} {target} {head}"
+        )
+    if action.extract:
+        entity = _EXTRACT_GREP.get(action.extract, r"\S+")
+        prog = (
+            f"$0~pat{{s=$0;while(match(s,ent)){{v=substr(s,RSTART,RLENGTH);"
+            f"{_AWK_KEY};{_AWK_EMIT};s=substr(s,RSTART+RLENGTH)}}}}"
+        )
+        return (
+            f"awk -v pat={pat} -v ent={_awk_var(entity)} {shlex.quote(prog)} "
+            f"{target} {head}"
+        )
+    if _has_group(action.pattern):
+        # gawk's three-argument match() fills m[1] with the first capture group.
+        prog = f"match($0,pat,m){{v=m[1];{_AWK_KEY};{_AWK_EMIT}}}"
+    else:
+        prog = f"match($0,pat){{v=substr($0,RSTART,RLENGTH);{_AWK_KEY};{_AWK_EMIT}}}"
+    return f"awk -v pat={pat} {shlex.quote(prog)} {target} {head}"
 
 
 def reproduce_command(action: InvestigativeAction, logs_dir: str = "logs") -> str:
@@ -94,6 +154,8 @@ def reproduce_command(action: InvestigativeAction, logs_dir: str = "logs") -> st
         return f"{_value_stream(action, target)} | sort | uniq -c | sort -rn"
     if action.action is ActionKind.STATS:
         return f"{_value_stream(action, target)} | sort -n | uniq -c"
+    if action.action is ActionKind.EXTREMES:
+        return _extremes_command(action, target)
     if action.action is ActionKind.TIMELINE:
         # Stamp frequencies at native granularity; the burst arithmetic is over these.
         return (
@@ -319,6 +381,7 @@ _AGGREGATES = {
     ActionKind.TALLY: aggregation.tally,
     ActionKind.TIMELINE: aggregation.timeline,
     ActionKind.STATS: aggregation.stats,
+    ActionKind.EXTREMES: aggregation.extremes,
 }
 
 
@@ -328,11 +391,12 @@ def execute_readonly(
     """Run one deterministic action. Never raises: a bad request becomes a Step with an error."""
     kind = action.action
     if kind in _AGGREGATES:
-        # timeline works off timestamps, so it takes no value selector; tally/stats do.
-        # validate_action has already rejected field/extract on anything but tally/stats.
+        # timeline works off timestamps, so it takes no value selector; the others do.
+        # validate_action has already rejected field/extract on anything else.
         selectors = (
-            {} if kind is ActionKind.TIMELINE
-            else {"field": action.field, "extract": action.extract}
+            {"field": action.field, "extract": action.extract}
+            if kind in SELECTOR_KINDS
+            else {}
         )
         outcome = _AGGREGATES[kind](corpus, action.pattern, file=action.file, **selectors)
         summary = outcome.headline
@@ -344,8 +408,16 @@ def execute_readonly(
             index=index,
             action=action,
             summary=summary,
-            # No lines on purpose: an aggregate produces numbers, and a number is not a
-            # citation. Nothing here may enter shown_refs().
+            # tally/timeline/stats carry no lines on purpose: they produce numbers, and a
+            # number is not a citation, so nothing of theirs enters shown_refs(). extremes
+            # is the exception by design -- its product IS the lines behind a number, and
+            # `hits` are real references the brief may cite. `truncated` is the honest gap
+            # between what matched and what was shown, so the ledger never says "the
+            # count above is exact" over a top-10 of 649.
+            lines=tuple(outcome.hits),
+            truncated=(
+                max(0, outcome.matched_lines - len(outcome.hits)) if outcome.hits else 0
+            ),
             table="\n".join(outcome.table),
             total_matches=outcome.matched_lines,
             error=outcome.error,

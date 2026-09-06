@@ -80,6 +80,10 @@ CASES: dict[str, dict] = {
                     r"TXT (record|response)s? .{0,140}(carr|contain).{0,140}(data|payload)",
                 ],
                 "refs": [],
+                # Any tunnel TXT line is the evidence for this; there are ~650 of them,
+                # so they are matched against the log at grade time, not listed.
+                "ref_lines": {"file": "dns.log",
+                              "pattern": r"\.t\.api-sync-telemetry\.net\t.*\tTXT\t"},
             },
             {
                 "name": "describes timing as bursty sessions, not a fixed interval",
@@ -115,6 +119,7 @@ CASES: dict[str, dict] = {
                 "name": "names the C2 destination and its rarity",
                 "needles": [r"185\.243\.115\.94|cdn-metric-collector"],
                 "refs": [],
+                "ref_lines": {"file": "http.log", "pattern": r"cdn-metric-collector\.net"},
             },
             {
                 # The scenario's whole point: periodic, NOT bursty. Either the correct
@@ -143,6 +148,10 @@ CASES: dict[str, dict] = {
                     r"request[_ ]body.{0,40}(large|bytes|volume)",
                 ],
                 "refs": [],
+                # The 14 /cm/upload POSTs are the exfiltration; citing any one of them is
+                # citing the direction.
+                "ref_lines": {"file": "http.log",
+                              "pattern": r"POST\tcdn-metric-collector\.net\t/cm/upload"},
             },
             {
                 "name": "records what it could not determine (coverage gaps)",
@@ -225,6 +234,34 @@ def _supporting_prose(body: dict) -> str:
     return _normalise("\n".join(out))
 
 
+def _resolve_ref_lines(case_dir: Path, spec: dict | None) -> tuple[set[str], str]:
+    """Expand a check's `ref_lines` into the `<file>:L<n>` refs it accepts.
+
+    Some facts are carried by hundreds of interchangeable lines (any tunnel TXT answer,
+    any beacon to the C2 host). Listing those refs by hand would be wrong the day the case
+    is regenerated, so the rubric names the file and a regex and the refs are derived from
+    the log at grade time -- numbered exactly as corpus.py numbers them, header lines
+    included. Returns the refs and a one-line description for the "wanted" message; an
+    absent or unreadable log yields no refs, and the literal `refs` still apply.
+    """
+    if not spec:
+        return set(), ""
+    path = case_dir / "logs" / spec["file"]
+    if not path.exists():
+        return set(), f"(could not read {path} to resolve line refs)"
+    regex = re.compile(spec["pattern"], re.I)
+    refs = {
+        f"{spec['file']}:L{number}"
+        for number, line in enumerate(path.read_text().splitlines(), start=1)
+        if regex.search(line)
+    }
+    examples = ", ".join(sorted(refs, key=lambda r: int(r.rsplit("L", 1)[1]))[:3])
+    return refs, (
+        f"any of {len(refs)} {spec['file']} line(s) matching /{spec['pattern']}/"
+        + (f", e.g. {examples}" if examples else "")
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("run_dir", type=Path)
@@ -256,12 +293,15 @@ def main() -> int:
             cited = False
         else:
             ok = any(re.search(n, prose, re.I) for n in check["needles"])
-            cited = any(r in refs for r in check["refs"])
+            derived, derived_note = _resolve_ref_lines(args.case, check.get("ref_lines"))
+            wanted = set(check["refs"]) | derived
+            cited = any(r in refs for r in wanted)
         reached += ok
         mark = "CITED " if ok and cited else ("REACHED" if ok else "MISSED ")
         detail = ""
-        if ok and check["refs"] and not cited:
-            detail = f"   (no line ref; wanted one of {', '.join(check['refs'])})"
+        if ok and (check["refs"] or check.get("ref_lines")) and not cited:
+            wants = list(check["refs"]) + ([derived_note] if derived_note else [])
+            detail = f"   (no line ref; wanted one of {', '.join(wants)})"
         print(f"  [{mark}] {check['name']}{detail}")
 
     print("\n  decoys (flagging one as evidence is a false positive):")

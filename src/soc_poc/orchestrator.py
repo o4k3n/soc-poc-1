@@ -47,7 +47,7 @@ from soc_poc.chunking import FileInventory
 from soc_poc.config import AppConfig
 from soc_poc.control import AbortMode, read_abort
 from soc_poc.corpus import Corpus
-from soc_poc.evidence import Evidence, Step
+from soc_poc.evidence import Evidence, Step, selector_suffix
 from soc_poc.grunt import run_grunt_task
 from soc_poc.llm.base import LLMClient
 from soc_poc.messages import GruntFailure, GruntSuccess, GruntTasking
@@ -490,6 +490,9 @@ class Orchestrator:
                 lines=repeat.lines,
                 total_matches=repeat.total_matches,
                 truncated=repeat.truncated,
+                # An aggregate's product is its table; a repeat that dropped it would
+                # re-create the very loop the repeat note exists to break.
+                table=repeat.table,
                 reproduce=repeat.reproduce,
             )
         elif action.action is ActionKind.CLOSE_READ:
@@ -561,6 +564,11 @@ class Orchestrator:
             action.action,
             action.pattern,
             action.file,
+            # The selectors change the question: `extremes field=request_body_len` and
+            # `field=response_body_len` over the same filter are two different questions,
+            # and the second must not be dismissed as a repeat of the first.
+            action.field,
+            action.extract,
             action.ref,
             action.start_line,
             action.end_line,
@@ -968,7 +976,7 @@ def _action_line(action: InvestigativeAction) -> str:
     kind = action.action
     scope = f" in {action.file}" if action.file else ""
     if kind in PATTERN_KINDS:
-        return f"{kind.value} /{action.pattern}/{scope}"
+        return f"{kind.value} /{action.pattern}/{scope}{selector_suffix(action)}"
     if kind is ActionKind.CONTEXT:
         return f"context around {action.ref}"
     if kind in (ActionKind.READ_LINES, ActionKind.CLOSE_READ):

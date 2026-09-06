@@ -70,14 +70,24 @@ worker with one question), `conclude` (stop and write the brief).
 own graded runs: `tally` (distinct values of a regex with exact counts — a distribution
 in one step instead of one `count` per guess), `timeline` (span, gap statistics and burst
 structure of a pattern's matches, same gap arithmetic as the profile), `stats`
-(min/median/p95/max over a captured value; lengths when the values are not numeric). All
-three live in `aggregation.py`, spend no GPU, return numbers rather than lines — nothing
-they produce enters `shown_refs()`, because a number is not a citation — and print their
-`grep`/`sed`/`awk` equivalent in the step ledger like every other action. The prompt
-teaches the discipline they exist for: **aggregate before you fetch** — size a result set
-with numbers before spending context on its lines.
+(min/median/p95/max over a captured value; lengths when the values are not numeric), and
+`extremes` (the ten matching *lines* with the largest value — numeric, or the longest —
+each with a citable reference, plus where those ten sit in the distribution). All four
+live in `aggregation.py`, spend no GPU and print their `grep`/`sed`/`awk` equivalent in
+the step ledger like every other action. The first three return numbers rather than
+lines — nothing they produce enters `shown_refs()`, because a number is not a citation.
+`extremes` is the deliberate exception: its product *is* the lines behind a number, so
+its rows enter `shown_refs()`, the ledger and the synthesis recap like a search's would.
+It exists because the transcripts showed the step between an aggregate and a citation
+being paid four times over — after `tally` said big values existed, the commander
+hand-built digit-range regexes (`\t(5[0-9]{2}|[6-9][0-9]{2}|1[0-9]{3,})\t`) to fetch
+"the big ones", and two tallies over label columns returned 790 distinct values across
+790 lines, where "the ten longest" was the question. The prompt teaches the discipline
+the number-only skills exist for: **aggregate before you fetch** — size a result set with
+numbers before spending context on its lines — and names `extremes` as the way to fetch
+the top of it.
 
-**Value selectors on `tally` and `stats`.** The pattern is always the line *filter*; how
+**Value selectors on `tally`, `stats` and `extremes`.** The pattern is always the line *filter*; how
 it picks the *value* has three modes, because "first capture group" alone forced a brittle
 column-counting regex that was the single most expensive failure in the transcripts (one
 run spent 8 of 24 steps re-anchoring the same qtype question). `field="<name-or-number>"`
@@ -120,7 +130,7 @@ Read `PORTING.md` next; it explains why several things are shaped the way they a
 | `src/soc_poc/corpus.py` | the case's log files, searchable by line; every result carries its ref |
 | `src/soc_poc/profiling.py` | the computed profile: rarities, entropy groups, bursts. No model |
 | `src/soc_poc/actions.py` | executing one action, plus the `grep` that reproduces it |
-| `src/soc_poc/aggregation.py` | the optional skills: tally, timeline, stats. Counted, never inferred |
+| `src/soc_poc/aggregation.py` | the optional skills: tally, timeline, stats, extremes. Counted, never inferred |
 | `src/soc_poc/evidence.py` | the append-only ledger: the run's memory *and* its audit trail |
 | `src/soc_poc/chunking.py` | token-aware chunking; still used for the inventory and injection scan |
 | `src/soc_poc/control.py` | run markers and the abort sentinel |
@@ -721,7 +731,7 @@ With the investigation loop healthy, the remaining graded misses were no longer 
   reasoning*, and then produced a brief that never mentioned it. The evidence was in the
   ledger with its refs; synthesis left it there. The fix is `_evidence_on_record` in
   `prompting/investigate.py`: a deterministic, flat, uncollapsed recap of every line the
-  commander *fetched* (aggregates excluded — they carry numbers, not citable lines), placed
+  commander *fetched* (number-only aggregates excluded — they carry no citable lines; `extremes` rows are included), placed
   at the end of the synthesis prompt, paired with a requirement to reconcile against it —
   each fetched line appears in the brief or is set aside in `coverage_gaps` with a reason,
   and an established identity (an IP's hostname, a domain's address) is never left unstated.

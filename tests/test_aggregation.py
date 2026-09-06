@@ -1,8 +1,10 @@
 """The aggregation skills: numbers about a pattern's matches, without fetching lines.
 
 The property under test is the same one profiling.py lives by: everything is counted,
-nothing is inferred, a zero from a wrong pattern must not read as absence, and nothing an
-aggregate produces can ever enter shown_refs() -- a number is not a citation.
+nothing is inferred, a zero from a wrong pattern must not read as absence, and nothing a
+number-only aggregate (tally/timeline/stats) produces can ever enter shown_refs() -- a
+number is not a citation. `extremes` is the deliberate exception and is tested as one:
+its rows ARE lines, with references, and they must be citable.
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from soc_poc.actions import execute_readonly, reproduce_command
-from soc_poc.aggregation import stats, tally, timeline
+from soc_poc.aggregation import EXTREMES_SHOWN, extremes, stats, tally, timeline
 from soc_poc.coercion import coerce_action_payload
 from soc_poc.config import RunConfig
 from soc_poc.corpus import Corpus
@@ -577,12 +579,17 @@ def test_corpus_parses_fields_and_separator(zeek_http: Corpus) -> None:
 # --- validation and wiring ------------------------------------------------------------
 
 
-def test_selectors_are_rejected_off_tally_and_stats() -> None:
+def test_selectors_are_rejected_off_the_selector_verbs() -> None:
     for kind in (ActionKind.SEARCH, ActionKind.COUNT, ActionKind.TIMELINE):
         problems = validate_action(
             _action(kind, pattern="x", field="foo"), known_files=["dns.log"]
         )
-        assert any("apply only to tally and stats" in p.message for p in problems)
+        assert any("apply only to tally, stats and extremes" in p.message for p in problems)
+    # extremes takes them exactly as stats does.
+    assert validate_action(
+        _action(ActionKind.EXTREMES, pattern="x", file="dns.log", field="2"),
+        known_files=["dns.log"],
+    ) == []
 
 
 def test_field_and_extract_are_mutually_exclusive() -> None:
@@ -678,3 +685,157 @@ def test_synthesis_prompt_demands_reconciliation_and_identities() -> None:
     from soc_poc.prompting.investigate import SYNTHESIS_SYSTEM_PROMPT
     assert "EVIDENCE ON THE RECORD" in SYNTHESIS_SYSTEM_PROMPT
     assert "IP to a hostname" in SYNTHESIS_SYSTEM_PROMPT
+
+
+# --- extremes: the one aggregate that returns lines ------------------------------------
+#
+# Pinned against inv-20260906T161604Z-0d1c (http-c2), which spent 4 of 23 steps building
+# digit-range regexes to fetch "the big ones" after a tally said big values existed, and
+# against the dns-tunnel runs whose tallies over label columns returned 790 distinct
+# values across 790 lines. The ten largest, with refs, is the question both were asking.
+
+
+def test_extremes_ranks_numeric_values_largest_first_with_refs(zeek_http: Corpus) -> None:
+    r = extremes(zeek_http, r"\.example", file="http.log", field="response_body_len")
+    assert r.matched_lines == 3 and not r.error
+    assert [h.ref for h in r.hits] == ["http.log:L5", "http.log:L6", "http.log:L4"]
+    assert r.table[0].startswith("ranked by: numeric value")
+    assert "5000" in r.table[1] and "http.log:L5" in r.table[1]
+    assert "all 3 shown" in r.table[-1]           # n <= 10: no cliff to report
+    assert r.headline.startswith("top 3 of 3 line(s) in http.log")
+
+
+def test_extremes_falls_back_to_length_and_says_so(corpus: Corpus) -> None:
+    r = extremes(corpus, r"query (\S+)", file="dns.log")
+    assert r.table[0].startswith("ranked by: value length")
+    assert len(r.hits) == EXTREMES_SHOWN and r.matched_lines == 20
+    # Every label is the same length, so ties keep corpus order.
+    assert r.hits[0].ref == "dns.log:L1" and r.hits[-1].ref == f"dns.log:L{EXTREMES_SHOWN}"
+    assert "showing top 10" in r.table[-1] and "next value" in r.table[-1]
+
+
+def test_extremes_keeps_one_row_per_line(corpus: Corpus) -> None:
+    """A line with several selected values contributes its largest, once: ten rows are
+    ten distinct citations, never the same line twice."""
+    r = extremes(corpus, r"bytes=(\d+)", file="dns.log", field="")
+    assert len({h.ref for h in r.hits}) == len(r.hits) == EXTREMES_SHOWN
+    assert r.hits[0].ref == "dns.log:L20"            # bytes=190 is the largest
+    r2 = extremes(corpus, "10.0.0", file="dns.log", extract="ip")
+    assert len({h.ref for h in r2.hits}) == len(r2.hits)
+
+
+def test_extremes_failures_are_values_and_zero_is_a_result(corpus: Corpus) -> None:
+    assert "bad regex" in extremes(corpus, "(", file="dns.log").headline
+    assert "no such file" in extremes(corpus, "x", file="nope.log").headline
+    assert "no field" in extremes(corpus, "x", file="dns.log", field="nope").headline
+    r = extremes(corpus, "does-not-occur", file="dns.log")
+    assert r.matched_lines == 0 and r.hits == () and not r.error
+
+
+def test_an_extremes_step_carries_lines_that_are_citable(corpus: Corpus) -> None:
+    """The counter-invariant. tally's step has no lines (tested above); extremes' rows are
+    real lines with refs and MUST enter shown_refs(), or the verb has no point."""
+    step = execute_readonly(
+        _action(ActionKind.EXTREMES, pattern=r"bytes=(\d+)", file="dns.log"), corpus, index=1
+    )
+    assert step.table and len(step.lines) == EXTREMES_SHOWN
+    assert step.total_matches == 20
+    assert step.truncated == 20 - EXTREMES_SHOWN     # the honest gap, said on every render
+    evidence = Evidence()
+    evidence.add(step)
+    assert "dns.log:L20" in evidence.shown_refs()
+    rendered = evidence.render()
+    assert "further match(es) exist and were NOT shown" in rendered
+    assert "the count above is exact" not in rendered
+    assert "extremes /bytes=(\\d+)/ in dns.log" in rendered
+
+
+def test_extremes_rows_reach_the_synthesis_record(corpus: Corpus) -> None:
+    from soc_poc.prompting.investigate import _evidence_on_record
+    ev = Evidence()
+    ev.add(execute_readonly(
+        _action(ActionKind.EXTREMES, pattern=r"bytes=(\d+)", file="dns.log"), corpus, index=1))
+    block = _evidence_on_record(ev)
+    assert "step 1" in block and "dns.log:L20" in block and "bytes=190" in block
+
+
+def test_all_extremes_rows_survive_the_line_budget() -> None:
+    """Ten ~300-char Zeek lines must all render in the recent window; at the old budget the
+    tenth ranked line -- often the one that mattered -- was the one dropped."""
+    lines = ["#fields\tts\tsize\tpayload"]
+    lines += [f"{i}\t{1000 - i}\t" + "x" * 280 for i in range(1, 15)]
+    corpus = Corpus({"http.log": lines})
+    ev = Evidence()
+    ev.add(execute_readonly(
+        _action(ActionKind.EXTREMES, pattern="x", file="http.log", field="size"), corpus, index=1))
+    rendered = ev.render()
+    assert "more shown line(s) omitted" not in rendered
+    for n in range(2, 12):                            # rows 1..10 are L2..L11
+        assert f"http.log:L{n}" in rendered
+
+
+def test_extremes_headline_shows_the_selector(corpus: Corpus) -> None:
+    from soc_poc.evidence import _headline
+    step = execute_readonly(
+        _action(ActionKind.EXTREMES, pattern="query", file="dns.log", field="4"), corpus, index=1)
+    assert _headline(step).endswith("in dns.log field=4")
+
+
+def test_selectors_make_two_aggregates_different_questions(zeek_http: Corpus) -> None:
+    """`extremes field=a` and `field=b` over the same filter must not be suppressed as a
+    repeat of each other; the same selector with different prose must."""
+    from soc_poc.orchestrator import Orchestrator
+    ask = lambda why, col: InvestigativeAction(  # noqa: E731
+        reasoning=why, expectation="the big ones", action=ActionKind.EXTREMES,
+        pattern=r"\.example", file="http.log", field=col,
+    )
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator._evidence = Evidence()
+    orchestrator._evidence.add(
+        execute_readonly(ask("how big", "response_body_len"), zeek_http, index=1))
+    assert orchestrator._previous_identical(ask("still how big", "response_body_len")) is not None
+    assert orchestrator._previous_identical(ask("how big", "method")) is None
+
+
+def test_extremes_is_gated_and_on_the_menu_only_when_enabled() -> None:
+    problems = validate_action(
+        _action(ActionKind.EXTREMES, pattern="x"), known_files=["dns.log"],
+        enabled_skills=frozenset({"tally"}))
+    assert any("not available in this run" in p.message for p in problems)
+    without = investigate_system_prompt(frozenset({"tally"}))
+    with_it = investigate_system_prompt(frozenset({"tally", "extremes"}))
+    assert "extremes  " not in without and "extremes  " in with_it
+    # It fetches lines, so it must not be offered as a way to size a result set.
+    assert "count/tally;" in with_it and "extremes;" not in with_it
+    assert "DOES fetch lines" in with_it
+    assert RunConfig(enabled_skills=("extremes",)).enabled_skills == ("extremes",)
+
+
+def test_extremes_reproduce_and_coercion() -> None:
+    by_name = reproduce_command(
+        _action(ActionKind.EXTREMES, pattern="evil", file="http.log", field="request_body_len"))
+    assert "awk -F" in by_name and "name=request_body_len" in by_name
+    assert by_name.endswith(f"| sort -rn | head -{EXTREMES_SHOWN}")
+    assert 'FILENAME":L"FNR' in by_name
+    by_number = reproduce_command(
+        _action(ActionKind.EXTREMES, pattern="evil", file="http.log", field="14"))
+    assert "v=$14" in by_number
+    grouped = reproduce_command(_action(ActionKind.EXTREMES, pattern=r"bytes=(\d+)"))
+    assert "match($0,pat,m)" in grouped
+    entity = reproduce_command(_action(ActionKind.EXTREMES, pattern="evil", extract="ip"))
+    assert "ent=" in entity and "head -10" in entity
+    coerced = coerce_action_payload({"action": "extremes", "action_input": r"bytes=(\d+)"})
+    assert coerced is not None and coerced["pattern"] == r"bytes=(\d+)"
+
+
+def test_awk_reproduce_values_survive_awk_escape_processing() -> None:
+    """awk -v turns `\\.` into `.`; a reproduce command that matched the wrong thing would
+    be worse than none. Backslashes are doubled and grep's \\b becomes gawk's \\y."""
+    cmd = reproduce_command(
+        _action(ActionKind.EXTREMES, pattern=r"evil\.example\t/up\?x=([0-9]+)", file="http.log"))
+    assert r"evil\\.example\\t/up\\?x=([0-9]+)" in cmd
+    ent = reproduce_command(_action(ActionKind.EXTREMES, pattern="evil", extract="domain"))
+    assert r"\\y(" in ent and r"\b(" not in ent
+    named = reproduce_command(
+        _action(ActionKind.TALLY, pattern=r"\.t\.example", file="dns.log", field="query"))
+    assert r"pat='\\.t\\.example'" in named

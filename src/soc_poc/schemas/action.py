@@ -40,8 +40,9 @@ class ActionKind(str, Enum):
     model: it hands a bounded line range to a worker for a question that counting cannot
     answer.
 
-    tally/timeline/stats are the aggregation skills (aggregation.py): numbers about a
-    pattern's matches without fetching the lines. They are gated by `run.enabled_skills`
+    tally/timeline/stats/extremes are the aggregation skills (aggregation.py): numbers
+    about a pattern's matches without fetching the lines -- except extremes, which fetches
+    the ten lines with the largest value so they can be cited. They are gated by `run.enabled_skills`
     so each can be trialled on its own; a disabled one is rejected by `validate_action`,
     not by the grammar -- shape from the grammar, meaning from Python, as everywhere else.
     """
@@ -51,6 +52,7 @@ class ActionKind(str, Enum):
     TALLY = "tally"
     TIMELINE = "timeline"
     STATS = "stats"
+    EXTREMES = "extremes"
     CONTEXT = "context"
     READ_LINES = "read_lines"
     CLOSE_READ = "close_read"
@@ -60,7 +62,16 @@ class ActionKind(str, Enum):
 # The verbs run.enabled_skills may name, and the set the prompt only describes when
 # enabled. Config validates against this at startup so a typo fails with a path, and the
 # prompt and the validator draw from the same set so they can never disagree.
-OPTIONAL_SKILLS = frozenset({ActionKind.TALLY.value, ActionKind.TIMELINE.value, ActionKind.STATS.value})
+OPTIONAL_SKILLS = frozenset({
+    ActionKind.TALLY.value,
+    ActionKind.TIMELINE.value,
+    ActionKind.STATS.value,
+    ActionKind.EXTREMES.value,
+})
+
+# The verbs that take the `field=`/`extract=` value selectors. timeline works off
+# timestamps and takes none.
+SELECTOR_KINDS = (ActionKind.TALLY, ActionKind.STATS, ActionKind.EXTREMES)
 
 # Verbs whose argument is a regex in `pattern`.
 PATTERN_KINDS = (
@@ -69,6 +80,7 @@ PATTERN_KINDS = (
     ActionKind.TALLY,
     ActionKind.TIMELINE,
     ActionKind.STATS,
+    ActionKind.EXTREMES,
 )
 
 # Entity types `extract=` accepts. Kept in lockstep with aggregation.ENTITY_PATTERNS by a
@@ -96,22 +108,23 @@ class InvestigativeAction(BaseModel):
     pattern: str = Field(
         default="",
         description=(
-            "Regex, for search/count/tally/timeline/stats. Case-insensitive. It is the "
-            "line FILTER; for tally/stats the value defaults to the first capture group "
-            "unless 'field' or 'extract' selects it instead. Empty otherwise."
+            "Regex, for search/count/tally/timeline/stats/extremes. Case-insensitive. It "
+            "is the line FILTER; for tally/stats/extremes the value defaults to the first "
+            "capture group unless 'field' or 'extract' selects it instead. Empty otherwise."
         ),
     )
     file: str = Field(
         default="",
         description=(
             "Restrict to one log file by name. Empty means every file in the case. "
-            "Required for read_lines and close_read, and for tally/stats with 'field'."
+            "Required for read_lines and close_read, and for tally/stats/extremes with "
+            "'field'."
         ),
     )
     field: str = Field(
         default="",
         description=(
-            "For tally/stats: the delimited column to aggregate, by #fields name (e.g. "
+            "For tally/stats/extremes: the delimited column to aggregate, by #fields name (e.g. "
             "'qtype_name') or 1-based number. Removes the need for a column-counting "
             "regex -- the pattern only has to match the line. Empty otherwise."
         ),
@@ -119,7 +132,7 @@ class InvestigativeAction(BaseModel):
     extract: str = Field(
         default="",
         description=(
-            "For tally/stats: pull every entity of this type from each matching line "
+            "For tally/stats/extremes: pull every entity of this type from each matching line "
             "instead of a capture group. One of 'ip', 'domain', 'hash', 'email'. Empty "
             "otherwise."
         ),
@@ -227,16 +240,17 @@ def validate_action(
     if kind in PATTERN_KINDS:
         require(action.pattern, "pattern", f"{kind.value} needs a regex in 'pattern'.")
 
-    # The value selectors belong only to tally/stats, and only one at a time. field-by-name
-    # needs a single file to resolve the header against; entity extraction works estate-wide.
+    # The value selectors belong only to tally/stats/extremes, and only one at a time.
+    # field-by-name needs a single file to resolve the header against; entity extraction
+    # works estate-wide.
     if action.field or action.extract:
-        if kind not in (ActionKind.TALLY, ActionKind.STATS):
+        if kind not in SELECTOR_KINDS:
             problems.append(
                 ActionProblem(
                     field="field" if action.field else "extract",
                     message=(
-                        "'field' and 'extract' apply only to tally and stats; leave them "
-                        "empty for this action."
+                        "'field' and 'extract' apply only to tally, stats and extremes; "
+                        "leave them empty for this action."
                     ),
                 )
             )
