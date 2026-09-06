@@ -76,6 +76,22 @@ _NUMBER_RULE = re.compile(r"\d+")
 # every line its own template -- so everything looked rare and nothing was.
 _ID_CANDIDATE = re.compile(r"\b[A-Za-z0-9]{8,}\b")
 
+# The domain shape (`a.b`) also matches a `firstname.lastname` username and a
+# `file.ext` path leaf. On a host log those would fill a section labelled "most-queried
+# domains" with people and binaries. A two-label token is counted as a domain only when
+# its last label is a real public suffix; a token with three or more labels
+# (`t.api-sync-telemetry.net`) is a domain regardless. Both filters are profile-only --
+# the extract=domain recogniser stays byte-identical to its printed grep mirror.
+_COMMON_TLDS = frozenset({
+    "com", "net", "org", "io", "co", "gov", "edu", "mil", "int", "info", "biz", "dev",
+    "app", "cloud", "ai", "uk", "us", "eu", "de", "fr", "se", "no", "nl", "ru", "cn",
+    "jp", "au", "ca", "example", "local", "internal", "corp", "lan", "test", "invalid",
+})
+
+
+def _looks_like_domain(parts: list[str]) -> bool:
+    return len(parts) >= 3 or (len(parts) == 2 and parts[-1] in _COMMON_TLDS)
+
 
 def _prenormalise(line: str) -> str:
     """Pass 1 only: shapes. Numbers survive so pass 2 can still see whole identifiers."""
@@ -138,6 +154,25 @@ def _timestamp(line: str) -> str | None:
         match = pattern.search(line)
         if match:
             return match.group(1)
+    return None
+
+
+def _to_epoch(stamp: str) -> float | None:
+    """A comparable number for any stamp shape `_timestamp` recognises.
+
+    Syslog stamps carry no year; they land in 1900, which keeps ordering and gaps
+    correct within one capture and is wrong across a New Year -- the render shows the
+    stamps themselves, so the reader sees the assumption rather than inheriting it.
+    Shared by the profile's burst arithmetic and the timeline verb, so both agree on
+    what a gap is whatever the log's stamp format.
+    """
+    if stamp.replace(".", "", 1).isdigit():
+        return float(stamp)
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%b %d %H:%M:%S"):
+        try:
+            return datetime.strptime(stamp, fmt).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
     return None
 
 
@@ -301,11 +336,14 @@ def _bursts(files: dict[str, list[str]], subject: str) -> tuple[list[Burst], str
                     stamps.append(stamp)
     if len(stamps) < 4:
         return [], subject
-    stamps.sort()
-
-    numeric = [float(s) if s.replace(".", "").isdigit() else None for s in stamps]
-    if any(v is None for v in numeric):
-        return [], subject  # non-epoch stamps: gap arithmetic is not safe here
+    epochs = [_to_epoch(s) for s in stamps]
+    if any(v is None for v in epochs):
+        return [], subject  # a stamp shape without gap arithmetic
+    # Sort by the epoch, not the string: ISO and bare epochs happen to sort lexically,
+    # syslog stamps ("Aug" < "Jul") do not.
+    order = sorted(range(len(stamps)), key=lambda i: epochs[i])
+    stamps = [stamps[i] for i in order]
+    numeric = [epochs[i] for i in order]
 
     gaps = [b - a for a, b in zip(numeric, numeric[1:])]
     ordered = sorted(gaps)
@@ -343,7 +381,10 @@ def build_profile(corpus: Corpus) -> CaseProfile:
         for line in lines:
             for domain in _DOMAIN.findall(line):
                 parts = domain.lower().split(".")
-                if len(parts) >= 2:
+                # `cmd.exe`, `MsMpEng.dll` and the username `j.chen` all match the domain
+                # shape; on a host log they would top a list labelled "most-queried
+                # domains". Keep only what actually looks like a domain (see above).
+                if _looks_like_domain(parts):
                     domains[".".join(parts[-2:])] += 1
             for address in _IP.findall(line):
                 addresses[address] += 1

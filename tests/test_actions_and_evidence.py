@@ -595,3 +595,15 @@ def test_an_unrepairable_reference_is_rejected_naming_what_was_written() -> None
     )
     assert len(problems) == 1
     assert "'somewhere in the log'" in problems[0].message
+
+
+def test_long_json_lines_keep_their_tail_visible() -> None:
+    """A Windows event serialised as JSON is 400-600 chars with the command line near the
+    end. The default elision must keep enough of the tail to show it."""
+    from soc_poc.evidence import LINE_HEAD_CHARS, LINE_MAX_CHARS
+    line = '{"ts":"2026-09-07T08:00:00Z",' + '"pad":"' + "x" * 300 + '",' + \
+           '"CommandLine":"cmd.exe /c whoami /all > C:\\\\Users\\\\Public\\\\out.txt"}'
+    shown = elide(line)
+    assert len(line) > LINE_MAX_CHARS and "elided" in shown
+    assert line[:LINE_HEAD_CHARS] in shown
+    assert "whoami /all" in shown

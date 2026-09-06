@@ -223,3 +223,28 @@ def re_escape(text: str) -> str:
     import re
 
     return re.escape(text)
+
+
+def test_bursts_are_computed_for_iso_timestamps_too() -> None:
+    """Windows event exports carry ISO stamps, not Zeek epochs. The same two sessions
+    must come out; before this the profile silently had no burst section on such logs."""
+    lines = [*ZEEK_HEADER]
+    for offset in [*range(0, 40, 5), *range(3600, 3640, 5)]:
+        hh, mm, ss = 8 + offset // 3600, (offset % 3600) // 60, offset % 60
+        lines.append(_zeek(f"2026-09-07T{hh:02d}:{mm:02d}:{ss:02d}Z", f"C{offset:012d}",
+                           "10.12.34.56", f"{'a9f2c7e4b1d8':.12}{offset:04d}.t.tunnel.net",
+                           "TXT", "-"))
+    profile = build_profile(Corpus({"dns.log": lines}))
+    assert [b.events for b in profile.bursts] == [8, 8]
+    assert profile.bursts[0].start == "2026-09-07T08:00:00"
+
+
+def test_file_names_are_not_counted_as_domains() -> None:
+    """`cmd.exe` matches the domain shape. On a host log it would top a list the prompt
+    labels "most-queried domains"; the profile filters file extensions, the extract=domain
+    recogniser deliberately does not (it must stay identical to its grep mirror)."""
+    from soc_poc.aggregation import ENTITY_PATTERNS
+    lines = [f"2026-09-07T08:00:{i:02d}Z\tWKS-1\tC:\\Windows\\cmd.exe\tevil.example.net" for i in range(50)]
+    profile = build_profile(Corpus({"w.log": lines}))
+    assert [d for d, _ in profile.top_domains] == ["example.net"]
+    assert "cmd.exe" in ENTITY_PATTERNS["domain"].findall(lines[0])

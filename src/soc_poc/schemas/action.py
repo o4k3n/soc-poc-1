@@ -125,8 +125,9 @@ class InvestigativeAction(BaseModel):
         default="",
         description=(
             "For tally/stats/extremes: the delimited column to aggregate, by #fields name (e.g. "
-            "'qtype_name') or 1-based number. Removes the need for a column-counting "
-            "regex -- the pattern only has to match the line. Empty otherwise."
+            "'qtype_name') or 1-based number; for a JSON-lines file, a key (nested via "
+            "dots, e.g. 'Details.User'). Removes the need for a column-counting regex -- "
+            "the pattern only has to match the line. Empty otherwise."
         ),
     )
     extract: str = Field(

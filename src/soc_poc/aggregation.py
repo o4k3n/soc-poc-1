@@ -26,13 +26,21 @@ digit-range regexes for four steps to fetch "the big ones".
 
 from __future__ import annotations
 
+import json
 import re
 import statistics
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 from soc_poc.corpus import Corpus, Hit
-from soc_poc.profiling import _DOMAIN, _IP, _LONG_TOKEN, BURST_GAP_FACTOR, _humanise, _timestamp
+from soc_poc.profiling import (
+    _DOMAIN,
+    _IP,
+    _LONG_TOKEN,
+    BURST_GAP_FACTOR,
+    _humanise,
+    _timestamp,
+    _to_epoch,
+)
 
 # Entity recognisers for `extract=`, reusing the exact shapes profiling.py already counts,
 # plus email. All are non-capturing, so `findall` returns whole matches. This is what turns
@@ -63,7 +71,54 @@ TIMELINE_MAX_SESSIONS = 12
 # budget in evidence.py.
 EXTREMES_SHOWN = 10
 
-_NUMERIC = re.compile(r"^-?\d+(\.\d+)?$")
+# Decimal, or a 0x-prefixed hex literal: Windows access masks (Sysmon GrantedAccess
+# 0x1010, 0x1FFFFF) are numbers an analyst compares, and ranking them by string length
+# would put every six-character mask on a par.
+_NUMERIC = re.compile(r"^(-?\d+(\.\d+)?|0[xX][0-9a-fA-F]+)$")
+
+
+def _as_number(value: str) -> float:
+    """The number a _NUMERIC-matching value denotes."""
+    if value[:2].lower() == "0x":
+        return float(int(value, 16))
+    return float(value)
+
+
+def _fmt_number(value: float) -> str:
+    """Plain digits for whole numbers however large: `44210880`, never `4.42109e+07` --
+    a byte count in scientific notation is a number the reader has to decode."""
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:g}"
+
+
+def _json_value(obj: dict, path: str) -> str | None:
+    """The value at a dotted key path in a JSON object, as the string the selectors
+    aggregate, or None when the path is absent.
+
+    Keys match case-insensitively at each level (`field="ipaddress"` finds `IpAddress`,
+    the way #fields names are lowercased). Numbers keep their JSON spelling so
+    `_NUMERIC` still sees them; booleans and null become their JSON words; nested
+    containers are re-serialised compactly so a tally over them still counts shapes.
+    """
+    current: object = obj
+    for part in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        lowered = {k.lower(): k for k in current}
+        key = lowered.get(part.strip().lower())
+        if key is None:
+            return None
+        current = current[key]
+    if current is None:
+        return "null"
+    if isinstance(current, bool):
+        return "true" if current else "false"
+    if isinstance(current, (int, float)):
+        return str(current)
+    if isinstance(current, str):
+        return current
+    return json.dumps(current, separators=(",", ":"))
 
 
 def _clip(value: str) -> str:
@@ -101,7 +156,9 @@ def _selected_rows(
         the IOC-extraction mode, and it needs no capture group.
       * `field="<name or 1-based number>"` -- one delimited column, resolved through the
         file's `#fields` header. This is what removes the column-counting regex: the
-        pattern only has to MATCH the line, and the field picks the value exactly.
+        pattern only has to MATCH the line, and the field picks the value exactly. On a
+        JSON-lines file the field is a key (dotted for nesting) and there are no
+        numbered columns.
       * otherwise -- the first capture group, or the whole match. The original behaviour,
         byte-for-byte, so nothing that worked before changes.
 
@@ -128,7 +185,15 @@ def _selected_rows(
     for name in [file] if file else corpus.file_names:
         index = None
         separator = "\t"
-        if field:
+        objects = corpus.json_objects(name) if field else None
+        if field and objects is not None:
+            if field.strip().isdigit():
+                keys = ", ".join(k for k, _ in corpus.json_keys(name)[:12])
+                return None, 0, (
+                    f"{name} is JSON lines: it has keys, not numbered columns; name a key "
+                    f"(e.g. {keys})"
+                )
+        elif field:
             field_map = corpus.field_map(name)
             index = _resolve_field(field, field_map)
             if index is None:
@@ -148,6 +213,11 @@ def _selected_rows(
             hit = Hit(f"{name}:L{number}", text)
             if extract:
                 rows.extend((v, hit) for v in ENTITY_PATTERNS[extract].findall(text))
+            elif field and objects is not None:
+                obj = objects[number - 1]
+                value = _json_value(obj, field) if obj else None
+                if value is not None:
+                    rows.append((value, hit))
             elif field:
                 columns = text.split(separator)
                 if index is not None and 0 <= index < len(columns):
@@ -155,6 +225,14 @@ def _selected_rows(
             else:
                 group = 1 if regex.groups else 0
                 rows.extend((m.group(group) or "", hit) for m in regex.finditer(text))
+        if field and objects is not None and matched_lines and not rows:
+            # Keys vary by event type in a JSON log, so an absent key is not known until
+            # the lines are read. Silence here would read as "the value is empty".
+            keys = ", ".join(k for k, _ in corpus.json_keys(name)[:12])
+            return None, matched_lines, (
+                f"{matched_lines} line(s) in {name} match, but none carries the key "
+                f"{field!r}; keys seen in this file: {keys}"
+            )
     return rows, matched_lines, ""
 
 
@@ -230,23 +308,6 @@ def tally(
         matched_lines=matched_lines,
         table=tuple(rows),
     )
-
-
-def _to_epoch(stamp: str) -> float | None:
-    """A comparable number for any stamp shape profiling._timestamp recognises.
-
-    Syslog stamps carry no year; they land in 1900, which keeps ordering and gaps
-    correct within one capture and is wrong across a New Year -- the render shows the
-    stamps themselves, so the reader sees the assumption rather than inheriting it.
-    """
-    if stamp.replace(".", "", 1).isdigit():
-        return float(stamp)
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%b %d %H:%M:%S"):
-        try:
-            return datetime.strptime(stamp, fmt).replace(tzinfo=timezone.utc).timestamp()
-        except ValueError:
-            continue
-    return None
 
 
 def timeline(corpus: Corpus, pattern: str, *, file: str = "") -> Aggregate:
@@ -354,7 +415,7 @@ def stats(
 
     if all(_NUMERIC.match(value) for value in values):
         mode = "numeric values"
-        series = sorted(float(value) for value in values)
+        series = sorted(_as_number(value) for value in values)
     else:
         mode = "value lengths in characters (values are not all numeric)"
         series = sorted(float(len(value)) for value in values)
@@ -363,9 +424,10 @@ def stats(
     rows = (
         f"statistic over: {mode}",
         f"n={len(series)}, distinct values={len(set(values))}",
-        f"min {series[0]:g}, median {statistics.median(series):g}, "
-        f"mean {statistics.fmean(series):.1f}, p95 {p95:g}, max {series[-1]:g}"
-        + (f", sum {sum(series):g}" if mode.startswith("numeric") else ""),
+        f"min {_fmt_number(series[0])}, median {_fmt_number(statistics.median(series))}, "
+        f"mean {statistics.fmean(series):.1f}, p95 {_fmt_number(p95)}, "
+        f"max {_fmt_number(series[-1])}"
+        + (f", sum {_fmt_number(sum(series))}" if mode.startswith("numeric") else ""),
     )
     return Aggregate(
         headline=(
@@ -413,7 +475,7 @@ def extremes(
         )
 
     mode, numeric = _rank_key([value for value, _ in rows])
-    measure = (lambda v: float(v)) if numeric else (lambda v: float(len(v)))
+    measure = _as_number if numeric else (lambda v: float(len(v)))
 
     # Best value per line, in corpus order, so a sort (stable) breaks ties by position.
     best: dict[str, tuple[float, str, Hit]] = {}
@@ -425,14 +487,18 @@ def extremes(
     top = ranked[:EXTREMES_SHOWN]
     series = [item[0] for item in ranked]
 
-    def fmt(key: float) -> str:
-        return f"{key:g}"
+    fmt = _fmt_number
 
     # Value first, ref last: the stub client cites anything that starts with a ref, and
     # these rows are a table, not the lines themselves (those follow via Step.lines).
     table = [f"ranked by: {mode}, largest first"]
     for rank, (key, value, hit) in enumerate(top, start=1):
-        shown = fmt(key) if numeric else f"{fmt(key)} chars  {_clip(value)}"
+        if numeric:
+            # The value as written, and its number when they differ (0x1010 -> 4112), so a
+            # hex access mask stays recognisable and still reads as the size it is.
+            shown = value if fmt(key) == value else f"{value} (={fmt(key)})"
+        else:
+            shown = f"{fmt(key)} chars  {_clip(value)}"
         table.append(f"#{rank:<2} {shown}  <- {hit.ref}")
     tail = f"n={len(ranked)} line(s)"
     if len(ranked) > len(top):

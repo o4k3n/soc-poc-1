@@ -839,3 +839,101 @@ def test_awk_reproduce_values_survive_awk_escape_processing() -> None:
     named = reproduce_command(
         _action(ActionKind.TALLY, pattern=r"\.t\.example", file="dns.log", field="query"))
     assert r"pat='\\.t\\.example'" in named
+
+
+# --- JSON lines: keys are columns -------------------------------------------------------
+#
+# The wmi-lsass case ships Windows events as one JSON object per line. field= must resolve
+# a key there exactly as it resolves a #fields name on Zeek TSV, and the reproduce command
+# must say jq where it would have said awk.
+
+
+@pytest.fixture
+def win_json() -> Corpus:
+    lines = [
+        '{"ts":"2026-09-07T08:10:00Z","event_id":4624,"computer":"WKS-1","LogonType":3,'
+        '"IpAddress":"10.12.34.71","TargetUserName":"j.doe"}',
+        '{"ts":"2026-09-07T08:10:05Z","event_id":4624,"computer":"WKS-1","LogonType":3,'
+        '"IpAddress":"10.12.34.71","TargetUserName":"svc_backup"}',
+        '{"ts":"2026-09-07T08:11:00Z","event_id":4688,"computer":"WKS-1",'
+        '"NewProcessName":"C:\\\\Windows\\\\System32\\\\cmd.exe","Details":{"User":"CORP\\\\j.doe"}}',
+        "",
+        "not json at all",
+        '{"ts":"2026-09-07T08:12:00Z","event_id":10,"computer":"WKS-1",'
+        '"GrantedAccess":"0x1010","SourceImage":"C:\\\\tmp\\\\mk.exe","elevated":true,"note":null}',
+        '{"ts":"2026-09-07T08:12:30Z","event_id":10,"computer":"WKS-1",'
+        '"GrantedAccess":"0x1000","SourceImage":"C:\\\\Program Files\\\\AV\\\\av.exe"}',
+    ]
+    return Corpus({"security.jsonl": lines, "dns.log": ["1700000000.000\t10.0.0.5\tquery"]})
+
+
+def test_corpus_detects_json_lines_and_lists_keys_by_frequency(win_json: Corpus) -> None:
+    assert win_json.is_json("security.jsonl") and not win_json.is_json("dns.log")
+    assert win_json.json_files == frozenset({"security.jsonl"})
+    objects = win_json.json_objects("security.jsonl")
+    assert objects[3] is None and objects[4] is None      # blank and broken lines keep their index
+    assert objects[5]["GrantedAccess"] == "0x1010"         # so index 5 is line 6
+    keys = win_json.json_keys("security.jsonl")
+    assert keys[0] == ("ts", 5) and ("LogonType", 2) in keys
+    assert win_json.field_map("security.jsonl") == {}      # the TSV path is untouched
+
+
+def test_tally_by_json_key_is_case_insensitive(win_json: Corpus) -> None:
+    r = tally(win_json, "4624", file="security.jsonl", field="ipaddress")
+    assert r.matched_lines == 2 and r.table == ("      2x  10.12.34.71",)
+    nested = tally(win_json, "4688", file="security.jsonl", field="Details.User")
+    assert nested.table[0].endswith("CORP\\j.doe")
+
+
+def test_json_numbers_and_hex_rank_numerically(win_json: Corpus) -> None:
+    r = stats(win_json, "4624", file="security.jsonl", field="LogonType")
+    assert r.table[0].endswith("numeric values") and "max 3" in r.table[2]
+    x = extremes(win_json, '"event_id":10', file="security.jsonl", field="GrantedAccess")
+    assert x.table[0].startswith("ranked by: numeric value")
+    assert [h.ref for h in x.hits] == ["security.jsonl:L6", "security.jsonl:L7"]
+    assert "0x1010" in x.table[1] and "4112" in x.table[1]   # the mask as written, and its value
+    words = tally(win_json, '"event_id":10', file="security.jsonl", field="elevated")
+    assert words.table == ("      1x  true",)                 # booleans are words, absent keys are skipped
+
+
+def test_json_field_mistakes_are_explained(win_json: Corpus) -> None:
+    by_number = tally(win_json, "4624", file="security.jsonl", field="3")
+    assert "keys, not numbered columns" in by_number.headline
+    absent = tally(win_json, "4624", file="security.jsonl", field="CommandLine")
+    assert "none carries the key 'CommandLine'" in absent.headline
+    assert "IpAddress" in absent.headline                    # and the keys that do exist are listed
+
+
+def test_json_reproduce_commands_use_jq(win_json: Corpus) -> None:
+    js = win_json.json_files
+    t = reproduce_command(
+        _action(ActionKind.TALLY, pattern="4624", file="security.jsonl", field="IpAddress"),
+        json_files=js)
+    assert "jq -r" in t and '."IpAddress"' in t and t.endswith("| sort | uniq -c | sort -rn")
+    x = reproduce_command(
+        _action(ActionKind.EXTREMES, pattern="4624", file="security.jsonl", field="Details.User"),
+        json_files=js)
+    assert x.startswith("jq -rR") and '."Details"."User"' in x
+    assert "input_line_number" in x and x.endswith("| sort -rn | head -10")
+    # A TSV file, or no json_files at all, keeps the awk form byte for byte.
+    tsv = _action(ActionKind.TALLY, pattern="q", file="dns.log", field="2")
+    assert reproduce_command(tsv, json_files=js) == reproduce_command(tsv)
+    assert "awk" in reproduce_command(tsv)
+
+
+def test_json_files_are_labelled_keys_in_the_files_block() -> None:
+    from soc_poc.prompting.investigate import _files_block
+    headers = {"security.jsonl": ["ts", "event_id"], "dns.log": ["ts", "query"]}
+    block = _files_block(["dns.log", "security.jsonl"], {"dns.log": 3, "security.jsonl": 5},
+                         headers, frozenset({"security.jsonl"}))
+    assert "      fields: ts, query" in block
+    assert "      keys (JSON lines): ts, event_id" in block
+
+
+def test_json_key_display_is_capped_and_says_so() -> None:
+    from soc_poc.orchestrator import JSON_KEYS_SHOWN, json_key_display
+    keys = [(f"k{i}", 100 - i) for i in range(JSON_KEYS_SHOWN + 7)]
+    shown = json_key_display(keys)
+    assert len(shown) == JSON_KEYS_SHOWN + 1 and shown[0] == "k0"
+    assert shown[-1].startswith("+7 more")
+    assert json_key_display(keys[:3]) == ["k0", "k1", "k2"]
