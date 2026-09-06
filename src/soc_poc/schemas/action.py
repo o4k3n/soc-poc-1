@@ -71,6 +71,10 @@ PATTERN_KINDS = (
     ActionKind.STATS,
 )
 
+# Entity types `extract=` accepts. Kept in lockstep with aggregation.ENTITY_PATTERNS by a
+# test, rather than imported, so the schema module stays free of runtime dependencies.
+_EXTRACT_TYPES = frozenset({"ip", "domain", "hash", "email"})
+
 
 class InvestigativeAction(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -92,16 +96,32 @@ class InvestigativeAction(BaseModel):
     pattern: str = Field(
         default="",
         description=(
-            "Regex, for search/count/tally/timeline/stats. Case-insensitive. For tally "
-            "and stats the first capture group, if any, is the value extracted. Empty "
-            "otherwise."
+            "Regex, for search/count/tally/timeline/stats. Case-insensitive. It is the "
+            "line FILTER; for tally/stats the value defaults to the first capture group "
+            "unless 'field' or 'extract' selects it instead. Empty otherwise."
         ),
     )
     file: str = Field(
         default="",
         description=(
             "Restrict to one log file by name. Empty means every file in the case. "
-            "Required for read_lines and close_read."
+            "Required for read_lines and close_read, and for tally/stats with 'field'."
+        ),
+    )
+    field: str = Field(
+        default="",
+        description=(
+            "For tally/stats: the delimited column to aggregate, by #fields name (e.g. "
+            "'qtype_name') or 1-based number. Removes the need for a column-counting "
+            "regex -- the pattern only has to match the line. Empty otherwise."
+        ),
+    )
+    extract: str = Field(
+        default="",
+        description=(
+            "For tally/stats: pull every entity of this type from each matching line "
+            "instead of a capture group. One of 'ip', 'domain', 'hash', 'email'. Empty "
+            "otherwise."
         ),
     )
     ref: str = Field(
@@ -206,6 +226,48 @@ def validate_action(
 
     if kind in PATTERN_KINDS:
         require(action.pattern, "pattern", f"{kind.value} needs a regex in 'pattern'.")
+
+    # The value selectors belong only to tally/stats, and only one at a time. field-by-name
+    # needs a single file to resolve the header against; entity extraction works estate-wide.
+    if action.field or action.extract:
+        if kind not in (ActionKind.TALLY, ActionKind.STATS):
+            problems.append(
+                ActionProblem(
+                    field="field" if action.field else "extract",
+                    message=(
+                        "'field' and 'extract' apply only to tally and stats; leave them "
+                        "empty for this action."
+                    ),
+                )
+            )
+        if action.field and action.extract:
+            problems.append(
+                ActionProblem(
+                    field="extract",
+                    message="set only one of 'field' or 'extract', not both.",
+                )
+            )
+        if action.extract and action.extract not in _EXTRACT_TYPES:
+            problems.append(
+                ActionProblem(
+                    field="extract",
+                    message=(
+                        f"extract must be one of {', '.join(sorted(_EXTRACT_TYPES))}; "
+                        f"got {action.extract!r}."
+                    ),
+                )
+            )
+        if action.field and not action.file:
+            problems.append(
+                ActionProblem(
+                    field="file",
+                    message=(
+                        "'field' names a column, which is resolved against one file's "
+                        "header -- set 'file' too."
+                    ),
+                )
+            )
+
     if kind is ActionKind.CONTEXT:
         if not action.ref:
             problems.append(

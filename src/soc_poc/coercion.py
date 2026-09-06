@@ -42,6 +42,8 @@ _NESTED_KEYS = ("action_input", "action_args", "parameters", "params", "argument
 _ALIASES: dict[str, tuple[str, ...]] = {
     "pattern": ("pattern", "regex", "query", "search", "term", "expression"),
     "file": ("file", "path", "filename", "log", "target"),
+    "field": ("field", "column", "col"),
+    "extract": ("extract", "entity", "entities"),
     "ref": ("ref", "reference", "line_ref"),
     "question": ("question", "prompt", "ask"),
     "reasoning": ("reasoning", "rationale", "why", "thought"),

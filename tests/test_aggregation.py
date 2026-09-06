@@ -493,3 +493,188 @@ def test_two_short_anchors_are_still_diagnosable(zeek_corpus: Corpus) -> None:
     )
     assert step.total_matches == 0
     assert "occur in this order" in step.summary and "BETWEEN" in step.summary
+
+
+# --- value selectors: field= and extract= ---------------------------------------------
+#
+# The point of the selectors is to kill the column-counting regex loop: the pattern only
+# has to MATCH the line, and field=/extract= pick the value exactly. See aggregation._extract.
+
+
+@pytest.fixture
+def zeek_http() -> Corpus:
+    """A tiny Zeek http.log with a real #fields header, for column selection."""
+    lines = [
+        "#separator \\x09",
+        "#fields\tts\tid.orig_h\tmethod\thost\tuser_agent\tresponse_body_len",
+        "#types\ttime\taddr\tstring\tstring\tstring\tcount",
+        "1\t10.0.0.5\tGET\tevil.example\tMSIE-8\t40",
+        "2\t10.0.0.5\tPOST\tevil.example\tMSIE-8\t5000",
+        "3\t10.0.0.6\tGET\tgood.example\tChrome\t120",
+    ]
+    return Corpus({"http.log": lines})
+
+
+def test_field_by_name_selects_the_column(zeek_http: Corpus) -> None:
+    r = tally(zeek_http, r"evil\.example", file="http.log", field="method")
+    assert r.matched_lines == 2
+    assert any("1x" in row and "GET" in row for row in r.table)
+    assert any("1x" in row and "POST" in row for row in r.table)
+
+
+def test_field_by_number_is_one_based(zeek_http: Corpus) -> None:
+    # Column 3 is 'method' (1-based over data columns).
+    r = tally(zeek_http, r"evil", file="http.log", field="3")
+    assert any("GET" in row for row in r.table) and any("POST" in row for row in r.table)
+
+
+def test_field_stats_reads_a_numeric_column(zeek_http: Corpus) -> None:
+    r = stats(zeek_http, r"evil", file="http.log", field="response_body_len")
+    listed = "\n".join(r.table)
+    assert "numeric values" in listed and "max 5000" in listed and "sum 5040" in listed
+
+
+def test_a_bad_field_name_lists_the_available_ones(zeek_http: Corpus) -> None:
+    r = tally(zeek_http, r"evil", file="http.log", field="nope")
+    assert r.error and "no field 'nope'" in r.error and "user_agent" in r.error
+
+
+def test_extract_pulls_entities_without_a_capture_group() -> None:
+    corpus = Corpus({"dns.log": [
+        "10.12.34.56 queried ns1.api-sync.net -> 45.77.203.118",
+        "10.12.34.56 queried cdn.example.com -> 93.1.2.3",
+    ]})
+    ips = tally(corpus, r"api-sync", file="dns.log", extract="ip")
+    vals = "\n".join(ips.table)
+    assert "45.77.203.118" in vals and "10.12.34.56" in vals and "93.1.2.3" not in vals
+    domains = tally(corpus, r"api-sync", file="dns.log", extract="domain")
+    assert any("api-sync.net" in row for row in domains.table)
+
+
+def test_extract_precedes_field_and_capture() -> None:
+    corpus = Corpus({"f.log": ["a\tb\t1.2.3.4 and 5.6.7.8"]})
+    # extract wins even with a capture group present and field set.
+    r = tally(corpus, r"(a)", file="f.log", field="1", extract="ip")
+    assert any("1.2.3.4" in row for row in r.table)
+
+
+def test_the_header_line_is_not_counted_in_selector_mode(zeek_http: Corpus) -> None:
+    # A pattern that also matches the #fields line must not pull 'method' from the header.
+    r = tally(zeek_http, r"method|GET|POST", file="http.log", field="method")
+    assert all("method" != row.split()[-1] for row in r.table if row.strip())
+
+
+# --- corpus header parsing ------------------------------------------------------------
+
+
+def test_corpus_parses_fields_and_separator(zeek_http: Corpus) -> None:
+    assert zeek_http.separator("http.log") == "\t"
+    fm = zeek_http.field_map("http.log")
+    assert fm["method"] == 2 and fm["response_body_len"] == 5
+    assert Corpus({"plain.log": ["no header here"]}).field_map("plain.log") == {}
+
+
+# --- validation and wiring ------------------------------------------------------------
+
+
+def test_selectors_are_rejected_off_tally_and_stats() -> None:
+    for kind in (ActionKind.SEARCH, ActionKind.COUNT, ActionKind.TIMELINE):
+        problems = validate_action(
+            _action(kind, pattern="x", field="foo"), known_files=["dns.log"]
+        )
+        assert any("apply only to tally and stats" in p.message for p in problems)
+
+
+def test_field_and_extract_are_mutually_exclusive() -> None:
+    problems = validate_action(
+        _action(ActionKind.TALLY, pattern="x", file="dns.log", field="a", extract="ip"),
+        known_files=["dns.log"],
+    )
+    assert any("only one of 'field' or 'extract'" in p.message for p in problems)
+
+
+def test_unknown_extract_type_is_rejected() -> None:
+    problems = validate_action(
+        _action(ActionKind.TALLY, pattern="x", extract="mac"), known_files=["dns.log"]
+    )
+    assert any("extract must be one of" in p.message for p in problems)
+
+
+def test_field_by_name_requires_a_file() -> None:
+    problems = validate_action(
+        _action(ActionKind.TALLY, pattern="x", field="method"), known_files=["dns.log"]
+    )
+    assert any(p.field == "file" for p in problems)
+
+
+def test_extract_types_match_the_recognisers() -> None:
+    """The schema's allowed set and the runtime's recogniser set must not drift."""
+    from soc_poc.aggregation import ENTITY_PATTERNS
+    from soc_poc.schemas.action import _EXTRACT_TYPES
+    assert set(ENTITY_PATTERNS) == set(_EXTRACT_TYPES)
+
+
+def test_field_names_are_shown_only_when_a_selector_skill_is_on() -> None:
+    from soc_poc.prompting.investigate import _files_block, build_investigate_messages
+    from soc_poc.schemas.alert import Alert
+    from soc_poc.profiling import CaseProfile
+    headers = {"http.log": ["ts", "method", "host"]}
+    assert "fields: ts, method, host" in _files_block(["http.log"], {"http.log": 3}, headers)
+    # The gate: build_investigate_messages hides them unless tally/stats is enabled.
+    alert = Alert(alert_id="A", detector="d", rule_name="r", status="open", severity="high",
+                  first_seen="t0", last_seen="t1", summary="s")
+    def msg(skills):
+        return build_investigate_messages(
+            alert=alert, profile=CaseProfile(), evidence=Evidence(),
+            file_names=["http.log"], line_counts={"http.log": 3}, steps_remaining=10,
+            enabled_skills=skills, field_headers=headers,
+        )[1]["content"]
+    assert "fields: ts, method, host" in msg(frozenset({"tally"}))
+    assert "fields: ts, method, host" not in msg(frozenset())
+
+
+def test_selector_reproduce_commands() -> None:
+    name = reproduce_command(
+        _action(ActionKind.TALLY, pattern="evil", file="http.log", field="method"))
+    assert "awk -F" in name and "name=method" in name and "uniq -c" in name
+    num = reproduce_command(
+        _action(ActionKind.STATS, pattern="evil", file="http.log", field="6"))
+    assert "print $6" in num
+    ip = reproduce_command(
+        _action(ActionKind.TALLY, pattern="evil", file="dns.log", extract="ip"))
+    assert "grep -oE" in ip and "uniq -c" in ip
+
+
+# --- synthesis: fetched lines stay on the record --------------------------------------
+#
+# Pinned against inv-20260906T095354Z-b8d4: a run searched dhcp.log, was shown the two
+# lease lines naming the host, and the brief never mentioned the hostname. The line was in
+# the collapsed ledger; the fix is a flat accountability recap plus a synthesis rule.
+
+
+def test_evidence_on_record_lists_fetched_lines_not_aggregates(corpus: Corpus) -> None:
+    from soc_poc.prompting.investigate import _evidence_on_record
+    ev = Evidence()
+    ev.add(execute_readonly(
+        _action(ActionKind.SEARCH, pattern="wks-2291", file="dhcp.log"), corpus, index=1))
+    ev.add(execute_readonly(
+        _action(ActionKind.TALLY, pattern=r"(10\.0\.0\.\d+)", file="dhcp.log"), corpus, index=2))
+    block = _evidence_on_record(ev)
+    assert "EVIDENCE ON THE RECORD" in block
+    assert "wks-2291" in block                    # the fetched line is surfaced flat
+    assert "dhcp.log:L1" in block                 # with its citable ref
+    assert "step 2" not in block                  # the tally (no lines) is not listed
+
+
+def test_evidence_on_record_is_empty_without_fetched_lines(corpus: Corpus) -> None:
+    from soc_poc.prompting.investigate import _evidence_on_record
+    ev = Evidence()
+    ev.add(execute_readonly(
+        _action(ActionKind.COUNT, pattern="query", file="dns.log"), corpus, index=1))
+    assert _evidence_on_record(ev) == ""          # nothing fetched -> no block, no empty header
+
+
+def test_synthesis_prompt_demands_reconciliation_and_identities() -> None:
+    from soc_poc.prompting.investigate import SYNTHESIS_SYSTEM_PROMPT
+    assert "EVIDENCE ON THE RECORD" in SYNTHESIS_SYSTEM_PROMPT
+    assert "IP to a hostname" in SYNTHESIS_SYSTEM_PROMPT

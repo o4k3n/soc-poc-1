@@ -159,6 +159,34 @@ class Corpus:
             header.append(line)
         return header
 
+    def separator(self, file: str) -> str:
+        r"""The field separator a delimited file declares, defaulting to a tab.
+
+        Zeek writes `#separator \x09` (a space-separated header line whose value is the
+        literal escape). Anything without the declaration is treated as tab-delimited,
+        which is what every log format the field selector is useful on actually is.
+        """
+        for line in self.format_header(file):
+            if line.startswith("#separator"):
+                parts = line.split(None, 1)
+                token = parts[1].strip() if len(parts) > 1 else ""
+                return token.replace("\\x09", "\t").replace("\\x20", " ") or "\t"
+        return "\t"
+
+    def field_map(self, file: str) -> dict[str, int]:
+        """Column name -> 0-based index, from a `#fields` header line, or empty.
+
+        The header's first token is the literal `#fields`, so a data column sits one to
+        the left of its name's position in that line; the map already accounts for it.
+        Names are lowercased so `field="qtype_name"` matches regardless of case.
+        """
+        sep = self.separator(file)
+        for line in self.format_header(file):
+            if line.startswith("#fields"):
+                names = line.split(sep)[1:]  # drop the "#fields" label
+                return {name.strip().lower(): index for index, name in enumerate(names)}
+        return {}
+
     def slice_lines(self, file: str, start: int, end: int) -> list[Hit]:
         """A contiguous range, for handing to a worker for a close read."""
         lines = self._files.get(file, [])

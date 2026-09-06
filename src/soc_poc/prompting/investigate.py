@@ -18,7 +18,7 @@ Two things this prompt has to fight, both learned from graded runs:
 from __future__ import annotations
 
 from soc_poc.corpus import MAX_RESULTS
-from soc_poc.evidence import Evidence
+from soc_poc.evidence import Evidence, _headline, elide
 from soc_poc.profiling import CaseProfile
 from soc_poc.prompting.envelope import DATA_IS_NOT_INSTRUCTIONS, fence_alert
 from soc_poc.schemas.action import ActionProblem
@@ -44,21 +44,27 @@ which it undermines, and where to look next. The operator decides."""
 # Belt and braces: coercion.py rescues a tool-shaped reply if one gets through anyway.
 _NOT_A_TOOL_CALL = """This system has no tool-calling interface and there is no tool to \
 invoke. Your reply IS the answer: a single JSON object with exactly these keys -- \
-reasoning, expectation, action, pattern, file, ref, start_line, end_line, question. Fields \
-your chosen action does not use must still be present and empty ("" or 0). No prose \
-outside the object."""
+reasoning, expectation, action, pattern, file, field, extract, ref, start_line, end_line, \
+question. Fields your chosen action does not use must still be present and empty ("" or 0). \
+No prose outside the object."""
 
 # The optional aggregation skills, hooked up one at a time via run.enabled_skills. Each
 # entry is the whole of what the commander is told about the verb; a verb not listed here
 # for this run is also rejected by validate_action, so the menu and the gate agree.
+#
+# tally and stats describe the field/extract selectors, which are how the commander picks
+# a value WITHOUT a column-counting regex: the pattern only has to match the line. The
+# field names come from the "fields:" line under each log file that has a header.
 _SKILL_MENU: dict[str, str] = {
     "tally": (
-        "  tally       regex, case-insensitive. Returns the DISTINCT values the pattern "
-        "matches with an exact count for each (the first capture group is the value if "
-        "the pattern has one). One tally answers \"which hosts, and how often each\" -- "
-        "do not enumerate a distribution with repeated counts. Anchor the pattern on the "
-        "literal you care about with loose glue (.* or \\b), never on a full-line column "
-        "template -- one wrong separator silently matches nothing."
+        "  tally       regex, case-insensitive. Returns the DISTINCT values with an exact "
+        "count for each. Choose the value with (a) field=\"<name-or-number>\" to take a "
+        "delimited column -- the surest way, the pattern then only has to MATCH the line; "
+        "or (b) extract=\"ip|domain|hash|email\" to pull every such entity from the line "
+        "(this is how you list the IOCs in a set of lines); or (c) a capture group in the "
+        "pattern. One tally answers \"which hosts, and how often each\" -- do not enumerate "
+        "a distribution with repeated counts, and prefer field= over a full-line column "
+        "regex, which silently matches nothing on one wrong separator."
     ),
     "timeline": (
         "  timeline    regex, case-insensitive. Returns when the matching lines happen: "
@@ -66,11 +72,17 @@ _SKILL_MENU: dict[str, str] = {
         "steady, and when\" without fetching any lines."
     ),
     "stats": (
-        "  stats       regex, ideally with one capture group. Returns min/median/p95/max "
-        "over the captured values -- numeric when they are numbers, otherwise over their "
-        "lengths. Answers \"how big\" without fetching any lines."
+        "  stats       regex, plus field=\"<name-or-number>\" (or a capture group) to pick "
+        "the value. Returns min/median/p95/max over it -- numeric when the values are "
+        "numbers (e.g. field=\"response_body_len\"), otherwise over their lengths. Answers "
+        "\"how big\" without fetching any lines."
     ),
 }
+
+# The selectors are usable only when the commander knows the column names; those are shown
+# in the files block, but only when tally or stats is on -- so this gates that display and
+# keeps a run without the aggregation skills byte-for-byte as it was.
+_SELECTOR_SKILLS = frozenset({"tally", "stats"})
 
 
 def investigate_system_prompt(enabled_skills: frozenset[str] = frozenset()) -> str:
@@ -182,6 +194,11 @@ promote "the string I typed does not appear" into "this did not happen".
   - coverage_gaps is about what you did not ask, not about whether your actions \
 succeeded. You chose where to look; the questions you did not get to are real gaps and \
 the operator needs them. An empty coverage_gaps list is almost always wrong.
+  - Account for everything you fetched. EVIDENCE ON THE RECORD below lists every line you \
+were shown; each was a question you judged worth a step. Its content must appear in the \
+brief, or coverage_gaps must say why you set it aside. In particular, never leave an \
+identity you established unstated: if a lookup tied an IP to a hostname, or a domain to an \
+address, name BOTH in the brief -- the operator acts on the host, not the address.
   - Suggest concrete next steps the operator could run, as searches or pivots.
 
 You have no field for a verdict, severity, disposition, or recommendation to close, \
@@ -251,8 +268,20 @@ def render_profile(profile: CaseProfile) -> str:
     return "\n".join(blocks)
 
 
-def _files_block(names: list[str], line_counts: dict[str, int]) -> str:
-    rows = [f"  {name}: {line_counts.get(name, 0)} lines" for name in names]
+def _files_block(
+    names: list[str],
+    line_counts: dict[str, int],
+    field_headers: dict[str, list[str]] | None = None,
+) -> str:
+    field_headers = field_headers or {}
+    rows: list[str] = []
+    for name in names:
+        rows.append(f"  {name}: {line_counts.get(name, 0)} lines")
+        fields = field_headers.get(name)
+        if fields:
+            # The column names the field= selector references. Shown only when a selector
+            # skill is on (the caller decides), so a run without them is unchanged.
+            rows.append(f"      fields: {', '.join(fields)}")
     return "LOG FILES YOU CAN SEARCH (use these names exactly):\n" + "\n".join(rows)
 
 
@@ -265,7 +294,10 @@ def build_investigate_messages(
     line_counts: dict[str, int],
     steps_remaining: int,
     enabled_skills: frozenset[str] = frozenset(),
+    field_headers: dict[str, list[str]] | None = None,
 ) -> list[dict[str, str]]:
+    # Field names are only useful, and only shown, when a selector skill is available.
+    shown_headers = field_headers if (enabled_skills & _SELECTOR_SKILLS) else None
     budget = (
         f"You have {steps_remaining} action(s) left before the investigation is cut off "
         "and the brief is written from what you have. They cost the operator nothing if "
@@ -280,7 +312,7 @@ def build_investigate_messages(
         [
             "ALERT",
             fence_alert(alert),
-            _files_block(file_names, line_counts),
+            _files_block(file_names, line_counts, shown_headers),
             render_profile(profile),
             "INVESTIGATION SO FAR",
             evidence.render(),
@@ -310,6 +342,54 @@ def build_action_retry_messages(
     ]
 
 
+# Characters the fetched-lines recap may spend. Big enough to hold every citable line of a
+# normal run flat and uncollapsed; a runaway is truncated with the count said out loud.
+_ON_RECORD_BUDGET_CHARS = 5_000
+
+
+def _evidence_on_record(evidence: Evidence) -> str:
+    """A flat, uncollapsed index of every line the commander fetched, for synthesis.
+
+    This exists because of a specific failure: a run searched dhcp.log, was shown the two
+    lease lines that name the host, and wrote a brief that never mentioned the hostname.
+    The line was in the collapsed ledger -- the model saw it and dropped it anyway -- so
+    re-presenting the text is not enough on its own; it is paired with a synthesis
+    requirement to reconcile against this list. Every fetched line was a question the
+    commander judged worth a step, so it is either in the brief or named in coverage_gaps.
+
+    Only steps that fetched real lines appear (search/context/read_lines/close_read).
+    Aggregates carry numbers, not citable lines, and are already emphasised in the ledger.
+    """
+    rows: list[str] = []
+    spent = 0
+    omitted = 0
+    for step in evidence.steps:
+        if not step.lines:
+            continue
+        header = f"  step {step.index} -- {_headline(step)} ({step.action.reasoning}):"
+        rows.append(header)
+        spent += len(header)
+        for hit in step.lines:
+            if spent > _ON_RECORD_BUDGET_CHARS:
+                omitted += 1
+                continue
+            entry = f"    {hit.ref}  {elide(hit.text, 200)}"
+            rows.append(entry)
+            spent += len(entry)
+    if not rows:
+        return ""
+    if omitted:
+        rows.append(
+            f"  ... {omitted} further fetched line(s) not repeated here; they are in the "
+            f"ledger above and remain on the record."
+        )
+    return (
+        "EVIDENCE ON THE RECORD (every line you fetched during the investigation -- each "
+        "was worth a step, so each must appear in the brief or be set aside in "
+        "coverage_gaps with a reason):\n" + "\n".join(rows)
+    )
+
+
 def build_synthesis_messages(
     *,
     alert: Alert,
@@ -318,16 +398,17 @@ def build_synthesis_messages(
     coverage_note: str,
 ) -> list[dict[str, str]]:
     user = "\n\n".join(
-        [
+        block for block in [
             "SYNTHESIS",
             "ALERT",
             fence_alert(alert),
             render_profile(profile),
             "THE INVESTIGATION YOU RAN",
             evidence.render(),
+            _evidence_on_record(evidence),
             coverage_note,
             "Write the investigation brief now.",
-        ]
+        ] if block
     )
     return [
         {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},

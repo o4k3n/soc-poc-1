@@ -37,8 +37,41 @@ def _has_group(pattern: str) -> bool:
         return False
 
 
+# The entity regexes `extract=` reproduces with, mirroring aggregation.ENTITY_PATTERNS.
+_EXTRACT_GREP = {
+    "ip": r"\b([0-9]{1,3}\.){3}[0-9]{1,3}\b",
+    "domain": r"\b([a-z0-9_-]+\.)+[a-z]{2,}\b",
+    "hash": r"\b[a-z0-9]{16,}\b",
+    "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+}
+
+
 def _value_stream(action: InvestigativeAction, target: str) -> str:
-    """grep -o the matches; when the pattern captures, reduce each match to the group."""
+    """The pipeline that isolates the aggregated value, matching `_extract`'s three modes.
+
+    * extract: grep the matching lines, then grep -o the entity shape out of them.
+    * field:   grep the matching lines (dropping comments), then awk the column -- by
+               1-based number directly, or by resolving a #fields name in the header.
+    * capture group / whole match: the original grep -o (+ sed for the group).
+    """
+    matching = f"grep -hE {shlex.quote(action.pattern)} {target}"
+    if action.extract:
+        entity = _EXTRACT_GREP.get(action.extract, r"\S+")
+        return f"{matching} | grep -oE {shlex.quote(entity)}"
+    if action.field:
+        body = f"{matching} | grep -v '^#'"
+        if action.field.strip().isdigit():
+            return f"{body} | awk -F'\\t' '{{print ${int(action.field)}}}'"
+        # Resolve the column from the #fields header in one awk pass over the file. The
+        # header's first token is '#fields', so a data column is one left of the name.
+        prog = (
+            f"/^#fields/{{for(i=2;i<=NF;i++)if($i==name)c=i-1}} "
+            f"!/^#/&&$0~pat{{print $c}}"
+        )
+        return (
+            f"awk -F'\\t' -v name={shlex.quote(action.field.strip())} "
+            f"-v pat={shlex.quote(action.pattern)} {shlex.quote(prog)} {target}"
+        )
     stream = f"grep -hoiE {shlex.quote(action.pattern)} {target}"
     if _has_group(action.pattern):
         stream += f" | sed -E {shlex.quote(f's/{action.pattern}/\\1/I')}"
@@ -295,7 +328,13 @@ def execute_readonly(
     """Run one deterministic action. Never raises: a bad request becomes a Step with an error."""
     kind = action.action
     if kind in _AGGREGATES:
-        outcome = _AGGREGATES[kind](corpus, action.pattern, file=action.file)
+        # timeline works off timestamps, so it takes no value selector; tally/stats do.
+        # validate_action has already rejected field/extract on anything but tally/stats.
+        selectors = (
+            {} if kind is ActionKind.TIMELINE
+            else {"field": action.field, "extract": action.extract}
+        )
+        outcome = _AGGREGATES[kind](corpus, action.pattern, file=action.file, **selectors)
         summary = outcome.headline
         if not outcome.error:
             summary += coverage_hint(

@@ -77,6 +77,20 @@ they produce enters `shown_refs()`, because a number is not a citation — and p
 teaches the discipline they exist for: **aggregate before you fetch** — size a result set
 with numbers before spending context on its lines.
 
+**Value selectors on `tally` and `stats`.** The pattern is always the line *filter*; how
+it picks the *value* has three modes, because "first capture group" alone forced a brittle
+column-counting regex that was the single most expensive failure in the transcripts (one
+run spent 8 of 24 steps re-anchoring the same qtype question). `field="<name-or-number>"`
+takes a delimited column — resolved through the log's own `#fields` header, which
+`corpus.py` parses and the prompt shows under each file — so the pattern only has to match
+the line and one wrong separator can no longer silently match nothing. `extract="ip|domain|
+hash|email"` pulls every entity of that type from each matching line, reusing
+`profiling.py`'s recognisers, which is also how the commander lists the IOCs in a set of
+lines in one step. A capture group remains the fallback. In a graded run this took the
+commander from ~8 zero-result regex steps to 1, with it reaching for `field=` unprompted.
+The named-column reproduce command is a self-resolving `awk` one-liner, so the result is
+still re-derivable by hand.
+
 **The commander proposes; the orchestrator disposes.** An action is a JSON object the
 model emits and `actions.py` executes. The model never runs anything, and the set of
 things that *can* be run is those six verbs over files already in memory. Guided decoding
@@ -690,6 +704,36 @@ it does not suppress a proposal). Four layers, each earned by a transcript:
    decisive line — and a count cannot be cited. The result says "few enough to read;
    re-run as a search". (One graded run counted the attacker nameserver twice and never
    fetched it, so the brief could not cite its strongest evidence.)
+
+The value selectors (`field=`/`extract=`, above) are the structural fix beneath these
+advisories: they remove the column-counting regex that produced the loop in the first
+place. Across the selector runs the commander reached for `field=` on its own four to five
+times per case, and zero-result steps fell from eight to one or two. The advisories stay as
+the net for the patterns a selector cannot express.
+
+### What the selector runs also showed: the bottleneck moved
+
+With the investigation loop healthy, the remaining graded misses were no longer failures to
+*find* evidence — they were failures to *carry it into the brief*, on two fronts:
+
+- **Synthesis dropped a fetched fact — now fixed.** One run searched `dhcp.log`, was shown
+  the two lease lines that name the host, *wrote the hostname in its own step-23
+  reasoning*, and then produced a brief that never mentioned it. The evidence was in the
+  ledger with its refs; synthesis left it there. The fix is `_evidence_on_record` in
+  `prompting/investigate.py`: a deterministic, flat, uncollapsed recap of every line the
+  commander *fetched* (aggregates excluded — they carry numbers, not citable lines), placed
+  at the end of the synthesis prompt, paired with a requirement to reconcile against it —
+  each fetched line appears in the brief or is set aside in `coverage_gaps` with a reason,
+  and an established identity (an IP's hostname, a domain's address) is never left unstated.
+  On the case that exhibited the drop, the host went from absent to **CITED** and the run
+  to 7/7. It re-presents the run's own evidence, so it cannot hallucinate.
+- **Mechanical grading under-reads correct analysis.** A brief that said "NS and A record
+  lookups … resolving to IP 45.77.203.118" and "TXT queries … returned high-entropy …
+  strings" had both the NS delegation and the payload right — but `grade.py`'s needles want
+  the tokens "NS record" and "answer … payload", so both scored MISSED. Single-run scores
+  are therefore noisy; the transcript is the truth, and the grader is a coarse gate, not a
+  verdict. Widen a needle only when it under-reads a genuinely correct statement, never to
+  make a weak brief pass.
 
 ---
 

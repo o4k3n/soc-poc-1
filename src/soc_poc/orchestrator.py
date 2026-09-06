@@ -150,6 +150,13 @@ class Orchestrator:
         self.investigation_id = investigation_id or f"inv-{uuid.uuid4().hex[:12]}"
         # The Registry: in-flight work, addressable by task id. At most one close_read.
         self._registry: dict[str, asyncio.Task[GruntSuccess | GruntFailure]] = {}
+        # Column names per file that declares a #fields header, ordered by index, for the
+        # field= selector. Computed once; empty for files with no header.
+        self._field_headers: dict[str, list[str]] = {}
+        for name in corpus.file_names:
+            field_map = corpus.field_map(name)
+            if field_map:
+                self._field_headers[name] = sorted(field_map, key=lambda k: field_map[k])
 
     # -- driver -----------------------------------------------------------------------
 
@@ -409,6 +416,7 @@ class Orchestrator:
             steps_taken=len(self._evidence.steps),
             min_steps=self._run.min_steps_before_conclude,
             enabled_skills=frozenset(self._run.enabled_skills),
+            field_headers=self._field_headers,
             progress=self._progress,
         )
 
@@ -444,6 +452,8 @@ class Orchestrator:
                 "expectation": action.expectation,
                 "pattern": action.pattern,
                 "file": action.file,
+                "field": action.field,
+                "extract": action.extract,
                 "ref": action.ref,
                 "lines": f"{action.start_line}-{action.end_line}",
                 "question": action.question,

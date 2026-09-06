@@ -25,7 +25,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from soc_poc.corpus import Corpus
-from soc_poc.profiling import BURST_GAP_FACTOR, _humanise, _timestamp
+from soc_poc.profiling import _DOMAIN, _IP, _LONG_TOKEN, BURST_GAP_FACTOR, _humanise, _timestamp
+
+# Entity recognisers for `extract=`, reusing the exact shapes profiling.py already counts,
+# plus email. All are non-capturing, so `findall` returns whole matches. This is what turns
+# a tally into IOC extraction: "every IP in lines mentioning the C2", in one step, with no
+# column-counting regex to get wrong.
+_EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+ENTITY_PATTERNS: dict[str, re.Pattern[str]] = {
+    "ip": _IP,
+    "domain": _DOMAIN,
+    "hash": _LONG_TOKEN,
+    "email": _EMAIL,
+}
 
 # How much of a distribution a tally shows. Top values say what dominates; the rarest
 # say what is unusual, and in this codebase the unusual is where the answer usually is
@@ -49,30 +61,83 @@ def _clip(value: str) -> str:
     return f"{value[:half]}…{value[-half:]}"
 
 
-def _extract(
-    corpus: Corpus, pattern: str, file: str
-) -> tuple[list[str], int, str] | tuple[None, int, str]:
-    """Every extracted value in corpus order, plus how many lines matched.
+def _resolve_field(selector: str, field_map: dict[str, int]) -> int | None:
+    """A field selector -> 0-based column index, or None if it cannot be resolved.
 
-    The value is the first capture group when the pattern has one, otherwise the whole
-    match -- the same convention as `grep -oE` piped through `sed s//\\1/`, which is what
-    the reproduce command prints. All occurrences per line count, not just the first.
+    A selector is a `#fields` name (resolved through the map) or a 1-based column number
+    (for a delimited file with no header). Everything else is unresolvable, and the caller
+    turns that into an error that lists the available names.
+    """
+    name = selector.strip().lower()
+    if name in field_map:
+        return field_map[name]
+    if name.isdigit() and int(name) >= 1:
+        return int(name) - 1
+    return None
+
+
+def _extract(
+    corpus: Corpus, pattern: str, file: str, *, field: str = "", extract: str = ""
+) -> tuple[list[str], int, str] | tuple[None, int, str]:
+    """Every selected value in corpus order, plus how many lines the pattern matched.
+
+    `pattern` is always the line filter. What it selects as the *value* depends on the
+    selector, in precedence order:
+
+      * `extract="ip|domain|hash|email"` -- every entity of that type on the line. This is
+        the IOC-extraction mode, and it needs no capture group.
+      * `field="<name or 1-based number>"` -- one delimited column, resolved through the
+        file's `#fields` header. This is what removes the column-counting regex: the
+        pattern only has to MATCH the line, and the field picks the value exactly.
+      * otherwise -- the first capture group, or the whole match. The original behaviour,
+        byte-for-byte, so nothing that worked before changes.
+
+    Comment/header lines are skipped only in the selector modes, where splitting the
+    `#fields` line into columns would otherwise pollute the result.
     """
     if file and file not in corpus.file_names:
         return None, 0, f"no such file {file!r}; this case has {', '.join(corpus.file_names)}"
+    if extract and extract not in ENTITY_PATTERNS:
+        return None, 0, (
+            f"unknown extract type {extract!r}; use one of {', '.join(sorted(ENTITY_PATTERNS))}"
+        )
     try:
         regex = re.compile(pattern, re.IGNORECASE)
     except re.error as exc:
         return None, 0, f"bad regex: {exc}"
-    group = 1 if regex.groups else 0
+
+    selecting = bool(field or extract)
     values: list[str] = []
     matched_lines = 0
     for name in [file] if file else corpus.file_names:
+        index = None
+        separator = "\t"
+        if field:
+            field_map = corpus.field_map(name)
+            index = _resolve_field(field, field_map)
+            if index is None:
+                available = ", ".join(sorted(field_map, key=lambda k: field_map[k]))
+                return None, 0, (
+                    f"no field {field!r} in {name}; "
+                    + (f"available: {available}" if available
+                       else "this file has no #fields header, so name a 1-based column number")
+                )
+            separator = corpus.separator(name)
         for text in corpus.file_lines(name):
-            found = [m.group(group) or "" for m in regex.finditer(text)]
-            if found:
-                matched_lines += 1
-                values.extend(found)
+            if selecting and text.startswith("#"):
+                continue
+            if not regex.search(text):
+                continue
+            matched_lines += 1
+            if extract:
+                values.extend(ENTITY_PATTERNS[extract].findall(text))
+            elif field:
+                columns = text.split(separator)
+                if index is not None and 0 <= index < len(columns):
+                    values.append(columns[index])
+            else:
+                group = 1 if regex.groups else 0
+                values.extend(m.group(group) or "" for m in regex.finditer(text))
     return values, matched_lines, ""
 
 
@@ -91,14 +156,17 @@ class Aggregate:
     error: str = ""
 
 
-def tally(corpus: Corpus, pattern: str, *, file: str = "") -> Aggregate:
+def tally(
+    corpus: Corpus, pattern: str, *, file: str = "", field: str = "", extract: str = ""
+) -> Aggregate:
     """Distinct values of a pattern with exact counts: a distribution in one step.
 
     "Which hosts query this domain, and how often each" is one tally. The transcripts
     show the alternative: runs spending 20+ `count` actions enumerating a distribution
-    one guessed value at a time.
+    one guessed value at a time. `field=` and `extract=` choose the value without a
+    capture group -- see `_extract`.
     """
-    values, matched_lines, error = _extract(corpus, pattern, file)
+    values, matched_lines, error = _extract(corpus, pattern, file, field=field, extract=extract)
     if values is None:
         return Aggregate(headline=f"failed: {error}", error=error)
     scope = file or f"{len(corpus.file_names)} file(s)"
@@ -232,14 +300,17 @@ def _humanise_epoch(value: float) -> str:
     return _humanise(str(int(value))) if value > 1_000_000_000 else f"t+{value:.0f}s"
 
 
-def stats(corpus: Corpus, pattern: str, *, file: str = "") -> Aggregate:
-    """Size statistics over a pattern's extracted values: "how big" without lines.
+def stats(
+    corpus: Corpus, pattern: str, *, file: str = "", field: str = "", extract: str = ""
+) -> Aggregate:
+    """Size statistics over a pattern's selected values: "how big" without lines.
 
-    Numeric when every extracted value is a number (byte counts, ports, durations);
+    Numeric when every selected value is a number (byte counts, ports, durations);
     otherwise statistics over the values' LENGTHS, stated as such -- which is the mode
-    that answers "are these query labels abnormally long" for a tunnel.
+    that answers "are these query labels abnormally long" for a tunnel. `field=` selects a
+    numeric column directly (`field="response_body_len"`), which is the usual way in.
     """
-    values, matched_lines, error = _extract(corpus, pattern, file)
+    values, matched_lines, error = _extract(corpus, pattern, file, field=field, extract=extract)
     if values is None:
         return Aggregate(headline=f"failed: {error}", error=error)
     scope = file or f"{len(corpus.file_names)} file(s)"
