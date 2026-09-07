@@ -186,9 +186,20 @@ CASES: dict[str, dict] = {
             {
                 # The logon id is what joins the 4624 to the 4688; a brief that makes the
                 # link either names the id or says it tied logon to process.
-                "name": "ties the logon to the WmiPrvSE->cmd process (shared logon id)",
-                "needles": [r"logon\s?id|SubjectLogonId|TargetLogonId|same session|"
-                            r"\b0x0*[0-9a-f]{4,}\b.*(logon|session)"],
+                # The logon-id is the exact mechanism, but a brief that ties the logon to
+                # the exec by the account and the immediate sequence has made the same link;
+                # the ref requirement (citing the 4688 lines) keeps a loose match honest.
+                "name": "ties the logon to the WmiPrvSE->cmd process (logon id, or account+sequence)",
+                "needles": [
+                    r"logon\s?id|SubjectLogonId|TargetLogonId|same session",
+                    r"\b0x0*[0-9a-f]{4,}\b[^.]{0,60}(logon|session)",
+                    # "immediately after the logon ... spawned/executed ..."
+                    r"(after|following|then)[^.]{0,50}(logon|authenticat)[^.]{0,120}"
+                    r"(spawn|creat|execut|ran|launch|cmd|rundll|process)",
+                    # the exec attributed to the same account that logged on
+                    r"(spawn|creat|execut|ran|launch)[^.]{0,120}svc_deploy",
+                    r"svc_deploy[^.]{0,120}(spawn|creat|execut|ran|launch|cmd|rundll|minidump)",
+                ],
                 "refs": [],
                 "ref_lines": {"file": "security.jsonl", "pattern": r"comsvcs\.dll, MiniDump"},
             },
@@ -225,6 +236,67 @@ CASES: dict[str, dict] = {
             # The killer decoy first: the exact WmiPrvSE->cmd pair the alert matches, benign.
             "SCCM management agent": r"svc_sccm|SRV-SCCM01|10\.12\.34\.8\b|quickfixengineering|CCM\\\\inventory",
             "antivirus lsass access": r"MsMpEng|Windows Defender",
+            "admin RDP": r"SRV-JUMP01|10\.12\.34\.9\b|t\.admin",
+            "backup service": r"SRV-FS01|10\.12\.34\.10\b",
+        },
+    },
+    "schtask-persist": {
+        "checks": [
+            {
+                "name": "names the source of the type-3 logon (10.12.34.75 / WKS-2190)",
+                "needles": [r"10\.12\.34\.75", r"WKS-2190"],
+                "refs": ["dhcp.log:L6"],
+                "ref_lines": {"file": "security.jsonl", "pattern": r'"IpAddress":"10\.12\.34\.75"'},
+            },
+            {
+                "name": "names the account svc_helpdesk and that it is out of place",
+                "needles": [r"svc[_-]?helpdesk"],
+                "refs": [],
+                "ref_lines": {"file": "security.jsonl", "pattern": r'"TargetUserName":"svc_helpdesk"'},
+            },
+            {
+                "name": "identifies the task registration and its encoded PowerShell action",
+                "needles": [
+                    r"HealthTelemetryUpdater",
+                    r"(4698|scheduled task|task regist)[^.]{0,80}"
+                    r"(powershell|encod|-enc|base64|payload)",
+                    r"(powershell|encod|-enc|base64|payload)[^.]{0,80}(task|4698|action)",
+                ],
+                "refs": [],
+                "ref_lines": {"file": "security.jsonl", "pattern": r'"event_id":4698.*powershell\.exe -NoP'},
+            },
+            {
+                # The join across the hour: same payload registered then run. Credit either
+                # the payload-identity linkage or the temporal install->fire phrasing.
+                "name": "ties the registration to the later execution (install-then-fire)",
+                "needles": [
+                    r"same (payload|command|base64|task)",
+                    r"(regist|install|task)[^.]{0,90}(later|then|subsequent|fired|ran|execut)",
+                    r"(fired|ran|execut)[^.]{0,90}(task|registered|payload|scheduled)",
+                    r"(install|regist)[^.]{0,60}(then|and )[^.]{0,60}(fire|ran|execut)",
+                ],
+                "refs": [],
+                "ref_lines": {"file": "security.jsonl", "pattern": r'"event_id":4688.*-Enc JABjAD0'},
+            },
+            {
+                "name": "describes timing as install-then-fire across a gap, not one chain",
+                "needles": [
+                    r"install[- ]then[- ]fire", r"two[- ]phase",
+                    r"(an hour|~?\d+\s?min|later|gap|delay)[^.]{0,80}(fire|ran|execut|task|schedul)",
+                    r"(register|install)[^.]{0,80}(an hour|~?\d+\s?min|later|gap)",
+                ],
+                "refs": [],
+            },
+            {
+                "name": "records what it could not determine (coverage gaps)",
+                "needles": [],  # structural
+                "refs": [],
+            },
+        ],
+        "decoys": {
+            # The killer decoy first: benign task registrations, the exact 4698 the alert fires on.
+            "benign scheduled tasks": r"GoogleUpdate|EdgeUpdate|ccmeval|ScheduledDefrag|usoclient|UpdateOrchestrator",
+            "admin schtasks": r"NightlyCleanup|cleanmgr",
             "admin RDP": r"SRV-JUMP01|10\.12\.34\.9\b|t\.admin",
             "backup service": r"SRV-FS01|10\.12\.34\.10\b",
         },

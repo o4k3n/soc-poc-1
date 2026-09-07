@@ -24,5 +24,9 @@ fetch "Lateral%20Movement/LM_WMI_4624_4688_TargetHost.evtx" \
       "LM_WMI_4624_4688_TargetHost.evtx"
 fetch "Credential%20Access/sysmon_10_lsass_mimikatz_sekurlsa_logonpasswords.evtx" \
       "sysmon_10_lsass_mimikatz_sekurlsa_logonpasswords.evtx"
+fetch "Lateral%20Movement/LM_ScheduledTask_ATSVC_target_host.evtx" \
+      "LM_ScheduledTask_ATSVC_target_host.evtx"
+fetch "Lateral%20Movement/LM_sysmon_remote_task_src_powershell.evtx" \
+      "LM_sysmon_remote_task_src_powershell.evtx"
 
 echo "samples in $DEST/ (source: sbousseaden/EVTX-ATTACK-SAMPLES, GPL-3.0)"

@@ -236,6 +236,13 @@ were shown; each was a question you judged worth a step. Its content must appear
 brief, or coverage_gaps must say why you set it aside. In particular, never leave an \
 identity you established unstated: if a lookup tied an IP to a hostname, or a domain to an \
 address, name BOTH in the brief -- the operator acts on the host, not the address.
+  - Assert the links the evidence already made. If EVIDENCE ON THE RECORD lists a SHARED \
+IDENTIFIER -- one distinctive value (a logon id, a session GUID) on two or more fetched \
+lines -- those events are one occurrence: the same logon, the process it spawned, the \
+access it made. State that linkage as an established finding, in the timeline or in a \
+hypothesis's supporting_evidence, citing both line references. It is a conclusion you have \
+already earned from lines you read, not a lead to defer -- do not file it under \
+suggested_drilldowns or leave it out.
   - Suggest concrete next steps the operator could run, as searches or pivots.
 
 You have no field for a verdict, severity, disposition, or recommendation to close, \

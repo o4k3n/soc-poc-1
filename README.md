@@ -388,6 +388,16 @@ runs the bundled demo — that is all `make demo` and `make demo-offline` do now
   `SubjectLogonId`), which the `field=` selector reads on a `.jsonl` file exactly as it
   reads a Zeek `#fields` column — a JSON key, dotted for nesting; the commander is shown
   each JSON file's keys the way it is shown a Zeek header.
+- `scripts/make_schtask_case.py` → `cases/schtask-persist` — Windows host telemetry again,
+  a scheduled-task persistence with a fourth, distinct timing signature: **install-then-fire**.
+  A remote actor registers a task (Security 4698) whose action is an encoded PowerShell
+  payload, and roughly an hour later the task runs on its own schedule, in SYSTEM context
+  with **no logon in front of it**, executing the same payload. The two phases are joined by
+  the base64 payload itself — the identical value on lines an hour apart, which is exactly
+  what the synthesis recap's shared-identifier note surfaces. Its killer decoy is the fleet
+  of benign scheduled tasks (GoogleUpdate, Edge, SCCM) that register and fire on every host
+  all day: the *same 4698 event* the alert matches, so the discriminator is the task's
+  action, not that a task exists. `make case-schtask-persist` to build it.
 
 `scripts/grade.py` scores a brief against a case, keyed by folder name — a new scenario is
 one entry in its `CASES` registry plus a generator, no change to the grading machinery.

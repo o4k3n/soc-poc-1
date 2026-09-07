@@ -1054,3 +1054,11 @@ def test_where_negation_reproduce_uses_the_negated_operator() -> None:
     assert "|not)" in j                       # !~ negates the jq test
     t = reproduce_command(_action(ActionKind.SEARCH, file="dns.log", where=["qtype_name!=NS"]))
     assert "!=tolower" in t                    # != in the awk comparison
+
+
+def test_synthesis_prompt_requires_asserting_shared_identifiers() -> None:
+    from soc_poc.prompting.investigate import SYNTHESIS_SYSTEM_PROMPT
+    assert "SHARED IDENTIFIER" in SYNTHESIS_SYSTEM_PROMPT
+    # It must be stated as a finding, not deferred.
+    assert "suggested_drilldowns" in SYNTHESIS_SYSTEM_PROMPT
+    assert "established finding" in SYNTHESIS_SYSTEM_PROMPT
