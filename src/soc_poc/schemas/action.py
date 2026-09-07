@@ -53,6 +53,7 @@ class ActionKind(str, Enum):
     TIMELINE = "timeline"
     STATS = "stats"
     EXTREMES = "extremes"
+    DECODE = "decode"
     CONTEXT = "context"
     READ_LINES = "read_lines"
     CLOSE_READ = "close_read"
@@ -67,11 +68,12 @@ OPTIONAL_SKILLS = frozenset({
     ActionKind.TIMELINE.value,
     ActionKind.STATS.value,
     ActionKind.EXTREMES.value,
+    ActionKind.DECODE.value,
 })
 
 # The verbs that take the `field=`/`extract=` value selectors. timeline works off
 # timestamps and takes none.
-SELECTOR_KINDS = (ActionKind.TALLY, ActionKind.STATS, ActionKind.EXTREMES)
+SELECTOR_KINDS = (ActionKind.TALLY, ActionKind.STATS, ActionKind.EXTREMES, ActionKind.DECODE)
 # The verbs that accept `where` field predicates: the ones that fetch or count lines.
 FILTER_KINDS = (ActionKind.SEARCH, ActionKind.COUNT, ActionKind.CONTEXT)
 
@@ -113,6 +115,7 @@ PATTERN_KINDS = (
     ActionKind.TIMELINE,
     ActionKind.STATS,
     ActionKind.EXTREMES,
+    ActionKind.DECODE,
 )
 
 # Entity types `extract=` accepts. Kept in lockstep with aggregation.ENTITY_PATTERNS by a

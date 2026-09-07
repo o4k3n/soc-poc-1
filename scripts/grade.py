@@ -282,8 +282,11 @@ CASES: dict[str, dict] = {
                 "name": "describes timing as install-then-fire across a gap, not one chain",
                 "needles": [
                     r"install[- ]then[- ]fire", r"two[- ]phase",
-                    r"(an hour|~?\d+\s?min|later|gap|delay)[^.]{0,80}(fire|ran|execut|task|schedul)",
-                    r"(register|install)[^.]{0,80}(an hour|~?\d+\s?min|later|gap)",
+                    r"(an? hour|~?\d+\s?(min|hour)|later|gap|delay)[^.]{0,80}"
+                    r"(fire|ran|execut|task|schedul|register|install)",
+                    # the common phrasing is the other order: "executed ... one hour later"
+                    r"(fire|ran|execut|register|install|task)[^.]{0,80}"
+                    r"(an? hour|~?\d+\s?(min|hour)|later|gap|delay)",
                 ],
                 "refs": [],
             },

@@ -93,6 +93,15 @@ _SKILL_MENU: dict[str, str] = {
         "record, so narrow the filter first, and mind the direction of a size column: the "
         "largest response bodies are downloads, the largest request bodies are uploads."
     ),
+    "decode": (
+        "  decode      regex, plus field=\"<name-or-key>\" (or a capture group) to pick the "
+        "value. Finds the base64 inside it and DECODES it to text, verified -- a run that is "
+        "not genuinely base64 is left alone, never mangled. Use it to read an encoded "
+        "command instead of guessing: decode field=\"CommandLine\" pattern=\"-Enc\" turns a "
+        "PowerShell -Enc payload into the command it runs, with a citable reference. Do not "
+        "decode base64 in your head -- a wrong guess about what a script does is the "
+        "expensive kind."
+    ),
 }
 
 # The verbs that size a result set without fetching lines. extremes is on the menu but not
@@ -102,7 +111,7 @@ _SIZING_SKILLS = frozenset({"tally", "timeline", "stats"})
 # The selectors are usable only when the commander knows the column names; those are shown
 # in the files block, but only when a selector verb is on -- so this gates that display and
 # keeps a run without the aggregation skills byte-for-byte as it was.
-_SELECTOR_SKILLS = frozenset({"tally", "stats", "extremes"})
+_SELECTOR_SKILLS = frozenset({"tally", "stats", "extremes", "decode"})
 
 
 def investigate_system_prompt(enabled_skills: frozenset[str] = frozenset()) -> str:
@@ -446,16 +455,21 @@ def _distinctive(token: str) -> bool:
     """Is this token an identifier worth reporting as a cross-event link?
 
     A decimal is a count or an epoch, not an id. A hex run (with or without 0x) is an
-    access mask or a logon id. Otherwise it must look random (entropy) or be long. The
-    `_ID_CANDIDATE` class already splits on '-'/'_' and '.', so IPs, dashed hostnames
-    (WKS-3355) and underscore accounts (svc_deploy) never reach here -- only the values
-    that actually tie two events together do.
+    access mask or a logon id. A mixed-letters-and-digits run is an encoded blob or an id
+    (a base64 payload, a GUID fragment). A pure-letter word is an identifier only if it is
+    genuinely random -- which drops the CamelCase XML/JSON boilerplate a serialised value
+    carries ("CalendarTrigger", "HighestAvailable"): those are dictionary words, not
+    identifiers, and on a task-registration log they sit on every line and would crowd out
+    the real join. The `_ID_CANDIDATE` class already splits on '-'/'_'/'.', so IPs, dashed
+    hostnames (WKS-3355) and underscore accounts (svc_deploy) never reach here.
     """
     if token.isdigit():
         return False
     if _HEXISH.match(token):
-        return True
-    return _entropy(token) >= 3.2 or len(token) >= 12
+        return len(token) >= 6                      # 0x1010, 0x00eea1ea -- not a tiny 0x3e7
+    if any(ch.isdigit() for ch in token) and len(token) >= 8:
+        return True                                 # base64 payloads, ids that carry digits
+    return _entropy(token) >= 3.8                    # only a very-random all-letter token
 
 
 def _shared_identifiers(evidence: Evidence) -> list[str]:

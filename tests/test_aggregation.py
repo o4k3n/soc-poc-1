@@ -1062,3 +1062,41 @@ def test_synthesis_prompt_requires_asserting_shared_identifiers() -> None:
     # It must be stated as a finding, not deferred.
     assert "suggested_drilldowns" in SYNTHESIS_SYSTEM_PROMPT
     assert "established finding" in SYNTHESIS_SYSTEM_PROMPT
+
+
+# --- decode: verified base64, never mangled ---------------------------------------------
+
+
+def test_decode_decodes_a_verified_base64_field() -> None:
+    import base64
+    from soc_poc.aggregation import decode
+    payload = base64.b64encode("whoami /all".encode("utf-16-le")).decode()
+    corpus = Corpus({"s.jsonl": [
+        '{"event_id":1,"CommandLine":"powershell -Enc ' + payload + '"}',
+        '{"event_id":1,"CommandLine":"notepad.exe"}',
+    ]})
+    r = decode(corpus, "-Enc", file="s.jsonl", field="CommandLine")
+    assert r.matched_lines == 1
+    assert any("whoami /all" in row for row in r.table)
+    assert [h.ref for h in r.hits] == ["s.jsonl:L1"]
+
+
+def test_decode_never_mangles_non_base64() -> None:
+    from soc_poc.aggregation import decode, _try_b64_decode
+    assert _try_b64_decode("thisisplaintextnotb64") is None
+    assert _try_b64_decode("q83vEjRWeJCrze8SNFZ4kA==") is None
+    corpus = Corpus({"s.jsonl": ['{"CommandLine":"run AAAABBBBCCCCDDDDEEEEFFFF now"}']})
+    r = decode(corpus, "run", file="s.jsonl", field="CommandLine")
+    assert "did NOT validate" in r.headline or "did not validate" in r.headline
+    assert r.hits == ()
+
+
+def test_decode_is_gated_and_reproduce_uses_base64() -> None:
+    dis = validate_action(_action(ActionKind.DECODE, pattern="x", file="s.jsonl"),
+                          known_files=["s.jsonl"], enabled_skills=frozenset({"tally"}))
+    assert any("not available in this run" in p.message for p in dis)
+    on = investigate_system_prompt(frozenset({"decode"}))
+    assert "decode  " in on and "base64" in on
+    cmd = reproduce_command(_action(ActionKind.DECODE, pattern="-Enc", file="s.jsonl",
+                                    field="CommandLine"), json_files=frozenset({"s.jsonl"}))
+    assert "base64 -d" in cmd and "grep -hE -e" in cmd

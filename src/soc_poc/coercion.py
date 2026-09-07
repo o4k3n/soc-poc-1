@@ -53,7 +53,7 @@ _ALIASES: dict[str, tuple[str, ...]] = {
     "end_line": ("end_line", "end", "to_line", "last_line"),
 }
 # Verbs that take their single positional argument as a regex rather than a filename.
-_PATTERN_VERBS = ("search", "count", "tally", "timeline", "stats", "extremes")
+_PATTERN_VERBS = ("search", "count", "tally", "timeline", "stats", "extremes", "decode")
 
 
 def _flatten(payload: dict[str, Any]) -> dict[str, Any]:

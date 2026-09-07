@@ -46,11 +46,14 @@ max_validation_retries = 1
 #   "extremes"  the 10 matching LINES with the largest value (numeric, or longest), with
 #               citable references -- the lines behind a stats max or a tally's long
 #               tail. The one aggregate that fetches lines, by design.
+#   "decode"    decode the base64 a pattern selects (e.g. a PowerShell -Enc payload) to
+#               text, VERIFIED -- a value that is not genuinely base64 is left alone, so a
+#               bad decode is never presented as a finding. Citable, like extremes.
 # All are computed in code, spend no GPU, and print their grep/sed/awk equivalent in the
 # step ledger like every other action. The core six verbs are always available; these
 # add aggregation so the commander can size a result set BEFORE fetching lines into its
 # context (extremes then fetches the top of it). An unknown name here fails at startup.
-enabled_skills = ["tally","extremes","timeline","stats"]
+enabled_skills = ["tally"]
 
 # [models.commander]
 # role = "commander"

@@ -71,9 +71,13 @@ worker with one question), `conclude` (stop and write the brief). `search`, `cou
 own graded runs: `tally` (distinct values of a regex with exact counts — a distribution
 in one step instead of one `count` per guess), `timeline` (span, gap statistics and burst
 structure of a pattern's matches, same gap arithmetic as the profile), `stats`
-(min/median/p95/max over a captured value; lengths when the values are not numeric), and
+(min/median/p95/max over a captured value; lengths when the values are not numeric),
 `extremes` (the ten matching *lines* with the largest value — numeric, or the longest —
-each with a citable reference, plus where those ten sit in the distribution). All four
+each with a citable reference, plus where those ten sit in the distribution), and
+`decode` (the base64 a pattern selects, decoded to text — *verified*: a value that is not
+genuinely base64 is left alone, so a PowerShell `-Enc` payload becomes the command it runs
+instead of being decoded in the model's head, where a wrong guess about what a script does
+is the expensive kind). All five
 live in `aggregation.py`, spend no GPU and print their `grep`/`sed`/`awk` equivalent in
 the step ledger like every other action. The first three return numbers rather than
 lines — nothing they produce enters `shown_refs()`, because a number is not a citation.
@@ -88,7 +92,7 @@ the number-only skills exist for: **aggregate before you fetch** — size a resu
 numbers before spending context on its lines — and names `extremes` as the way to fetch
 the top of it.
 
-**Value selectors on `tally`, `stats` and `extremes`.** The pattern is always the line *filter*; how
+**Value selectors on `tally`, `stats`, `extremes` and `decode`.** The pattern is always the line *filter*; how
 it picks the *value* has three modes, because "first capture group" alone forced a brittle
 column-counting regex that was the single most expensive failure in the transcripts (one
 run spent 8 of 24 steps re-anchoring the same qtype question). `field="<name-or-number>"`

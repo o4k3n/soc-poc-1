@@ -26,6 +26,7 @@ digit-range regexes for four steps to fetch "the big ones".
 
 from __future__ import annotations
 
+import base64
 import re
 import statistics
 from dataclasses import dataclass, field
@@ -472,4 +473,104 @@ def extremes(
         matched_lines=matched_lines,
         table=tuple(table),
         hits=tuple(hit for _, _, hit in top),
+    )
+
+
+# A base64 run worth trying: standard alphabet, long enough to be a payload not an id or a
+# stray token. Padding is optional in the middle of a field, required at the end of a whole
+# value, so it is matched but not relied on.
+_B64_RUN = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+DECODE_SHOWN = 10
+
+
+def _try_b64_decode(candidate: str) -> str | None:
+    """Decode a base64 candidate to text, or None if it is not genuinely base64.
+
+    Deliberately strict, because a bad decode presented as a finding is worse than no
+    decode: the charset is guaranteed by the caller's regex, but this also requires a
+    length that is a multiple of four and a decode that yields mostly-printable text.
+    PowerShell `-Enc` is base64 of UTF-16LE; ordinary base64 is UTF-8; both are tried, and
+    anything that decodes to bytes rather than text is rejected, not shown.
+    """
+    if len(candidate) % 4 != 0:
+        return None
+    try:
+        raw = base64.b64decode(candidate, validate=True)
+    except ValueError:
+        return None
+    if not raw:
+        return None
+    for encoding in ("utf-16-le", "utf-8"):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if not text:
+            continue
+        # ASCII, not merely "printable": a command is ASCII, whereas random bytes read as
+        # UTF-16LE decode to printable CJK and would sail past a printable-only test.
+        ascii_ok = sum(32 <= ord(ch) <= 126 or ch in "\t\n\r" for ch in text)
+        if ascii_ok / len(text) >= 0.9:
+            return text.replace("\r", " ").replace("\n", " ").strip()
+    return None
+
+
+def decode(
+    corpus: Corpus, pattern: str, *, file: str = "", field: str = "", extract: str = ""
+) -> Aggregate:
+    """Decode the base64 a pattern selects -- verified, never mangled.
+
+    For each matching line's selected value (a `field=`, a capture group, or an
+    `extract=` entity), the base64 runs inside it are found and the genuinely-base64 ones
+    decoded into text; a run that does not validate is COUNTED, not decoded. This turns an
+    encoded PowerShell command line into the command it actually runs, in one step and with
+    a citable reference, instead of the commander decoding it in its head -- which is a
+    guess, and a wrong guess about what a script does is the expensive kind.
+    """
+    rows, matched_lines, error = _selected_rows(corpus, pattern, file, field=field, extract=extract)
+    if rows is None:
+        return Aggregate(headline=f"failed: {error}", error=error)
+    scope = file or f"{len(corpus.file_names)} file(s)"
+    if not rows:
+        return Aggregate(
+            headline=f"0 matches in {scope} -- this pattern does not occur there"
+        )
+    decoded: list[tuple[Hit, str]] = []
+    not_base64 = 0
+    for value, hit in rows:
+        got = False
+        for match in _B64_RUN.finditer(value):
+            text = _try_b64_decode(match.group(0))
+            if text is not None:
+                decoded.append((hit, text))
+                got = True
+        if not got and _B64_RUN.search(value):
+            not_base64 += 1
+    if not decoded:
+        note = f" ({not_base64} looked base64 but did not validate)" if not_base64 else ""
+        return Aggregate(
+            headline=(
+                f"0 valid base64 value(s) among {matched_lines} matching line(s) in "
+                f"{scope}{note}"
+            ),
+            matched_lines=matched_lines,
+        )
+    shown = decoded[:DECODE_SHOWN]
+    table = ["decoded base64 (verified; a run that did not validate is not shown):"]
+    for hit, text in shown:
+        table.append(f"  {_clip(text)}  <- {hit.ref}")
+    tail = f"{len(decoded)} value(s) decoded"
+    if len(decoded) > len(shown):
+        tail += f", showing {len(shown)}"
+    if not_base64:
+        tail += (
+            f"; {not_base64} matching value(s) looked base64 but did NOT validate and were "
+            f"left encoded"
+        )
+    table.append(tail)
+    return Aggregate(
+        headline=f"decoded {len(shown)} of {len(decoded)} base64 value(s) in {scope}",
+        matched_lines=matched_lines,
+        table=tuple(table),
+        hits=tuple(hit for hit, _ in shown),
     )

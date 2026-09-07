@@ -86,7 +86,7 @@ def _value_stream(
                a small divergence from the code, which counts them as words).
     * capture group / whole match: the original grep -o (+ sed for the group).
     """
-    matching = f"grep -hE {shlex.quote(action.pattern)} {target}"
+    matching = f"grep -hE -e {shlex.quote(action.pattern)} {target}"
     if action.extract:
         entity = _EXTRACT_GREP.get(action.extract, r"\S+")
         return f"{matching} | grep -oE {shlex.quote(entity)}"
@@ -260,6 +260,15 @@ def reproduce_command(
         return f"{_value_stream(action, target, json_files)} | sort -n | uniq -c"
     if action.action is ActionKind.EXTREMES:
         return _extremes_command(action, target, json_files)
+    if action.action is ActionKind.DECODE:
+        # Pull the selected value, isolate its base64 runs, and decode UTF-16LE (the
+        # PowerShell -Enc convention). `base64 -d` on junk fails quietly, so a bad
+        # candidate produces nothing rather than garbage.
+        return (
+            f"{_value_stream(action, target, json_files)} | grep -oE "
+            f"'[A-Za-z0-9+/]{{16,}}={{0,2}}' | base64 -d 2>/dev/null | "
+            f"iconv -f UTF-16LE -t UTF-8 2>/dev/null"
+        )
     if action.action is ActionKind.TIMELINE:
         # Stamp frequencies at native granularity; the burst arithmetic is over these.
         return (
@@ -486,6 +495,7 @@ _AGGREGATES = {
     ActionKind.TIMELINE: aggregation.timeline,
     ActionKind.STATS: aggregation.stats,
     ActionKind.EXTREMES: aggregation.extremes,
+    ActionKind.DECODE: aggregation.decode,
 }
 
 
