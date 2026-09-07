@@ -1,26 +1,26 @@
-# SOC log-analysis PoC — serving layer + orchestrator skeleton
+# SOC log-analysis PoC — an auditable investigation loop
 
 A lab proof of concept on a single NVIDIA DGX Spark (GB10, 128 GB unified memory,
-~273 GB/s). An external detection system raises an alert; this system investigates
-around it.
+~273 GB/s). An external detection system raises an alert; this system investigates around
+it and hands a human SOC operator a brief they can act on. It never renders a verdict.
 
-A **commander** model reads the alert and a **computed profile** of the case — line-shape
-frequencies, rare shapes, high-entropy token groups, activity bursts, all counted in code
-with no model involved. It then investigates by issuing one search at a time against the
-raw logs, seeing each result before deciding the next question, and finally synthesizes an
-investigation brief for a human SOC operator.
+A **commander** model reads the alert and a **computed profile** of the case — record-type
+scope, line-shape frequencies, rare shapes, high-entropy token groups, activity bursts,
+all counted in code with no model involved. It then investigates one action at a time
+against the raw logs: it asks a question, sees the exact result, and decides the next
+question, building an append-only evidence ledger as it goes. When it has what it needs it
+concludes and synthesizes the brief. Every step is a regex or a field filter over files on
+disk, and every step prints the `grep`/`jq`/`awk` that reproduces it, so the brief is
+checkable by hand without a GPU.
 
-**Coverage is arithmetic, not attendance.** `count` over the corpus is exact and the
-operator can re-run it with `grep` in milliseconds. Every step lands in the brief's ledger
-with the shell command that reproduces it.
-
-The earlier design instead swept every slice of every file through a fleet of **grunt**
-workers, on the argument that if every line is read by a model then a negative means
-something. Six graded runs disproved the premise — reading is not noticing. See
-"Why the sweep is gone" below. Grunts survive as `close_read`: a bounded line range handed
-to a worker for one specific question the commander wrote, when counting cannot answer it.
-
-The brief supports the operator. **It never renders a verdict.**
+**Coverage is arithmetic, not attendance.** A `count` over the corpus is exact and the
+operator can re-run it with `grep` in milliseconds. The earlier design instead swept every
+slice of every file through a fleet of **grunt** workers, on the argument that if every
+line is read by a model then a negative means something. Six graded runs disproved the
+premise — reading is not noticing (see "Why the sweep is gone"). Grunts survive as
+`close_read`: a bounded line range handed to a worker for one specific question the
+commander wrote, when counting genuinely cannot answer it. In 10+ graded runs on the
+current stack it has fired zero times.
 
 Latency is explicitly not a concern here. Correctness, auditability, and an architecture
 that survives being ported to Elixir/OTP are.
@@ -53,109 +53,113 @@ that survives being ported to Elixir/OTP are.
     └───────┬───────────────────────────────┬──────────────────┘
             │ typed messages only           │
             ▼                               ▼
-   commander (port 8000)            grunt (port 8001)
-   gpt-oss-120b, MXFP4              Qwen3-8B-FP8, ONE instance
-   actions + synthesis              close_read only, on demand
+   commander (SGLang, :18400)       grunt (same endpoint)
+   Qwen3.8-Flash-Next, NVFP4        close_read only, on demand
+   actions + synthesis              (has fired 0× on this stack)
             │                               │
             └──────► every call ────────────┘
                      transcript.jsonl (full prompt + response, always)
 ```
 
-**The six actions.** `search` (regex; exact total count plus up to 40 lines), `count`
-(the number alone — cheap, use it to test a guess), `context` (the lines around a
-reference), `read_lines` (a range verbatim), `close_read` (hand a bounded range to a
-worker with one question), `conclude` (stop and write the brief). `search`, `count` and
-`context` also take a `where` field filter (below).
+The commander is a JSON contract, not a particular model: `actions.py` executes a JSON
+object the model emits, over the files already in memory, and nothing in the orchestrator
+knows which engine satisfies the schema. The current commander is
+**Qwen3.8-Flash-Next served by SGLang on `:18400`** (see "Serving layer"); the grunt points
+at the same endpoint. Guided decoding against a flat schema, not native tool-calling:
+guided decoding has been the most reliable component of this stack, while every
+model-side parsing convention touched here has produced a silent failure at least once.
 
-**The aggregation skills**, gated by `run.enabled_skills` so each can be trialled on its
-own graded runs: `tally` (distinct values of a regex with exact counts — a distribution
-in one step instead of one `count` per guess), `timeline` (span, gap statistics and burst
-structure of a pattern's matches, same gap arithmetic as the profile), `stats`
-(min/median/p95/max over a captured value; lengths when the values are not numeric),
-`extremes` (the ten matching *lines* with the largest value — numeric, or the longest —
-each with a citable reference, plus where those ten sit in the distribution), and
-`decode` (the base64 a pattern selects, decoded to text — *verified*: a value that is not
-genuinely base64 is left alone, so a PowerShell `-Enc` payload becomes the command it runs
-instead of being decoded in the model's head, where a wrong guess about what a script does
-is the expensive kind). All five
-live in `aggregation.py`, spend no GPU and print their `grep`/`sed`/`awk` equivalent in
-the step ledger like every other action. The first three return numbers rather than
-lines — nothing they produce enters `shown_refs()`, because a number is not a citation.
-`extremes` is the deliberate exception: its product *is* the lines behind a number, so
-its rows enter `shown_refs()`, the ledger and the synthesis recap like a search's would.
-It exists because the transcripts showed the step between an aggregate and a citation
-being paid four times over — after `tally` said big values existed, the commander
-hand-built digit-range regexes (`\t(5[0-9]{2}|[6-9][0-9]{2}|1[0-9]{3,})\t`) to fetch
-"the big ones", and two tallies over label columns returned 790 distinct values across
-790 lines, where "the ten longest" was the question. The prompt teaches the discipline
-the number-only skills exist for: **aggregate before you fetch** — size a result set with
-numbers before spending context on its lines — and names `extremes` as the way to fetch
-the top of it.
+---
 
-**Value selectors on `tally`, `stats`, `extremes` and `decode`.** The pattern is always the line *filter*; how
-it picks the *value* has three modes, because "first capture group" alone forced a brittle
-column-counting regex that was the single most expensive failure in the transcripts (one
-run spent 8 of 24 steps re-anchoring the same qtype question). `field="<name-or-number>"`
-takes a delimited column — resolved through the log's own `#fields` header, which
-`corpus.py` parses and the prompt shows under each file — so the pattern only has to match
-the line and one wrong separator can no longer silently match nothing. `extract="ip|domain|
-hash|email"` pulls every entity of that type from each matching line, reusing
-`profiling.py`'s recognisers, which is also how the commander lists the IOCs in a set of
-lines in one step. A capture group remains the fallback. In a graded run this took the
-commander from ~8 zero-result regex steps to 1, with it reaching for `field=` unprompted.
-The named-column reproduce command is a self-resolving `awk` one-liner, so the result is
-still re-derivable by hand.
+## What the commander can do
 
-On a **JSON-lines** file (`*.jsonl`, one object per line — the shape Windows host events
-take in `cases/wmi-lsass`) there are no columns; `field=` names a **key** instead, dotted
-for nesting (`field="Details.User"`), matched case-insensitively. The commander is shown
-each JSON file's keys under it, the way a Zeek header's fields are shown, labelled
-`keys (JSON lines):`. Values keep their JSON type, so a numeric key stays numeric for
-`stats`/`extremes` and a hex access mask like `0x1010` is ranked by its value, not its
-length. The reproduce command becomes a `jq` one-liner rather than `awk`, so a JSON
-aggregate is re-derivable by hand too.
+**The core verbs.** `search` (regex, case-insensitive; exact total count plus up to 40
+lines with their references), `count` (the number alone — cheap, use it to test a guess),
+`context` (the lines around a reference), `read_lines` (a range verbatim), `close_read`
+(hand a bounded range to a worker for one question counting cannot answer), `conclude`
+(stop and write the brief). The model never runs anything; the set of things that *can* be
+run is these verbs over the case's files.
 
-**The `where` filter on `search`, `count` and `context`.** A structured log invites a
+**The `where` field filter on `search`, `count` and `context`.** A structured log invites a
 regex that lists `"key":"value"` pairs in sequence to pin one record — and on JSON that
 silently matches nothing, because the record may order its keys differently. Graded runs
 burned three steps each recovering from exactly that. `where=["event_id=10",
 "computer=WKS-3355"]` instead matches by *parsed field*, ANDed, order-independent: a JSON
 key (dotted for nesting) or a `#fields` column, resolved the same way `field=` resolves.
 Four operators — `=` (exact, case-insensitive), `!=`, `~` (regex on the value), `!~` — so
-`where=["event_id=10","TargetImage~lsass","SourceImage!~MsMpEng"]` isolates the credential
+`where=["event_id=10","TargetImage~lsass","SourceImage!~MsMpEng"]` isolates a credential
 dump from the antivirus's own lsass reads in one step. `pattern` stays an optional extra
 whole-line regex, and the reproduce command is a `jq -c 'select(...)'` (JSON) or a
-header-resolving `awk` (TSV) that re-derives the same lines by hand. In the first graded
-run to have it, the commander reached for `where` in 18 of 24 steps and the key-order wall
-disappeared entirely.
+header-resolving `awk` (TSV) that re-derives the same lines by hand. In its first graded
+run the commander reached for `where` in 18 of 24 steps and the key-order wall vanished.
 
-**Shared identifiers in the synthesis recap.** The recap that lists every fetched line
-also scans their *values* (not their key names) for id-shaped tokens — a logon id, a GUID —
-that appear on two or more fetched lines, and names them: *"`0x00eea1ea` on
-security.jsonl:L1675, L1677, L1678"*. A distinctive value shared by lines the commander
-chose to fetch usually ties those events into one — a logon and the process it spawned —
-and this hands synthesis the join rather than trusting it to notice. It is evidence-only
-(no corpus scan), and IPs, hostnames and short process names fall out by shape.
+**The optional skills**, gated by `run.enabled_skills` so each can be trialled on its own
+graded runs and judged one at a time:
 
-**The commander proposes; the orchestrator disposes.** An action is a JSON object the
-model emits and `actions.py` executes. The model never runs anything, and the set of
-things that *can* be run is those six verbs over files already in memory. Guided decoding
-against a flat schema, not native tool-calling: guided decoding has been the most reliable
-component of this stack, while every model-side parsing convention touched here has
-produced a silent failure at least once, and tool-calling would put the newest parser in
-the hot path of every step.
+- `tally` — the distinct values of a regex with an exact count each: a distribution in one
+  step instead of one `count` per guess.
+- `timeline` — span, gap statistics and burst structure of a pattern's matches, the same
+  gap arithmetic as the profile.
+- `stats` — min/median/p95/max over a captured value; the value's length when it is not
+  numeric.
+- `extremes` — the ten matching *lines* with the largest value, each with a citable
+  reference, plus where those ten sit in the distribution. This is the bridge from a number
+  to its evidence: after `stats` says "max request_body_len 46392" it hands you the lines
+  behind the top end, instead of the hand-built digit-range regexes the transcripts showed
+  the commander writing for four steps.
+- `decode` — the base64 a pattern selects, decoded to text, **verified**: a value that is
+  not genuinely base64 is left alone, never mangled. A PowerShell `-Enc` payload becomes the
+  command it runs, with a citable reference, instead of being decoded in the model's head —
+  where a wrong guess about what a script does is the expensive kind.
 
-**Commander** sees: the alert, the computed profile, the file names and line counts, and
-the evidence ledger — every question it has asked and the lines it was shown. Recent steps
-render in full; older ones collapse to their summary, keeping their exact counts. That
-bound is what makes the context flat: on the 1 MB DNS case, 4 steps cost ~6,350 tokens and
-24 steps cost ~6,930.
+`tally`, `timeline` and `stats` return numbers, not lines: nothing they produce enters
+`shown_refs()`, because a number is not a citation. `extremes` and `decode` are the
+deliberate exceptions — their product *is* lines behind a number, so their rows enter the
+ledger and the synthesis recap like a search's would. All five live in `aggregation.py`,
+spend no GPU, and print their shell equivalent in the step ledger like every other action.
+The prompt teaches the discipline the number-only skills exist for: **aggregate before you
+fetch** — size a result set with numbers before spending context on its lines.
 
-**A close_read grunt** sees: one fenced line range, its column header, and the one question
-asked of it. Nothing else — no sibling reports, no history. Isolation is what makes each
-task checkable and what makes it a supervised Task in the Elixir port.
+**Value selectors** on `tally`, `stats`, `extremes` and `decode`. The pattern is always the
+line *filter*; how it picks the *value* has three modes, because "first capture group"
+alone forced a brittle column-counting regex that was the single most expensive failure in
+the transcripts. `field="<name-or-number>"` takes a delimited column, resolved through the
+log's own `#fields` header, so the pattern only has to match the line and one wrong
+separator can no longer silently match nothing. `extract="ip|domain|hash|email"` pulls
+every entity of that type from each matching line, reusing `profiling.py`'s recognisers. A
+capture group remains the fallback. On a **JSON-lines** file (`*.jsonl`, one object per
+line — the shape Windows host events take) there are no columns: `field=` names a **key**
+instead, dotted for nesting (`field="Details.User"`), matched case-insensitively, and the
+commander is shown each JSON file's keys the way it is shown a Zeek header. Values keep
+their JSON type, so a numeric key stays numeric for `stats`/`extremes` and a hex access
+mask like `0x1010` is ranked by its value, not its length. The reproduce becomes `jq`
+rather than `awk`, so a JSON aggregate is re-derivable by hand too.
 
-Read `PORTING.md` next; it explains why several things are shaped the way they are.
+**The computed profile** is the commander's first page, and it is the one block guaranteed
+free of model error — arithmetic over the corpus, re-derivable with `grep` and `sort`. Per
+file it shows the **record-type scope** (the distribution of the low-cardinality fields that
+say what *kinds* of record the file holds — `event_id`, `LogonType`, `GrantedAccess` on a
+Windows log; `qtype_name`, `method` on a network one — detected generically by cardinality,
+so no format is special-cased), the most common line shapes, and the **rare shapes** (a
+line shape occurring a handful of times among thousands, which is where the unusual thing
+usually is — the NS delegation that occurs once in 5,586 lines lands here). Globally it
+shows the most-queried domains and addresses, high-entropy token groups (with how many
+distinct hosts emit each — one host is a tunnel, forty is a vendor service), and activity
+bursts. The scope section exists because a commander handed a Windows JSON log used to
+regex-crawl it without ever tallying `event_id` to learn what record kinds it held; now
+that map is computed and handed over.
+
+**The synthesis recap.** Before the brief is written, `_evidence_on_record` re-presents a
+flat, uncollapsed list of every line the commander fetched, paired with a requirement to
+account for each in the brief or in `coverage_gaps` — the fix for a run that searched
+dhcp.log, was shown the two lease lines naming the host, and wrote a brief that never
+mentioned the hostname. It also computes **shared identifiers**: a distinctive value (a
+logon id, a session GUID, a base64 payload) appearing on two or more fetched lines usually
+ties those events into one, so it is surfaced by name for the brief to state or rule out —
+the join a logon and the process it spawned share, or the payload a scheduled task
+registers and later fires.
+
+---
 
 ### Module map
 
@@ -163,11 +167,11 @@ Read `PORTING.md` next; it explains why several things are shaped the way they a
 |---|---|
 | `analyze.py` / `abort.py` | the two entry points; everything else is library code |
 | `src/soc_poc/casedir.py` | case-folder discovery and validation, with fixable errors |
-| `src/soc_poc/corpus.py` | the case's log files, searchable by line; every result carries its ref |
-| `src/soc_poc/profiling.py` | the computed profile: rarities, entropy groups, bursts. No model |
-| `src/soc_poc/actions.py` | executing one action, plus the `grep` that reproduces it |
-| `src/soc_poc/aggregation.py` | the optional skills: tally, timeline, stats, extremes. Counted, never inferred |
-| `src/soc_poc/evidence.py` | the append-only ledger: the run's memory *and* its audit trail |
+| `src/soc_poc/corpus.py` | the case's log files, searchable by line; JSON detection, `where` field matching, categorical scope; every result carries its ref |
+| `src/soc_poc/profiling.py` | the computed profile: record-type scope, rarities, entropy groups, bursts. No model |
+| `src/soc_poc/aggregation.py` | the optional skills: tally, timeline, stats, extremes, decode. Counted, never inferred |
+| `src/soc_poc/actions.py` | executing one action, plus the `grep`/`jq`/`awk` that reproduces it |
+| `src/soc_poc/evidence.py` | the append-only ledger: the run's memory *and* its audit trail; the synthesis recap and shared-identifier scan |
 | `src/soc_poc/chunking.py` | token-aware chunking; still used for the inventory and injection scan |
 | `src/soc_poc/control.py` | run markers and the abort sentinel |
 | `src/soc_poc/progress.py` | the live-output sink; keeps I/O out of the state machine |
@@ -176,15 +180,17 @@ Read `PORTING.md` next; it explains why several things are shaped the way they a
 | `src/soc_poc/messages.py` | every message crossing an agent boundary, failures included |
 | `src/soc_poc/grunt.py` | one isolated unit of work; always returns, never raises |
 | `src/soc_poc/commander.py` | the decide-action and synthesis calls |
+| `src/soc_poc/coercion.py` | rescues a tool-call-shaped reply onto the flat action schema |
 | `src/soc_poc/schemas/` | the contracts (alert, action, slices, grunt report, brief) |
 | `src/soc_poc/validation/` | no-verdict guard, citation enforcement, injection post-pass |
 | `src/soc_poc/prompting/` | prompt construction; all untrusted content goes through `envelope.py` |
-| `src/soc_poc/llm/` | `LLMClient` protocol, vLLM client, offline stub |
-| `src/soc_poc/transcript.py` | the JSONL corpus — the PoC's actual deliverable |
+| `src/soc_poc/llm/` | `LLMClient` protocol, vLLM/SGLang client, offline stub |
+| `src/soc_poc/transcript.py` | the JSONL transcript — the PoC's actual deliverable |
 | `src/soc_poc/preflight.py` | the three endpoint checks that gate every run |
-| `scripts/make_*_case.py` | the seeded scenario generators (dns-tunnel, http-c2, wmi-lsass) |
+| `scripts/make_*_case.py` | the seeded scenario generators (dns-tunnel, http-c2, wmi-lsass, schtask-persist) |
+| `scripts/fetch_evtx_samples.sh` | fetch the EVTX attack samples the Windows cases derive from |
 | `scripts/grade.py` | scores a brief against a case-keyed ground-truth rubric |
-| `deploy/flashnext/` | scripts to serve Qwen3.8-Flash-Next via SGLang (commander-only) |
+| `deploy/flashnext/` | scripts to serve Qwen3.8-Flash-Next via SGLang (the current commander) |
 
 ---
 
@@ -192,339 +198,59 @@ Read `PORTING.md` next; it explains why several things are shaped the way they a
 
 Prompts are a courtesy. These four are structural, and they hold when the prompt fails.
 
-1. **There is no verdict field.** `BriefBody` has no `severity`, `disposition`,
-   `verdict`, `risk_score`, or recommended-action field. A model cannot flip a decision
-   the schema gives it nowhere to write. `validation/no_verdict.py` walks every
-   model-facing schema at **import time** and refuses to start the process if one grows
-   a decision-shaped field — so "just a severity hint, six months from now" fails the
-   build rather than the review.
-2. **Every claim carries a citation, and citations are checked.** The brief's references
-   are validated against `Evidence.shown_refs()` — the exact set of lines that passed in
-   front of the commander — not against the corpus. A reference that resolves in the files
-   but was never displayed is not a citation, it is a plausible-looking guess, and that is
-   the failure mode worth catching now that the commander knows every file name and line
-   count. For a `close_read`, guided decoding guarantees `representative_refs` is a list of
-   strings; only Python can know whether
-   `dns.log:L142` was in the range *that particular worker* was handed.
-   `validation/citations.py` checks exactly that, plus the reference cap, that
-   `match_count` is consistent with what was cited, and that a report claiming the slice
-   is irrelevant has not simultaneously recorded a hit — a grammar constrains shape and
-   cannot count or cross-check. A finding with no citation, or a fabricated one, is a
-   validation failure: the worker is re-prompted once with the specific error and then
-   recorded as a failure. At brief level, evidence written with no reference at all is
-   listed in `uncited_claims` — non-blocking, because some claims are legitimately
-   uncitable, but visible.
+1. **There is no verdict field.** `BriefBody` has no `severity`, `disposition`, `verdict`,
+   `risk_score`, or recommended-action field. A model cannot flip a decision the schema
+   gives it nowhere to write. `validation/no_verdict.py` walks every model-facing schema at
+   **import time** and refuses to start the process if one grows a decision-shaped field —
+   so "just a severity hint, six months from now" fails the build rather than the review.
+2. **Every claim carries a citation, and citations are checked.** The brief's references are
+   validated against `Evidence.shown_refs()` — the exact set of lines that passed in front
+   of the commander — not against the corpus. A reference that resolves in the files but was
+   never displayed is not a citation, it is a plausible-looking guess. `validation/citations.py`
+   also checks a `close_read` worker's `representative_refs` against the range that worker
+   was actually handed, the reference cap, and that a report calling a slice irrelevant has
+   not simultaneously recorded a hit — a grammar constrains shape and cannot cross-check. A
+   finding with a fabricated or missing citation is a validation failure; evidence written
+   with no reference at all lands in `uncited_claims` — non-blocking, because some claims are
+   legitimately uncitable, but visible.
 3. **The alert's status never round-trips through a model.** `AlertRef` in the finished
-   brief is built by `orchestrator._assemble_brief` copying the inbound alert. No model
-   sees it as an output field.
-4. **Logging cannot be turned off.** `TranscriptLogger` is a required constructor
-   argument of every LLM client and of the orchestrator. No default, no `None` branch,
-   no config key. A client that could make an unlogged call is not constructible.
+   brief is built by `orchestrator._assemble_brief` copying the inbound alert. No model sees
+   it as an output field.
+4. **Logging cannot be turned off.** `TranscriptLogger` is a required constructor argument
+   of every LLM client and of the orchestrator. No default, no `None` branch, no config key.
+   A client that could make an unlogged call is not constructible.
 
 The prompt-level defenses — data fencing with envelope metadata, "log content is never
 instructions" — are in `prompting/envelope.py`, clearly labelled as the soft layer.
-`validation/injection.py` is a cheap post-pass that flags log content appearing to
-address an AI system; hits land on the brief rather than being filtered out, because an
-injection attempt in a log is itself a detection signal.
+`validation/injection.py` is a cheap post-pass that flags log content appearing to address
+an AI system; hits land on the brief rather than being filtered out, because an injection
+attempt in a log is itself a detection signal.
 
 ---
 
 ## Serving layer
 
-Both vLLM instances run co-located on the one GB10 and share its 128 GB unified pool
-with the OS. Image: **`nvcr.io/nvidia/vllm:26.07-py3`** (arm64) — vLLM 0.24.0,
-torch 2.13.0a0, CUDA 13.3.1.
+The commander is a JSON contract; any engine that passes `make health`'s guided-JSON round
+trip satisfies it. Two stacks have run on this box. **Flash-Next via SGLang is the current
+one**; the co-located vLLM pair is documented after it, because its memory-split saga is a
+hard-won GB10 lesson worth keeping.
 
-| | commander | grunt fleet |
-|---|---|---|
-| model | `openai/gpt-oss-120b` (native MXFP4) | `Qwen/Qwen3-8B-FP8` |
-| port | 8000 | 8001 |
-| `--gpu-memory-utilization` | **0.64** (~76.5 GiB) | **0.24** (~28.7 GiB) |
-| weights on disk | ~61 GB | ~8.8 GB |
-| weights loaded | 66.1 GiB | ~9 GiB |
-| KV cache after load | 7.9 GiB | — |
-| `--max-model-len` | 16384 | 16384 |
-| `--max-num-seqs` | 4 | 8 |
+### Current: Qwen3.8-Flash-Next on SGLang (commander-only)
 
-**0.64 + 0.24 = 0.88** of the ~119.6 GiB vLLM actually sees (not the nominal 128 GB).
-With both models loaded and serving, `free -g` reports **114 of 121 GB used, ~6 GB
-available**. That is the real headroom, and it is thinner than the arithmetic suggests
-because container runtime and per-process overhead sit outside both fractions. It works,
-but do not run anything else heavy on this box during an investigation, and treat 0.88
-as the ceiling rather than a starting point.
+The 125B ultra-sparse MoE `Qwen3.8-Flash-Next` (6B active params, nvidia NVFP4 tree) runs
+as the commander via **SGLang** on `:18400`, with the grunt pointed at the same endpoint
+and the vLLM pair down. `deploy/flashnext/` holds the scripts, adapted from
+single-spark-ai's DGX-Spark recipe. Cutover: `make down`, then
+`bash deploy/flashnext/probe-image.sh` (CPU-only, confirms the pinned image knows
+`qwen4_exp`), then `bash deploy/flashnext/launch-flash-next.sh`, then swap the
+`[models.commander]` / `[models.grunt]` blocks in `config.toml` to the Flash-Next pair and
+run `make health`. Rollback is `docker stop flashnext-commander && make up` plus reverting
+the config. Sampling is Qwen's instruct recommendation (temp 0.7, top_p 0.8), not the 0.2
+used for gpt-oss: Qwen MoEs repetition-loop at low temperature. Thinking is disabled via the
+chat template, because guided JSON and a think-block fight over the first token.
 
-These are measured, not estimated. The first boot at 0.55/0.28 failed with *"No
-available memory for the cache blocks"* and `Available KV cache memory: -1.95 GiB`. Two
-things had been underestimated: gpt-oss-120b loads to **66.1 GiB**, ~5 GiB more than its
-on-disk size (MXFP4 scales and padding), and CUDA graph capture reserves another 1.6 GiB.
-The floor for this model is ~0.57 just to start. `--max-model-len` came down to 16384 at
-the same time — the KV cache must hold at least one full-length sequence, and the largest
-prompt the commander ever builds is a few thousand tokens, so 32k of headroom bought
-nothing out of an 8 GiB budget.
-
-The lines to watch on every boot are `Available KV cache memory` and `maximum
-concurrency`; they move when the model, the context length, or the vLLM version changes.
-At this split they read 7.9 GiB / 12.39x for the commander and 18.03 GiB / 8.01x for the
-grunt, both comfortably above what `--max-num-seqs` asks for.
-
-Why static fractions — this is the shipped flag's own help text, not folklore:
-
-> This is a per-instance limit, and only applies to the current vLLM instance. It does
-> not matter if you have another vLLM instance running on the same GPU. For example, if
-> you have two vLLM instances running on the same GPU, you can set the GPU memory
-> utilization to 0.5 for each instance.
-
-So two static fractions coexist by construction. The default is **0.92**, and NVIDIA's
-release notes name that as the cause of OOM on unified-memory systems (DGX Spark,
-Jetson) — explicit fractions are the documented fix, not a preference. Neither instance
-is allowed to autodetect "all available memory": on this box that starves the OS, and
-whichever instance starts second loses.
-
-The commander gets the larger share because its weights are ~7× bigger. The grunt's 0.24
-is still generous relative to its ~9 GiB of weights, because the rest is KV cache and
-that is what absorbs a whole batch of concurrent workers reading long slices — it is the
-instance that actually sees concurrency.
-
-**GB10 specifics**, verified inside the pulled image rather than assumed: torch reports
-compute capability `(12, 1)` (sm_121), served by the sm_120-family binaries and
-`compute_120` PTX the image ships; the registered quantization methods include both
-`mxfp4` and a dedicated `gpt_oss_mxfp4` path. Quantization is auto-detected from each
-model's config, so neither service passes `--quantization`.
-
-**Start order matters.** vLLM has a known memory-accounting issue when a second instance
-starts while another is still profiling (vllm-project/vllm#10643), so
-`deploy/docker-compose.yml` gates the grunt service on the commander's healthcheck. Big
-model first, always.
-
-**One grunt instance serves every grunt.** Concurrency comes from vLLM's continuous
-batching. One instance per agent would duplicate the weights and buy nothing.
-
-The fractions live in `deploy/commander.env` and `deploy/grunt.env` and are deliberately
-not repeated in `config/config.toml` — one place to be wrong instead of two.
-
----
-
-## Running it
-
-### Bringing the endpoints up
-
-`make setup` and `make weights` are one-time; the rest is the service lifecycle.
-
-```bash
-make setup          # venv + editable install
-make weights        # fetch ~72 GB of weights into the shared HF cache
-make up             # start both vLLM instances (commander first)
-make health         # /health, served model name, guided-JSON round trip, both ports
-make ps             # service state, including health
-make restart-grunt  # bounce one service after editing deploy/*.env
-make down           # when you want the GPU back
-```
-
-`make restart-grunt` recreates just the grunt, waits for health, and prints the command
-line it is actually serving with so you can confirm a flag took. Use it rather than
-`make down && make up` after a grunt env edit: the commander takes ~8 minutes to load
-62 GB of weights, and bouncing the stack to change a grunt flag throws that away.
-
-**`make restart SERVICE=commander` refuses, and `make restart-commander` cycles the whole
-stack.** The commander cannot be restarted on its own. Its checkpoint is 62 GB against
-121 GB of unified memory shared with the OS; if the grunt is resident it holds ~28 GiB,
-leaving less room than the checkpoint needs. The kernel then reclaims page cache faster
-than the loader can stream it and the load thrashes indefinitely — no crash, no OOM kill,
-no container restart, just "Starting to load model" forever with memory sawtoothing
-between ~28 and ~60 GB. That is a worse failure than an error because it looks like
-progress. The commander has to come up into an empty box, which is the ordering `make up`
-already enforces through the grunt's healthcheck gate.
-
-`make weights` is not optional convenience. `openai/gpt-oss-120b` is 195.8 GB in full,
-but vLLM loads only the root `model-*-of-00014.safetensors` (~62 GB) — the rest is
-`metal/model.bin` (65 GB, Apple silicon) and `original/` (67 GB). Letting the server
-fetch the repo blind downloads three times what it needs, and a cold download inside the
-container outlasts the commander's healthcheck window — which the grunt service gates
-on, so you would end up with one server instead of two and no obvious reason why. The
-target filters the patterns and is resumable.
-
-### Investigating
-
-`analyze.py` starts nothing heavy: it assumes `make up` already brought the endpoints
-online, and it preflights them before the orchestrator leaves `RECEIVED`.
-
-```bash
-./analyze.py cases/my-case          # investigate
-./analyze.py cases/my-case --stub   # same code path, no GPU
-./analyze.py --init cases/new-case  # scaffold an empty case folder
-./abort.py                          # stop a run in progress, keep the brief
-```
-
-A **case folder** is the whole input format:
-
-```
-cases/my-case/
-    alert.json      the alert an external detector already raised — required
-    logs/           your raw logs, any text format — required
-```
-
-That is it. There is nothing to hand-author and nothing to configure: every file in
-`logs/` becomes searchable. `fixtures/` is itself a case folder, so `./analyze.py fixtures`
-runs the bundled demo — that is all `make demo` and `make demo-offline` do now.
-
-**Graded scenarios.** Two seeded generators write graded cases, each with a
-`GROUND_TRUTH.md` at the case root (which `analyze.py` never reads):
-
-- `scripts/make_dns_tunnel_case.py` → `cases/dns-tunnel` — a bursty DNS tunnel with
-  payload-bearing answers and four tunnel-shaped benign decoys.
-- `scripts/make_http_c2_case.py` → `cases/http-c2` — a **periodic** HTTP beacon (the
-  timing opposite of the tunnel: ~60 s jittered check-ins, not bursts), an anomalous
-  constant User-Agent, and outbound POST exfil. Its lead decoy is an internal monitoring
-  agent that heartbeats on a fixed interval from many hosts *including the victim*, so
-  "beacons periodically to one host" is benignly true — the case is built to prove the
-  commander's timing conclusions are evidence-driven, not templated.
-- `scripts/make_wmi_lsass_case.py` → `cases/wmi-lsass` — Windows **host** telemetry
-  (Security + Sysmon as JSON lines, not network logs), a WMI lateral-movement into an
-  LSASS credential dump. The timing is a **single ~80 s chain**, the opposite again of
-  both a beacon and a burst. It is derived from two public EVTX attack samples
-  (sbousseaden/EVTX-ATTACK-SAMPLES, GPL-3.0) with every identifier re-seeded; run
-  `make case-wmi-lsass` to fetch the samples and build it (needs the `cases` extra:
-  `pip install -e ".[cases]"`). Its killer decoy is an SCCM agent that runs the *exact*
-  `WmiPrvSE.exe → cmd.exe` pair the alert matches, on every host all day — so the shallow
-  signature the alert fires on is benignly true estate-wide, and the intrusion is only
-  visible by pivoting to the logon source, the account, and the lsass access. The
-  discriminators live in named fields (`LogonType`, `IpAddress`, `GrantedAccess`,
-  `SubjectLogonId`), which the `field=` selector reads on a `.jsonl` file exactly as it
-  reads a Zeek `#fields` column — a JSON key, dotted for nesting; the commander is shown
-  each JSON file's keys the way it is shown a Zeek header.
-- `scripts/make_schtask_case.py` → `cases/schtask-persist` — Windows host telemetry again,
-  a scheduled-task persistence with a fourth, distinct timing signature: **install-then-fire**.
-  A remote actor registers a task (Security 4698) whose action is an encoded PowerShell
-  payload, and roughly an hour later the task runs on its own schedule, in SYSTEM context
-  with **no logon in front of it**, executing the same payload. The two phases are joined by
-  the base64 payload itself — the identical value on lines an hour apart, which is exactly
-  what the synthesis recap's shared-identifier note surfaces. Its killer decoy is the fleet
-  of benign scheduled tasks (GoogleUpdate, Edge, SCCM) that register and fire on every host
-  all day: the *same 4698 event* the alert matches, so the discriminator is the task's
-  action, not that a task exists. `make case-schtask-persist` to build it.
-
-`scripts/grade.py` scores a brief against a case, keyed by folder name — a new scenario is
-one entry in its `CASES` registry plus a generator, no change to the grading machinery.
-`make grade RUN=out/<id> CASE=cases/http-c2` selects the rubric; the default is
-`cases/dns-tunnel`. On why the attack *patterns* being public does not skew results: every
-identifier — IPs, hosts, domains, User-Agents, timestamps, volumes — is novel and seeded,
-so pattern knowledge helps the model the way it helps a human analyst, and there is no
-specific case to memorize. Contamination that did leak in would degrade into a *visible*
-failure here rather than silent score inflation: a memorized fact the model was never
-shown cannot be cited, so it lands in `uncited_claims` (see "The four guarantees").
-
-**How logs become visible.** `corpus.py` loads every file and indexes it by line, so every
-search result carries a `<file>:L<n>` reference that resolves back to the exact line. Then
-`profiling.py` counts the corpus — line-shape frequencies, shapes occurring only a handful
-of times, high-entropy token families with how many distinct hosts emit each, and
-contiguous activity bursts — and that profile is the commander's first page.
-
-Nothing there is inferred. On the bundled 1 MB DNS case the profile is built in 0.31 s and
-puts the NS delegation, which occurs once in 5,586 lines, on that page as the only rare
-shape in the file.
-
-**Cost no longer scales with the corpus.** Searching is free; what is paid for is the
-commander's turn around each result. A 40 MB case costs roughly what a 1 MB case costs — a
-bigger corpus mostly means each search returns more. `analyze.py` prints the step budget
-and a worst-case wall-clock before starting, calibrated on observed seconds per step from
-the last real run on this machine, and asks to proceed. Most investigations end early with
-`conclude`; `./abort.py` is there when you change your mind.
-
-Output, one directory per run:
-
-```
-out/<investigation_id>/
-    transcript.jsonl        canonical: every LLM call, transition and validation, one
-                            JSON object per line, flushed as it goes
-    transcript.json         readable view of the same, written at close
-    brief.json              the artifact for the operator (absent if the run failed)
-    run_meta.json           config snapshot, model ids, git sha, terminal state
-    stats.json              performance counters, for comparing runs
-```
-
-`transcript.jsonl` stays canonical because it is the only form a dying run can leave
-usable — a single pretty-printed array cannot be written incrementally. The readable view
-splits multi-line strings into arrays of lines, because indenting JSON does nothing for
-prompts: `\n` inside a string stays escaped however you format the document. Join a list
-with `\n` to recover the canonical string.
-
-`stats.json` carries what you want when comparing runs: wall clock and time per phase,
-per-role call counts, retries and latency spread, token usage, rejection rate broken
-down by reason, `seconds_per_step` (which is what calibrates the next run's estimate), and
-— from vLLM's own `/metrics`, snapshotted before and after and reported as deltas —
-server-side tokens, mean end-to-end latency, time to first token and **prefix-cache hit
-rate**. That last one matters more than it did: consecutive commander turns share the
-alert, the profile and all but the newest steps, so the shared prefix is now most of the
-prompt rather than a tenth of it.
-Machine counters (GPU utilisation, power, temperature, host memory) are sampled every 5 s
-during the run. GPU memory is reported as `null` rather than zero — GB10 shares the host
-pool and `nvidia-smi` returns `[N/A]`, and an absent measurement is not a measurement of
-zero.
-
-`brief.json` carries a `step_ledger`: every question the commander asked, why it asked,
-what it expected *before* seeing the result, what came back, and the shell command that
-reproduces it. Read that first — it is what makes the brief checkable without re-running a
-GPU. Then two audit fields: `unresolved_citations`
-(references to lines the commander was never actually shown) and `uncited_claims` (evidence written
-with no reference at all).
-
-### Watching a run
-
-`analyze.py` streams the commander's reasoning live to stderr as it plans and
-synthesizes, and prints one line per grunt task with its observation count and whether
-its citations held up. `--quiet` turns it off. Progress goes to stderr and results to
-stdout, so `./analyze.py case > result.txt` still behaves.
-
-### Stopping a run
-
-```bash
-./abort.py            # graceful: finish in-flight readers, then synthesize what we have
-./abort.py --hard     # cancel in-flight work, write no brief
-./abort.py --list     # what is running
-```
-
-Graceful is the useful one: you get a brief from the reports already collected. Cancelled
-tasks are recorded as failures with reason `aborted`, so unexamined ground stays visible
-as unexamined rather than turning into absence of evidence. The transcript is complete
-either way, because it is written as the run goes rather than at the end.
-
-A graceful abort ends in `DONE` — synthesis really did complete — so the brief carries a
-code-stamped `aborted_by_operator` flag as well. The commander is *asked* to record the
-abort in `coverage_gaps` and generally does, but asking a model to disclose a limitation
-is not a guarantee; the flag is. Nobody reading `brief.json` alone should mistake an
-interrupted run for a complete one.
-
-Two more things to know: an abort that lands before any report exists stops without a
-brief (synthesizing over nothing wastes two minutes), and once the run reaches
-`SYNTHESIZING` it finishes — interrupting the single call that produces the artifact
-would throw away the run's product.
-
-### Swapping models
-
-`config/config.toml` holds every endpoint and model name. Commander and grunt models are
-swappable without touching code — the contract is a JSON schema, not a model. There is a
-stubbed `[models.evaluator]` entry (`enabled = false`) as the seam for a future cloud
-frontier judge; nothing reads it yet beyond the config loader.
-
-The commander block carries commented alternates for each model that has been trialled —
-`Qwen3.8-27B` and `Qwen3.8-Flash-Next` — with the exact cutover and rollback steps inline.
-`make health`'s guided-JSON round trip is the arbiter for any swap; a served model that
-passes it satisfies the contract regardless of which engine is behind the endpoint.
-
-### Serving Qwen3.8-Flash-Next (SGLang, commander-only)
-
-An alternative to the co-located vLLM pair: run the 125B ultra-sparse MoE
-`Qwen3.8-Flash-Next` (6B active params) as the commander via **SGLang**, with the grunt
-disabled. `deploy/flashnext/` holds the scripts, adapted from single-spark-ai's DGX-Spark
-recipe. Cutover is `make down`, then `bash deploy/flashnext/probe-image.sh` (CPU-only,
-confirms the pinned image knows `qwen4_exp`), then `bash deploy/flashnext/launch-flash-next.sh`,
-then swap the commented `[models.commander]` / `[models.grunt]` blocks in `config.toml` to
-the Flash-Next pair and run `make health`. Rollback is `docker stop flashnext-commander &&
-make up` plus reverting the config. First graded run: 7/7 on `cases/dns-tunnel`, zero
-coercion, zero malformed citations.
-
-**Grunt-only-off, not gone.** The model's resident set (~80 GiB weights + KV + the mmap'd
-PLE table's page cache) leaves ~21 GiB, no room for a second model. Both roles point at the
+**Grunt-off, not gone.** The model's resident set (~80 GiB weights + KV + the mmap'd PLE
+table's page cache) leaves ~21 GiB — no room for a second model. Both roles point at the
 one endpoint; `close_read` has fired zero times in 10+ graded runs, so nothing real is lost.
 
 **Three GB10-specific pitfalls are baked into `launch-flash-next.sh` and must not be
@@ -541,6 +267,191 @@ one endpoint; `close_read` has fired zero times in 10+ graded runs, so nothing r
 3. **KV cache must stay bf16.** The image's native SM121 QSA kernel is gated to BF16 KV;
    `--kv-cache-dtype fp8_e4m3` is rejected at CUDA-graph capture. At 131k tokens the cost of
    bf16 KV is 1.5 GB — irrelevant here.
+
+Docker on this box needs `sg docker -c "..."` from a fresh shell until the login session
+picks up the docker group.
+
+### Previous: the co-located vLLM pair, and the memory-split lesson
+
+The original stack ran two vLLM instances co-located on the one GB10, sharing its 128 GB
+unified pool with the OS. Image **`nvcr.io/nvidia/vllm:26.07-py3`** (arm64) — vLLM 0.24.0,
+torch 2.13.0a0, CUDA 13.3.1. `config.toml` keeps this block commented as the fallback: if
+Flash-Next fails to load, uncommenting it and `make up` brings back `openai/gpt-oss-120b`
+(commander, `:8000`) and `Qwen/Qwen3-8B-FP8` (grunt, `:8001`).
+
+| | commander | grunt fleet |
+|---|---|---|
+| model | `openai/gpt-oss-120b` (native MXFP4) | `Qwen/Qwen3-8B-FP8` |
+| port | 8000 | 8001 |
+| `--gpu-memory-utilization` | **0.64** (~76.5 GiB) | **0.24** (~28.7 GiB) |
+| `--max-model-len` / `--max-num-seqs` | 16384 / 4 | 16384 / 8 |
+
+**0.64 + 0.24 = 0.88** of the ~119.6 GiB vLLM actually sees (not the nominal 128 GB). With
+both loaded and serving, `free -g` reports 114 of 121 GB used, ~6 GB available — thinner
+than the arithmetic, because container and per-process overhead sit outside both fractions.
+
+These fractions are measured, not estimated, and that is the lesson. The first boot at
+0.55/0.28 failed with *"No available memory for the cache blocks"* and
+`Available KV cache memory: -1.95 GiB`: gpt-oss-120b loads to **66.1 GiB**, ~5 GiB more than
+its on-disk size (MXFP4 scales and padding), and CUDA graph capture reserves another
+1.6 GiB — a ~0.57 floor just to start. The lines to watch on every boot are `Available KV
+cache memory` and `maximum concurrency`; they move when the model, context length, or vLLM
+version changes. Static fractions are the documented fix, not a preference — vLLM's default
+0.92 is named in NVIDIA's release notes as the cause of OOM on unified-memory systems, and
+the flag's own help text says two instances coexist by construction at explicit fractions.
+Neither instance may autodetect "all available memory": on this box that starves the OS and
+whichever starts second loses. **Start order matters** (vllm#10643): `docker-compose.yml`
+gates the grunt on the commander's healthcheck. Big model first, always. One grunt instance
+serves every grunt — concurrency is vLLM's continuous batching; duplicating the weights
+would buy nothing.
+
+The fractions live in `deploy/commander.env` and `deploy/grunt.env`, deliberately not
+repeated in `config/config.toml` — one place to be wrong instead of two.
+
+---
+
+## Running it
+
+`make setup` and (for the vLLM stack) `make weights` are one-time; the rest is the service
+lifecycle. To bring the current commander up, see "Serving layer" above; to bring the vLLM
+pair up:
+
+```bash
+make setup          # venv + editable install
+make weights        # fetch ~72 GB of weights into the shared HF cache (vLLM stack)
+make up             # start both vLLM instances (commander first)
+make health         # /health, served model name, guided-JSON round trip
+make ps             # service state, including health
+make down           # when you want the GPU back
+```
+
+**The commander cannot be restarted on its own** on the vLLM stack. `make restart
+SERVICE=commander` refuses; `make restart-commander` cycles the whole stack. Its checkpoint
+is 62 GB against 121 GB shared with the OS; if the grunt is resident it holds ~28 GiB,
+leaving less room than the checkpoint needs, and the load thrashes indefinitely — no crash,
+no OOM kill, just "Starting to load model" forever with memory sawtoothing. That is worse
+than an error because it looks like progress. `make restart-grunt` bounces just the grunt
+after an env edit and prints the command line it is serving so you can confirm a flag took.
+
+### Investigating
+
+`analyze.py` starts nothing heavy: it assumes the endpoint is already up and preflights it
+before the orchestrator leaves `RECEIVED`.
+
+```bash
+./analyze.py cases/my-case          # investigate
+./analyze.py cases/my-case --stub   # same code path, no GPU
+./analyze.py --init cases/new-case  # scaffold an empty case folder
+./abort.py                          # stop a run in progress, keep the brief
+```
+
+A **case folder** is the whole input format:
+
+```
+cases/my-case/
+    alert.json      the alert an external detector already raised — required
+    logs/           your raw logs, any text format (TSV, JSON lines, syslog) — required
+```
+
+That is it. There is nothing to hand-author and nothing to configure: every file in
+`logs/` becomes searchable, and a `.jsonl` file's keys are read exactly as a Zeek header's
+columns are. `fixtures/` is itself a case folder, so `./analyze.py fixtures` runs the
+bundled demo — that is all `make demo` and `make demo-offline` do.
+
+Output, one directory per run:
+
+```
+out/<investigation_id>/
+    transcript.jsonl        canonical: every LLM call, transition and validation, one JSON
+                            object per line, flushed as it goes
+    transcript.json         readable view of the same, written at close
+    brief.json              the artifact for the operator (absent if the run failed)
+    run_meta.json           config snapshot, model ids, git sha, terminal state
+    stats.json              performance counters, for comparing runs
+```
+
+`transcript.jsonl` stays canonical because it is the only form a dying run can leave usable
+— a single pretty-printed array cannot be written incrementally. `brief.json` carries a
+`step_ledger`: every question the commander asked, why, what it expected *before* the
+result, what came back, and the shell command that reproduces it. Read that first — it is
+what makes the brief checkable without a GPU. Two audit fields follow: `unresolved_citations`
+(references to lines never actually shown) and `uncited_claims` (evidence written with no
+reference). `stats.json` carries wall clock and per-phase time, per-role call counts,
+retries, token usage, rejection rate by reason, `seconds_per_step` (which calibrates the
+next run's estimate) and, from the server's `/metrics`, the prefix-cache hit rate — which
+matters because consecutive commander turns share the alert, the profile and all but the
+newest steps.
+
+### Watching and stopping a run
+
+`analyze.py` streams the commander's reasoning live to stderr as it plans and synthesizes;
+`--quiet` turns it off. Results go to stdout, so `./analyze.py case > result.txt` behaves.
+
+```bash
+./abort.py            # graceful: finish in-flight readers, then synthesize what we have
+./abort.py --hard     # cancel in-flight work, write no brief
+./abort.py --list     # what is running
+```
+
+A graceful abort ends in `DONE` and stamps a code-level `aborted_by_operator` flag on the
+brief, so nobody reading `brief.json` alone mistakes an interrupted run for a complete one.
+The commander is *asked* to record the abort in `coverage_gaps` and generally does, but the
+flag is the guarantee. Once a run reaches `SYNTHESIZING` it finishes — interrupting the one
+call that produces the artifact would throw the run's product away.
+
+### Swapping models
+
+`config/config.toml` holds every endpoint and model name; commander and grunt are swappable
+without touching code, because the contract is a JSON schema. It keeps commented alternates
+for each model trialled (`gpt-oss-120b`, `Qwen3.8-27B`, `Qwen3.8-Flash-Next`) with exact
+cutover and rollback steps inline. `make health`'s guided-JSON round trip is the arbiter for
+any swap: a served model that passes it satisfies the contract regardless of the engine
+behind the endpoint. A stubbed `[models.evaluator]` (`enabled = false`) is the seam for a
+future cloud frontier judge; nothing reads it yet.
+
+---
+
+## The cases
+
+`analyze.py` runs any case folder; the four seeded generators write *graded* cases, each
+with a `GROUND_TRUTH.md` at the case root (which `analyze.py` never reads) and a rubric in
+`scripts/grade.py`. Each case is built to be a different *timing signature* and to carry
+benign decoys that defeat the obvious heuristic, so a brief is judged on evidence-driven
+reasoning rather than template-matching. Every identifier — IPs, hosts, domains,
+User-Agents, timestamps, volumes — is novel and seeded, so pattern knowledge helps the
+model the way it helps a human analyst and there is no specific case to memorize;
+contamination that did leak in degrades into a *visible* failure (a memorized fact the
+model was never shown cannot be cited, so it lands in `uncited_claims`).
+
+- **`cases/dns-tunnel`** (`make_dns_tunnel_case.py`) — a **bursty** DNS tunnel with
+  payload-bearing answers and four tunnel-shaped benign decoys (DNSBL, AV reputation, CDN
+  cache keys, DKIM).
+- **`cases/http-c2`** (`make_http_c2_case.py`) — a **periodic** HTTP beacon (~60 s jittered
+  check-ins), an anomalous constant User-Agent, and outbound POST exfil. Its killer decoy is
+  an internal monitoring agent that heartbeats on a fixed interval from many hosts including
+  the victim, so "beacons periodically to one host" is benignly true.
+- **`cases/wmi-lsass`** (`make_wmi_lsass_case.py`, `make case-wmi-lsass`) — Windows **host**
+  telemetry (Security + Sysmon as JSON lines), a WMI lateral-movement into an LSASS
+  credential dump, timed as a **single ~80 s chain**. Derived from two public EVTX attack
+  samples (sbousseaden/EVTX-ATTACK-SAMPLES, GPL-3.0) with every identifier re-seeded. Its
+  killer decoy is an SCCM agent running the *exact* `WmiPrvSE.exe → cmd.exe` pair the alert
+  matches, on every host all day, so the intrusion is only visible by pivoting to the logon
+  source, the account, and the lsass access (`field=` on `LogonType`, `IpAddress`,
+  `GrantedAccess`).
+- **`cases/schtask-persist`** (`make_schtask_case.py`, `make case-schtask-persist`) — Windows
+  host telemetry, a scheduled-task persistence timed as **install-then-fire**: a task
+  (Security 4698) whose action is an encoded PowerShell payload is registered, and ~an hour
+  later runs on its own schedule in SYSTEM context with no logon in front of it, executing
+  the same payload. The two phases are joined by the base64 payload — the identical value on
+  lines an hour apart, which the synthesis recap's shared-identifier note surfaces. Its
+  killer decoy is the fleet of benign scheduled tasks (GoogleUpdate, Edge, SCCM) that
+  register and fire on every host, so the discriminator is the task's *action*, not that a
+  task exists. The `decode` skill turns its `-Enc` payload into the command it runs.
+
+The Windows cases need the `cases` extra (`pip install -e ".[cases]"`, which adds
+`python-evtx`). `make grade RUN=out/<id> CASE=cases/<name>` selects the rubric; the default
+is `cases/dns-tunnel`. A new scenario is one entry in `scripts/grade.py`'s `CASES` registry
+plus a generator — no change to the grading machinery.
 
 ---
 
@@ -644,11 +555,12 @@ Explicitly not in this build, with the seam each one will land on:
   be re-derived with `grep` and `sort`.
 - **Eval harness.** Seam: the `LLMClient` protocol (`llm/base.py`) plus the
   `[models.evaluator]` config entry. The transcript corpus is the eval set.
-- **Synthetic scenario generation.** No longer a non-goal — `scripts/make_dns_tunnel_case.py`
-  and `scripts/make_http_c2_case.py` are the two generators, each writing a graded case
-  folder plus a `GROUND_TRUTH.md`, with `scripts/grade.py` scoring against a case-keyed
-  rubric. The seam held: a case folder is just `alert.json` + `logs/`, so a generator
-  writes one and `./analyze.py` runs it unchanged.
+- **Synthetic scenario generation.** No longer a non-goal — four generators
+  (`make_dns_tunnel_case.py`, `make_http_c2_case.py`, `make_wmi_lsass_case.py`,
+  `make_schtask_case.py`) each write a graded case folder plus a `GROUND_TRUTH.md`, with
+  `scripts/grade.py` scoring against a case-keyed rubric (see "The cases"). The seam held:
+  a case folder is just `alert.json` + `logs/`, so a generator writes one and
+  `./analyze.py` runs it unchanged.
 - **Multi-machine serving.** Endpoints are per-role in config rather than assumed
   co-located, so a second box is a config edit.
 - **Latency and throughput tuning.** Deliberate. This box is bandwidth-bound and the
