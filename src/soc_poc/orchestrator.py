@@ -397,6 +397,8 @@ class Orchestrator:
                         "time_range": f.time_range,
                         "top_templates": f.top_templates,
                         "rare_shapes": [s.model_dump() for s in f.rare_shapes],
+                        "categorical": [d.model_dump() for d in f.categorical],
+                        "is_json": f.is_json,
                     }
                     for f in profile.files
                 ],

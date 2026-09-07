@@ -26,12 +26,11 @@ digit-range regexes for four steps to fetch "the big ones".
 
 from __future__ import annotations
 
-import json
 import re
 import statistics
 from dataclasses import dataclass, field
 
-from soc_poc.corpus import Corpus, Hit
+from soc_poc.corpus import Corpus, Hit, _json_value, _resolve_field
 from soc_poc.profiling import (
     _DOMAIN,
     _IP,
@@ -92,55 +91,11 @@ def _fmt_number(value: float) -> str:
     return f"{value:g}"
 
 
-def _json_value(obj: dict, path: str) -> str | None:
-    """The value at a dotted key path in a JSON object, as the string the selectors
-    aggregate, or None when the path is absent.
-
-    Keys match case-insensitively at each level (`field="ipaddress"` finds `IpAddress`,
-    the way #fields names are lowercased). Numbers keep their JSON spelling so
-    `_NUMERIC` still sees them; booleans and null become their JSON words; nested
-    containers are re-serialised compactly so a tally over them still counts shapes.
-    """
-    current: object = obj
-    for part in path.split("."):
-        if not isinstance(current, dict):
-            return None
-        lowered = {k.lower(): k for k in current}
-        key = lowered.get(part.strip().lower())
-        if key is None:
-            return None
-        current = current[key]
-    if current is None:
-        return "null"
-    if isinstance(current, bool):
-        return "true" if current else "false"
-    if isinstance(current, (int, float)):
-        return str(current)
-    if isinstance(current, str):
-        return current
-    return json.dumps(current, separators=(",", ":"))
-
-
 def _clip(value: str) -> str:
     if len(value) <= VALUE_MAX_CHARS:
         return value
     half = VALUE_MAX_CHARS // 2 - 2
     return f"{value[:half]}…{value[-half:]}"
-
-
-def _resolve_field(selector: str, field_map: dict[str, int]) -> int | None:
-    """A field selector -> 0-based column index, or None if it cannot be resolved.
-
-    A selector is a `#fields` name (resolved through the map) or a 1-based column number
-    (for a delimited file with no header). Everything else is unresolvable, and the caller
-    turns that into an error that lists the available names.
-    """
-    name = selector.strip().lower()
-    if name in field_map:
-        return field_map[name]
-    if name.isdigit() and int(name) >= 1:
-        return int(name) - 1
-    return None
 
 
 def _selected_rows(

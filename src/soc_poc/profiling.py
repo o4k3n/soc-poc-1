@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from soc_poc.corpus import Corpus
+from soc_poc.corpus import CATEGORICAL_TOP_VALUES, Corpus
 
 _ISO_TS = re.compile(r"\b(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})(?:\.\d+)?Z?\b")
 _EPOCH_TS = re.compile(r"^(\d{10})\.\d{3,6}\b")
@@ -211,6 +211,23 @@ class Burst(BaseModel):
     events: int
 
 
+class FieldDistribution(BaseModel):
+    """One record-type axis of a file: a low-cardinality field and its value counts.
+
+    `coverage` is the fraction of the file's event lines that carry the field, so a master
+    axis present on every line (event_id) reads 1.0 and a subtype present on a slice
+    (LogonType, only on logon events) reads lower.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    field: str
+    distinct: int
+    coverage: float
+    values: list[tuple[str, int]] = Field(default_factory=list)
+    more: int = 0
+
+
 class FileProfile(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -219,6 +236,11 @@ class FileProfile(BaseModel):
     time_range: str
     top_templates: list[tuple[str, int]] = Field(default_factory=list)
     rare_shapes: list[RareShape] = Field(default_factory=list)
+    # The record-type scope: which record kinds this file holds, computed. Empty for a
+    # file with no low-cardinality axis (a free-text log). Needs the corpus, so it is only
+    # filled when _profile_file is given one.
+    categorical: list[FieldDistribution] = Field(default_factory=list)
+    is_json: bool = False
 
 
 class CaseProfile(BaseModel):
@@ -244,7 +266,7 @@ def _is_event(line: str) -> bool:
     return bool(stripped) and not stripped.startswith("#")
 
 
-def _profile_file(name: str, lines: list[str]) -> FileProfile:
+def _profile_file(name: str, lines: list[str], corpus: Corpus | None = None) -> FileProfile:
     unique = _unique_tokens([_prenormalise(line) for line in lines if _is_event(line)])
     templates = Counter(_templatize(line, unique) for line in lines if _is_event(line))
     first_ref: dict[str, list[str]] = defaultdict(list)
@@ -262,6 +284,20 @@ def _profile_file(name: str, lines: list[str]) -> FileProfile:
         if count <= RARE_TEMPLATE_MAX
     ]
     rare.sort(key=lambda r: r.occurrences)
+
+    categorical: list[FieldDistribution] = []
+    if corpus is not None:
+        for field_name, distribution in corpus.categorical_fields(name):
+            occ = sum(count for _, count in distribution)
+            shown = distribution[:CATEGORICAL_TOP_VALUES]
+            categorical.append(FieldDistribution(
+                field=field_name,
+                distinct=len(distribution),
+                coverage=round(occ / events, 2) if events else 0.0,
+                values=shown,
+                more=len(distribution) - len(shown),
+            ))
+
     return FileProfile(
         file=name,
         lines=len(lines),
@@ -270,6 +306,8 @@ def _profile_file(name: str, lines: list[str]) -> FileProfile:
         ),
         top_templates=[(t, c) for t, c in templates.most_common(5)],
         rare_shapes=rare[:12] if events >= RARE_MIN_EVENTS else [],
+        categorical=categorical,
+        is_json=corpus.is_json(name) if corpus is not None else False,
     )
 
 
@@ -399,7 +437,7 @@ def build_profile(corpus: Corpus) -> CaseProfile:
     bursts, burst_subject = _bursts(files, subject)
 
     return CaseProfile(
-        files=[_profile_file(name, lines) for name, lines in files.items()],
+        files=[_profile_file(name, lines, corpus) for name, lines in files.items()],
         top_domains=domains.most_common(8),
         top_addresses=addresses.most_common(8),
         entropy_groups=groups,

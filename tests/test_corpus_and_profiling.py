@@ -248,3 +248,88 @@ def test_file_names_are_not_counted_as_domains() -> None:
     profile = build_profile(Corpus({"w.log": lines}))
     assert [d for d, _ in profile.top_domains] == ["example.net"]
     assert "cmd.exe" in ENTITY_PATTERNS["domain"].findall(lines[0])
+
+
+# --- record-type scope: the profile hands the commander its categorical axes -----------
+#
+# Pinned against the wmi-lsass run inv-20260906T231259Z-9966, which regex-crawled Windows
+# JSON logs, never tallied event_id, and never noticed the Sysmon process-access events.
+# The profile now precomputes the low-cardinality "record kinds" per file.
+
+
+def _win_security() -> "Corpus":
+    lines = []
+    for i in range(60):
+        eid = 4624 if i % 2 else 4688
+        lt = 3 if i % 3 == 0 else 2
+        lines.append(
+            f'{{"ts":"2026-09-07T08:00:{i:02d}Z","event_id":{eid},"channel":"Security",'
+            f'"computer":"WKS-1","LogonType":{lt},"TargetDomainName":"CORP",'
+            f'"uid":"u{i:08d}","CommandLine":"cmd /c thing number {i} with args {i*7}"}}'
+        )
+    return Corpus({"security.jsonl": lines})
+
+
+def test_categorical_fields_json_picks_event_id_and_logontype() -> None:
+    fields = dict(_win_security().categorical_fields("security.jsonl"))
+    assert "event_id" in fields and "LogonType" in fields
+    # event_id is on every line and named -> it sorts first.
+    order = [name for name, _ in _win_security().categorical_fields("security.jsonl")]
+    assert order[0] == "event_id"
+    assert dict(fields["event_id"]) == {"4688": 30, "4624": 30}
+    # channel is constant, TargetDomainName is constant -> not axes.
+    assert "channel" not in fields and "TargetDomainName" not in fields
+    # ts is timestamp-shaped and unique; uid is near-unique -> rejected.
+    assert "ts" not in fields and "uid" not in fields
+    # CommandLine is freetext (long, near-unique) -> rejected.
+    assert "CommandLine" not in fields
+
+
+def test_categorical_fields_tsv_picks_qtype_rejects_ids() -> None:
+    qtypes = ["A", "TXT", "CNAME", "AAAA", "NS"]
+    dns = [*ZEEK_HEADER]
+    for n in range(80):
+        dns.append(_zeek(f"17866945{n:02d}.100000", f"Cn{n:011d}", f"10.12.34.{n % 6 + 10}",
+                         f"host{n}.example.com", qtypes[n % len(qtypes)], "93.184.2.1"))
+    fields = dict(Corpus({"dns.log": dns}).categorical_fields("dns.log"))
+    assert "qtype_name" in fields
+    assert dict(fields["qtype_name"])["TXT"] == 16
+    # id.orig_h has only 6 distinct values here, so it is a valid axis (like computer
+    # on a host log); the high-cardinality columns are what must be rejected.
+    for rejected in ("uid", "query", "answers", "ts", "id.orig_p"):
+        assert rejected not in fields, rejected
+
+
+def test_categorical_fields_ignores_a_headerless_file(corpus: Corpus) -> None:
+    # dhcp.log has no #fields header and is not JSON -> no columns to reason about.
+    assert corpus.categorical_fields("dhcp.log") == []
+
+
+def test_column_values_reads_json_keys_and_tsv_columns(corpus: Corpus) -> None:
+    win = _win_security()
+    # LogonType is 3 when i%3==0 else 2 -> i=0,1,2 -> 3,2,2.
+    assert win.column_values("security.jsonl", "logontype")[:3] == ["3", "2", "2"]
+    assert win.column_values("security.jsonl", "nope") == []      # absent key -> empty
+    # TSV by #fields name and by 1-based number resolve the same column (qtype_name is col 6).
+    by_name = corpus.column_values("dns.log", "qtype_name")
+    by_num = corpus.column_values("dns.log", "6")
+    assert by_name == by_num and by_name.count("NS") == 1
+
+
+def test_file_profile_carries_the_distribution() -> None:
+    profile = build_profile(_win_security())
+    fp = next(f for f in profile.files if f.file == "security.jsonl")
+    assert fp.is_json is True
+    ev = next(d for d in fp.categorical if d.field == "event_id")
+    assert ev.distinct == 2 and ev.coverage == 1.0 and ev.more == 0
+    assert ev.values[0] in (("4688", 30), ("4624", 30))
+
+
+def test_render_profile_shows_scope_and_drops_json_templates() -> None:
+    from soc_poc.prompting.investigate import render_profile
+    rendered = render_profile(build_profile(_win_security()))
+    assert "record-type scope" in rendered
+    assert "event_id  (2 distinct value(s), on 100% of lines):" in rendered
+    assert "30x  4688" in rendered
+    # A JSON file with an axis suppresses the token-heavy line-shape templates.
+    assert "most common line shapes:" not in rendered

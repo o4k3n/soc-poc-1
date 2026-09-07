@@ -138,6 +138,14 @@ It is slow. Most questions are not this.
   conclude    stop and write the brief.
 
 How to work:
+  - Scope before you drill. The profile's record-type section lists, per file, which \
+kinds of record it holds and how many of each -- a file of Windows events is mostly \
+event_id 4624 (a logon), 4688 (a process starting), and so on. Different facts live in \
+different record kinds: who logged on is in one, what they ran is in another, what a \
+process touched is in a third. Read that section first, and before you conclude, account \
+for the record kinds the alert did NOT point you at -- the alert names one line; the \
+answer is usually in a kind of record it never mentions. A `tally field="<name>"` over \
+one of those fields is one step and turns a guessed regex into an exact distribution.
   - Aggregate before you fetch. Lines are your scarce resource: every line a search \
 returns stays in your working record for the rest of the run, and a broad search fills \
 that space with neighbourhood instead of answers. Numbers are nearly free. Before any \
@@ -146,7 +154,7 @@ then narrow the pattern until the lines you fetch are the ones that settle the q
 A result reading "showing the first {MAX_RESULTS} of 700" means the question was too \
 broad -- aggregate the 700 down to the discriminating value, then fetch that.
   - The profile below is computed, not inferred: every number in it is arithmetic over \
-the corpus and can be re-derived with grep. Trust it and start from it. The rare shapes \
+the corpus and can be re-derived with grep. Trust it and start from it. Read the record-type scope of each file first to learn its vocabulary. The rare shapes \
 and the entropy groups are there because they are where the answer usually is.
   - Establish quantities before narrative. "788 of 5,586 queries, from one host" is worth \
 more to an operator than any adjective.
@@ -172,7 +180,7 @@ not. Narrow it or count it; do not assume you saw all of it.
   - The step budget is a ceiling, not a cost. An unspent step is worth nothing to the \
 operator, and confirming the alert is not an investigation -- the detector already knew \
 that much. Before you conclude, you should be able to answer, or say why these logs \
-cannot: **which host and, if these logs record one, which user**, **whether the \
+cannot: **which record kinds and low-cardinality fields you have not yet examined** (the profile's scope names them; an unlooked-at record kind is an unasked question), **which host and, if these logs record one, which user**, **whether the \
 pattern is confined to that host or is \
 estate-wide**, **what the responses carried**, **what the domain resolves to and what \
 else touches that address**, **how the activity is distributed in time**, and **whether \
@@ -238,9 +246,27 @@ def render_profile(profile: CaseProfile) -> str:
 
     for file in profile.files:
         blocks.append(f"\n  {file.file} -- {file.lines} lines, {file.time_range}")
-        blocks.append("    most common line shapes:")
-        for template, count in file.top_templates:
-            blocks.append(f"      {count:>6}x  {template}")
+        if file.categorical:
+            blocks.append(
+                "    record-type scope (what kinds of record this file holds, counted; "
+                "reproduce any row with  tally field=\"<name>\", and pivot into one with "
+                "a search on that value):"
+            )
+            for dist in file.categorical:
+                blocks.append(
+                    f"      {dist.field}  ({dist.distinct} distinct value(s), on "
+                    f"{dist.coverage:.0%} of lines):"
+                )
+                for value, count in dist.values:
+                    blocks.append(f"        {count:>6}x  {value or '(empty)'}")
+                if dist.more:
+                    blocks.append(f"        … +{dist.more} more distinct value(s)")
+        # Line-shape templates are token-heavy and near-worthless on a JSON log once its
+        # record types are counted above; keep them only where there is no such axis.
+        if file.top_templates and not (file.is_json and file.categorical):
+            blocks.append("    most common line shapes:")
+            for template, count in file.top_templates:
+                blocks.append(f"      {count:>6}x  {template}")
         if file.rare_shapes:
             blocks.append(
                 "    RARE shapes (a line shape occurring only a handful of times among "

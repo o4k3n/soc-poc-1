@@ -18,8 +18,117 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+
+
+# -- field value extraction (shared by aggregation's selectors and the profile's scope) --
+#
+# These live here, not in aggregation, because profiling.py needs them too and importing
+# aggregation from profiling would be a cycle (aggregation imports profiling).
+
+
+def _resolve_field(selector: str, field_map: dict[str, int]) -> int | None:
+    """A field selector -> 0-based column index, or None if it cannot be resolved.
+
+    A selector is a `#fields` name (resolved through the map) or a 1-based column number
+    (for a delimited file with no header). Everything else is unresolvable, and the caller
+    turns that into an error that lists the available names.
+    """
+    name = selector.strip().lower()
+    if name in field_map:
+        return field_map[name]
+    if name.isdigit() and int(name) >= 1:
+        return int(name) - 1
+    return None
+
+
+def _json_value(obj: dict, path: str) -> str | None:
+    """The value at a dotted key path in a JSON object, as the string the selectors
+    aggregate, or None when the path is absent.
+
+    Keys match case-insensitively at each level (`field="ipaddress"` finds `IpAddress`,
+    the way #fields names are lowercased). Numbers keep their JSON spelling so a numeric
+    selector still sees them; booleans and null become their JSON words; nested containers
+    are re-serialised compactly so a tally over them still counts shapes.
+    """
+    current: object = obj
+    for part in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        lowered = {k.lower(): k for k in current}
+        key = lowered.get(part.strip().lower())
+        if key is None:
+            return None
+        current = current[key]
+    if current is None:
+        return "null"
+    if isinstance(current, bool):
+        return "true" if current else "false"
+    if isinstance(current, (int, float)):
+        return str(current)
+    if isinstance(current, str):
+        return current
+    return json.dumps(current, separators=(",", ":"))
+
+
+# -- record-type scope: which low-cardinality fields partition a file into record kinds ---
+#
+# A host log's event_id, a DNS log's qtype_name, an HTTP log's method are the axes an
+# analyst reads first: they say what KINDS of record the file holds and how many of each.
+# The profile precomputes these so the commander is handed the map instead of having to
+# think to tally for it. Detection is by shape, not by name, so it serves any log format;
+# a name match only breaks ties.
+CATEGORICAL_MIN_DISTINCT = 2       # one value is not an axis (drops channel/provider)
+CATEGORICAL_MAX_DISTINCT = 24      # above this it is an identifier space, not a record kind
+CATEGORICAL_CONSTANT_FRAC = 0.98   # top value >= 98% of a field's occurrences: effectively constant
+CATEGORICAL_MAX_UNIQUE_RATIO = 0.5 # distinct/occurrences: rejects uid, GUIDs, bare timestamps
+CATEGORICAL_MAX_MEAN_LEN = 48      # mean value length: rejects CommandLine, CallTrace, answers
+CATEGORICAL_MIN_COVERAGE = 0.02    # a field must appear on >= 2% of event lines
+CATEGORICAL_MAX_FIELDS = 4         # axes surfaced per file
+CATEGORICAL_TOP_VALUES = 12        # values shown per field before a "+N more" tail
+_CAT_TS = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}|\d{10}\.\d|[A-Z][a-z]{2}\s+\d{1,2}\s)"
+)
+# A mild first-tiebreak: when several fields qualify, lead with the one an analyst names.
+CATEGORICAL_PREFERRED_NAMES = frozenset({
+    "event_id", "eventid", "type", "logontype", "grantedaccess", "status", "status_code",
+    "action", "method", "qtype", "qtype_name", "rcode", "rcode_name", "proto", "service",
+    "conn_state",
+})
+
+
+def _categorical_rank(
+    field: str, values: list[str], total: int, max_distinct: int, min_coverage: float
+) -> tuple | None:
+    """A sort key if `field` is a record-type axis over `values`, else None (rejected).
+
+    total is the file's event-line count; coverage is how many of those carry the field.
+    The gates, in order: enough coverage, a small-but-plural distinct count, not
+    effectively constant, not near-unique (ids/timestamps), not timestamp-shaped, not
+    freetext by mean length.
+    """
+    occ = len(values)
+    if occ == 0 or occ / total < min_coverage:
+        return None
+    counts = Counter(values)
+    distinct = len(counts)
+    if not (CATEGORICAL_MIN_DISTINCT <= distinct <= max_distinct):
+        return None
+    top_value, top_count = counts.most_common(1)[0]
+    if top_count / occ >= CATEGORICAL_CONSTANT_FRAC:
+        return None
+    if distinct / occ >= CATEGORICAL_MAX_UNIQUE_RATIO:
+        return None
+    if _CAT_TS.match(top_value):
+        return None
+    if sum(len(v) for v in values) / occ > CATEGORICAL_MAX_MEAN_LEN:
+        return None
+    preferred = 0 if field.lower() in CATEGORICAL_PREFERRED_NAMES else 1
+    coverage_bucket = -round(occ / total, 1)  # descending: full-coverage master axis first
+    return (preferred, coverage_bucket, distinct, -occ)
+
 
 # Bounds. A search that returns everything is a search that overflows the context, and the
 # commander cannot reason about 800 lines any better than it could about 83 reports.
@@ -245,6 +354,71 @@ class Corpus:
                 for key in obj:
                     counts[key] = counts.get(key, 0) + 1
         return sorted(counts.items(), key=lambda kv: -kv[1])
+
+    def column_values(self, file: str, field: str) -> list[str]:
+        """Every present value of one field, in line order, as the string a tally counts.
+
+        JSON: a key (dotted) via json_objects + _json_value. TSV: a `#fields` name or a
+        1-based column via separator + field_map. Absent keys, short rows, unparsable
+        lines and `#` header lines contribute nothing -- exactly what `_selected_rows`
+        does, factored out so the profile can reuse it without importing aggregation.
+        """
+        objects = self.json_objects(file)
+        if objects is not None:
+            out: list[str] = []
+            for obj in objects:
+                if obj is not None:
+                    value = _json_value(obj, field)
+                    if value is not None:
+                        out.append(value)
+            return out
+        index = _resolve_field(field, self.field_map(file))
+        if index is None:
+            return []
+        separator = self.separator(file)
+        out = []
+        for text in self._files.get(file, []):
+            if text.startswith("#") or not text.strip():
+                continue
+            columns = text.split(separator)
+            if 0 <= index < len(columns):
+                out.append(columns[index])
+        return out
+
+    def categorical_fields(
+        self,
+        file: str,
+        *,
+        max_distinct: int = CATEGORICAL_MAX_DISTINCT,
+        min_coverage: float = CATEGORICAL_MIN_COVERAGE,
+    ) -> list[tuple[str, list[tuple[str, int]]]]:
+        """The file's record-type axes -- its low-cardinality fields -- best first, each
+        with its (value, count) distribution most-common-first.
+
+        Candidate fields are the JSON keys (for a .jsonl file) or the `#fields` names (for
+        a delimited one); `_categorical_rank` decides which qualify and in what order. The
+        result is what the profile shows as "record-type scope" and what the commander
+        would otherwise have to think to `tally field=` for.
+        """
+        objects = self.json_objects(file)
+        if objects is not None:
+            candidates = [key for key, _ in self.json_keys(file)]
+            total = sum(1 for obj in objects if obj is not None)
+        else:
+            field_map = self.field_map(file)
+            candidates = sorted(field_map, key=lambda k: field_map[k])
+            total = sum(1 for text in self._files.get(file, [])
+                        if text.strip() and not text.startswith("#"))
+        if total == 0:
+            return []
+        scored: list[tuple[tuple, str, list[tuple[str, int]]]] = []
+        for field in candidates:
+            values = self.column_values(file, field)
+            rank = _categorical_rank(field, values, total, max_distinct, min_coverage)
+            if rank is not None:
+                scored.append((rank, field, Counter(values).most_common()))
+        scored.sort(key=lambda item: item[0])
+        return [(field, distribution) for _, field, distribution in scored[:CATEGORICAL_MAX_FIELDS]]
 
     def slice_lines(self, file: str, start: int, end: int) -> list[Hit]:
         """A contiguous range, for handing to a worker for a close read."""
