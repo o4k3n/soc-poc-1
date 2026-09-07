@@ -72,6 +72,38 @@ OPTIONAL_SKILLS = frozenset({
 # The verbs that take the `field=`/`extract=` value selectors. timeline works off
 # timestamps and takes none.
 SELECTOR_KINDS = (ActionKind.TALLY, ActionKind.STATS, ActionKind.EXTREMES)
+# The verbs that accept `where` field predicates: the ones that fetch or count lines.
+FILTER_KINDS = (ActionKind.SEARCH, ActionKind.COUNT, ActionKind.CONTEXT)
+
+
+def parse_predicate(entry: str) -> tuple[str, str, str] | str:
+    """Parse one `where` entry into (field, op, value), or return an error string.
+
+    A predicate is `<field><op><value>`, op one of: `=` (equals, case-insensitive), `!=`
+    (not equals), `~` (regex matches the value), `!~` (regex does not match). The op is the
+    first one found; the value may itself contain any of these characters. Shared by the
+    validator (to reject a malformed predicate before the run) and the executor.
+    """
+    op = None
+    cut = -1
+    for i, ch in enumerate(entry):
+        if ch == "!" and i + 1 < len(entry) and entry[i + 1] in "=~":
+            op, cut = entry[i:i + 2], i
+            break
+        if ch in "=~":
+            op, cut = ch, i
+            break
+    if op is None or cut == 0:
+        return f"predicate {entry!r} needs '<field><op>value', op one of = != ~ !~"
+    field, value = entry[:cut].strip(), entry[cut + len(op):]
+    if not field:
+        return f"predicate {entry!r} has an empty field name"
+    if "~" in op:
+        try:
+            re.compile(value, re.IGNORECASE)
+        except re.error as exc:
+            return f"predicate {entry!r} has a bad regex: {exc}"
+    return (field, op, value)
 
 # Verbs whose argument is a regex in `pattern`.
 PATTERN_KINDS = (
@@ -111,6 +143,18 @@ class InvestigativeAction(BaseModel):
             "Regex, for search/count/tally/timeline/stats/extremes. Case-insensitive. It "
             "is the line FILTER; for tally/stats/extremes the value defaults to the first "
             "capture group unless 'field' or 'extract' selects it instead. Empty otherwise."
+        ),
+    )
+    where: list[str] = Field(
+        default_factory=list,
+        description=(
+            "For search/count/context: field predicates, ANDed, order-independent. Each is "
+            "'<field><op><value>' with op '=' (exact, case-insensitive) or '~' (regex on the "
+            "field's value). 'field' is a JSON key (dotted, e.g. 'Details.User') or a #fields "
+            "column name. Use this to pin a record on a structured log instead of a regex that "
+            "lists \"key\":\"value\" pairs in order -- the order of keys in the record does "
+            "not matter here. Requires 'file'. Empty otherwise, e.g. [\"event_id=10\", "
+            "\"computer=WKS-3355\"]."
         ),
     )
     file: str = Field(
@@ -240,8 +284,38 @@ def validate_action(
         if not value:
             problems.append(ActionProblem(field=field, message=message))
 
-    if kind in PATTERN_KINDS:
+    # A search/count normally needs a regex, but a `where`-only filter is a complete
+    # question on its own, so the pattern is optional then.
+    if kind in PATTERN_KINDS and not (
+        kind in (ActionKind.SEARCH, ActionKind.COUNT) and action.where
+    ):
         require(action.pattern, "pattern", f"{kind.value} needs a regex in 'pattern'.")
+
+    if action.where:
+        if kind not in FILTER_KINDS:
+            problems.append(
+                ActionProblem(
+                    field="where",
+                    message=(
+                        "'where' filters apply only to search, count and context; leave it "
+                        "empty for this action."
+                    ),
+                )
+            )
+        if not action.file:
+            problems.append(
+                ActionProblem(
+                    field="file",
+                    message=(
+                        "'where' names fields resolved against one file's header/keys -- "
+                        "set 'file' too."
+                    ),
+                )
+            )
+        for entry in action.where:
+            parsed = parse_predicate(entry)
+            if isinstance(parsed, str):
+                problems.append(ActionProblem(field="where", message=parsed))
 
     # The value selectors belong only to tally/stats/extremes, and only one at a time.
     # field-by-name needs a single file to resolve the header against; entity extraction

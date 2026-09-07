@@ -17,9 +17,12 @@ Two things this prompt has to fight, both learned from graded runs:
 
 from __future__ import annotations
 
+import json
+import re
+
 from soc_poc.corpus import MAX_RESULTS
 from soc_poc.evidence import Evidence, _headline, elide
-from soc_poc.profiling import CaseProfile
+from soc_poc.profiling import CaseProfile, _ID_CANDIDATE, _entropy, _looks_like_domain
 from soc_poc.prompting.envelope import DATA_IS_NOT_INSTRUCTIONS, fence_alert
 from soc_poc.schemas.action import ActionProblem
 from soc_poc.schemas.alert import Alert
@@ -44,8 +47,8 @@ which it undermines, and where to look next. The operator decides."""
 # Belt and braces: coercion.py rescues a tool-shaped reply if one gets through anyway.
 _NOT_A_TOOL_CALL = """This system has no tool-calling interface and there is no tool to \
 invoke. Your reply IS the answer: a single JSON object with exactly these keys -- \
-reasoning, expectation, action, pattern, file, field, extract, ref, start_line, end_line, \
-question. Fields your chosen action does not use must still be present and empty ("" or 0). \
+reasoning, expectation, action, pattern, where, file, field, extract, ref, start_line, \
+end_line, question. Fields your chosen action does not use must still be present and empty ("" or 0). \
 No prose outside the object."""
 
 # The optional aggregation skills, hooked up one at a time via run.enabled_skills. Each
@@ -153,6 +156,14 @@ search you expect to match more than a handful of lines, size it with {aggregate
 then narrow the pattern until the lines you fetch are the ones that settle the question. \
 A result reading "showing the first {MAX_RESULTS} of 700" means the question was too \
 broad -- aggregate the 700 down to the discriminating value, then fetch that.
+  - On a structured log (JSON lines, or a #fields table), pin a record by FIELD, not by \
+key order. `where=["event_id=10","computer=WKS-3355"]` on search/count/context matches \
+those fields wherever they sit in the line; a regex that lists "key":"value" pairs in \
+sequence silently returns nothing when the record orders its keys differently. Name the \
+fields exactly as the record-type scope / keys line above spells them. Four operators: \
+`=` equals, `!=` not-equal, `~` the field's value matches this regex, `!~` it does not -- \
+so `where=["event_id=10","TargetImage~lsass","SourceImage!~MsMpEng"]` finds lsass access \
+that is NOT the antivirus, in one step.
   - The profile below is computed, not inferred: every number in it is arithmetic over \
 the corpus and can be re-derived with grep. Trust it and start from it. Read the record-type scope of each file first to learn its vocabulary. The rare shapes \
 and the entropy groups are there because they are where the answer usually is.
@@ -397,6 +408,82 @@ def build_action_retry_messages(
 _ON_RECORD_BUDGET_CHARS = 8_000
 
 
+_GUID = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+_HEXISH = re.compile(r"^(?:0[xX])?[0-9a-fA-F]+$")
+_SHARED_IDS_SHOWN = 5
+_SHARED_REFS_PER_ID = 6
+
+
+def _value_text(text: str) -> str:
+    """The scannable content of a fetched line: for a JSON object, only its values
+    (recursively), space-joined, so key names are not mistaken for identifiers; for any
+    other line, the text unchanged."""
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    out: list[str] = []
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+        elif cur is not None and not isinstance(cur, bool):
+            out.append(str(cur))
+    return " ".join(out)
+
+
+def _distinctive(token: str) -> bool:
+    """Is this token an identifier worth reporting as a cross-event link?
+
+    A decimal is a count or an epoch, not an id. A hex run (with or without 0x) is an
+    access mask or a logon id. Otherwise it must look random (entropy) or be long. The
+    `_ID_CANDIDATE` class already splits on '-'/'_' and '.', so IPs, dashed hostnames
+    (WKS-3355) and underscore accounts (svc_deploy) never reach here -- only the values
+    that actually tie two events together do.
+    """
+    if token.isdigit():
+        return False
+    if _HEXISH.match(token):
+        return True
+    return _entropy(token) >= 3.2 or len(token) >= 12
+
+
+def _shared_identifiers(evidence: Evidence) -> list[str]:
+    """Distinctive tokens that appear on >=2 fetched lines, as cross-event links.
+
+    The commander hand-picked every fetched line, so a distinctive value shared by two of
+    them usually means those events are one thing -- a logon and the process it spawned
+    carrying the same logon id, say. Surfacing it hands synthesis the join it keeps
+    dropping. Iterates all fetched lines regardless of the render budget -- a link can sit
+    on a line the row budget elided.
+    """
+    by_token: dict[str, list[str]] = {}
+    seen: set[tuple[str, str]] = set()
+    for step in evidence.steps:
+        for hit in step.lines:
+            # On a JSON line, scan the VALUES only -- the key names (computer,
+            # TokenElevationType, ...) are structure shared by every line, not evidence.
+            scanned = _value_text(hit.text)
+            tokens = set(_GUID.findall(scanned))
+            tokens |= {t for t in _ID_CANDIDATE.findall(scanned) if _distinctive(t)}
+            for token in tokens:
+                if _looks_like_domain(token.split(".")):
+                    continue
+                if (token, hit.ref) in seen:
+                    continue
+                seen.add((token, hit.ref))
+                by_token.setdefault(token, []).append(hit.ref)
+    shared = [(t, refs) for t, refs in by_token.items() if len(refs) >= 2]
+    shared.sort(key=lambda tr: (-len(tr[1]), -len(tr[0])))
+    return [
+        f"    {token} on {', '.join(refs[:_SHARED_REFS_PER_ID])}"
+        for token, refs in shared[:_SHARED_IDS_SHOWN]
+    ]
+
+
 def _evidence_on_record(evidence: Evidence) -> str:
     """A flat, uncollapsed index of every line the commander fetched, for synthesis.
 
@@ -434,6 +521,14 @@ def _evidence_on_record(evidence: Evidence) -> str:
             f"  ... {omitted} further fetched line(s) not repeated here; they are in the "
             f"ledger above and remain on the record."
         )
+    links = _shared_identifiers(evidence)
+    if links:
+        rows.append(
+            "  SHARED IDENTIFIERS across the lines you fetched (a distinctive value on "
+            "several fetched lines usually ties those events into one -- a logon and the "
+            "process it spawned, say; state the link in the brief or rule it out):"
+        )
+        rows.extend(links)
     return (
         "EVIDENCE ON THE RECORD (every line you fetched during the investigation -- each "
         "was worth a step, so each must appear in the brief or be set aside in "

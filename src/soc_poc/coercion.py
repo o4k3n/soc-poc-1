@@ -43,6 +43,7 @@ _ALIASES: dict[str, tuple[str, ...]] = {
     "pattern": ("pattern", "regex", "query", "search", "term", "expression"),
     "file": ("file", "path", "filename", "log", "target"),
     "field": ("field", "column", "col", "key"),
+    "where": ("where", "filter", "filters", "match"),
     "extract": ("extract", "entity", "entities"),
     "ref": ("ref", "reference", "line_ref"),
     "question": ("question", "prompt", "ask"),
@@ -122,7 +123,10 @@ def coerce_action_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
     out: dict[str, Any] = {"action": flat.get("action", "")}
     for field, names in _ALIASES.items():
         value = next((flat[name] for name in names if flat.get(name) not in (None, "")), "")
-        out[field] = _as_int(value) if field.endswith("_line") else str(value)
+        if field == "where":
+            out[field] = value if isinstance(value, list) else ([value] if value else [])
+        else:
+            out[field] = _as_int(value) if field.endswith("_line") else str(value)
 
     # The model was not asked for these in the shape it produced, so say so rather than
     # inventing analyst reasoning it never wrote. The transcript shows the raw reply.

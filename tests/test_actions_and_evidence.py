@@ -607,3 +607,54 @@ def test_long_json_lines_keep_their_tail_visible() -> None:
     assert len(line) > LINE_MAX_CHARS and "elided" in shown
     assert line[:LINE_HEAD_CHARS] in shown
     assert "whoami /all" in shown
+
+
+# --- shared-identifier links in the synthesis recap -------------------------------------
+
+
+def test_shared_identifier_is_surfaced_across_fetched_lines() -> None:
+    from soc_poc.corpus import Hit
+    from soc_poc.evidence import Evidence, Step
+    from soc_poc.prompting.investigate import _shared_identifiers
+    from soc_poc.schemas.action import ActionKind, InvestigativeAction
+    a = InvestigativeAction(reasoning="r", expectation="e", action=ActionKind.SEARCH,
+                            pattern="x", file="security.jsonl")
+    lines = (
+        Hit("security.jsonl:L10", '{"event_id":4624,"TargetLogonId":"0x00eea1ea"}'),
+        Hit("security.jsonl:L12", '{"event_id":4688,"SubjectLogonId":"0x00eea1ea"}'),
+    )
+    ev = Evidence(); ev.add(Step(index=1, action=a, summary="", lines=lines))
+    out = _shared_identifiers(ev)
+    assert any("0x00eea1ea" in row and "L10" in row and "L12" in row for row in out)
+
+
+def test_token_on_one_line_and_shared_ip_are_not_surfaced() -> None:
+    from soc_poc.corpus import Hit
+    from soc_poc.evidence import Evidence, Step
+    from soc_poc.prompting.investigate import _shared_identifiers
+    from soc_poc.schemas.action import ActionKind, InvestigativeAction
+    a = InvestigativeAction(reasoning="r", expectation="e", action=ActionKind.SEARCH,
+                            pattern="x", file="f.jsonl")
+    lines = (
+        Hit("f.jsonl:L1", '{"ip":"10.9.9.9","tok":"0xabc12399ff"}'),   # tok only here
+        Hit("f.jsonl:L2", '{"ip":"10.9.9.9","note":"benign"}'),        # shares only the ip
+    )
+    ev = Evidence(); ev.add(Step(index=1, action=a, summary="", lines=lines))
+    out = _shared_identifiers(ev)
+    assert out == []                                    # ip is shape-excluded; tok is on one line
+
+
+def test_shared_identifiers_ignores_json_key_names() -> None:
+    from soc_poc.corpus import Hit
+    from soc_poc.evidence import Evidence, Step
+    from soc_poc.prompting.investigate import _shared_identifiers
+    from soc_poc.schemas.action import ActionKind, InvestigativeAction
+    a = InvestigativeAction(reasoning="r", expectation="e", action=ActionKind.SEARCH,
+                            pattern="x", file="f.jsonl")
+    # "TokenElevationType"/"ParentProcessName" are keys on both lines -- must NOT surface.
+    lines = (
+        Hit("f.jsonl:L1", '{"ParentProcessName":"a.exe","TokenElevationType":"t1"}'),
+        Hit("f.jsonl:L2", '{"ParentProcessName":"b.exe","TokenElevationType":"t2"}'),
+    )
+    ev = Evidence(); ev.add(Step(index=1, action=a, summary="", lines=lines))
+    assert _shared_identifiers(ev) == []

@@ -14,12 +14,18 @@ requested deliberately at a bounded line range, rather than issued 83 times at e
 from __future__ import annotations
 
 import re
+import json
 import shlex
 
 from soc_poc import aggregation
 from soc_poc.corpus import Corpus, SearchResult
 from soc_poc.evidence import Step
-from soc_poc.schemas.action import SELECTOR_KINDS, ActionKind, InvestigativeAction
+from soc_poc.schemas.action import (
+    SELECTOR_KINDS,
+    ActionKind,
+    InvestigativeAction,
+    parse_predicate,
+)
 
 # The timestamp shapes profiling/aggregation recognise, as one grep -oE alternation, so
 # a timeline's reproduce command extracts the same stamps the code did.
@@ -180,6 +186,54 @@ def _extremes_command(
     return f"awk -v pat={pat} {shlex.quote(prog)} {target} {head}"
 
 
+def _filter_command(
+    action: InvestigativeAction, target: str, json_files: frozenset[str], *, count: bool
+) -> str:
+    """The shell equivalent of a `where`-filtered search/count: an order-independent field
+    match, jq on a JSON file and header-resolving awk on a TSV one, so the reproduce keeps
+    the same property the verb has -- key order does not matter."""
+    preds = [parse_predicate(e) for e in action.where]
+    preds = [p for p in preds if not isinstance(p, str)]
+    grep = f"grep -hE {shlex.quote(action.pattern)} {target} | "         if action.pattern else ""
+    if action.file in json_files:
+        # `g` looks a key up case-insensitively (jq's own `.key` is case-sensitive, and the
+        # model may type a key in any case, as the Python filter tolerates); a dotted path
+        # chains it. This keeps the printed command's result identical to the verb's.
+        prelude = "def g(k): (to_entries[]|select((.key|ascii_downcase)==(k|ascii_downcase)).value);"
+        clauses = []
+        for field, op, value in preds:
+            getter = "|".join(f"g({json.dumps(seg.strip())})" for seg in field.split("."))
+            base = f"({getter})|tostring"
+            if op == "=":
+                clauses.append(f"({base}|ascii_downcase=={json.dumps(value.lower())})")
+            elif op == "!=":
+                clauses.append(f"({base}|ascii_downcase!={json.dumps(value.lower())})")
+            elif op == "~":
+                clauses.append(f'({base}|test({json.dumps(value)};"i"))')
+            else:  # !~
+                clauses.append(f'(({base}|test({json.dumps(value)};"i"))|not)')
+        prog = f"{prelude} select({' and '.join(clauses)})"
+        body = f"{grep}jq -c {shlex.quote(prog)}" if grep else f"jq -c {shlex.quote(prog)} {target}"
+        return f"{body} | wc -l" if count else body
+    # TSV: resolve each field to a column via the #fields header (case-insensitively, as the
+    # code does), then compare.
+    setup = " ".join(f"-v v{i}={shlex.quote(v)}" for i, (_f, _o, v) in enumerate(preds))
+    resolve = "".join(
+        f'for(i=2;i<=NF;i++)if(tolower($i)==tolower({json.dumps(f)}))c{i2}=i-1; '
+        for i2, (f, _o, _v) in enumerate(preds)
+    )
+    _AWK_OP = {"=": "==", "!=": "!=", "~": "~", "!~": "!~"}
+    tests = " && ".join(
+        f"tolower($c{i}){_AWK_OP[o]}tolower(v{i})" for i, (_f, o, _v) in enumerate(preds)
+    )
+    pat = _awk_var(action.pattern) if action.pattern else None
+    guard = "$0~pat&&" if pat else ""
+    prog = f"/^#fields/{{{resolve}}} !/^#/&&{guard}({tests}){{print}}"
+    patarg = f"-v pat={pat} " if pat else ""
+    awk = f"awk -F'\t' {setup} {patarg}{shlex.quote(prog)} {target}"
+    return f"{awk} | wc -l" if count else awk
+
+
 def reproduce_command(
     action: InvestigativeAction,
     logs_dir: str = "logs",
@@ -194,6 +248,8 @@ def reproduce_command(
     JSON-lines files, whose field= selectors reproduce with jq rather than awk.
     """
     target = f"{logs_dir}/{action.file}" if action.file else f"{logs_dir}/*"
+    if action.where and action.action in (ActionKind.SEARCH, ActionKind.COUNT):
+        return _filter_command(action, target, json_files, count=action.action is ActionKind.COUNT)
     if action.action is ActionKind.SEARCH:
         return f"grep -niE {shlex.quote(action.pattern)} {target}"
     if action.action is ActionKind.COUNT:
@@ -471,12 +527,26 @@ def execute_readonly(
             error=outcome.error,
             reproduce=reproduce_command(action, logs_dir, json_files=corpus.json_files),
         )
+    where = None
+    if action.where:
+        parsed = [parse_predicate(entry) for entry in action.where]
+        errors = [p for p in parsed if isinstance(p, str)]
+        if errors:
+            return Step(
+                index=index,
+                action=action,
+                summary=f"failed: {errors[0]}",
+                error=errors[0],
+                reproduce=reproduce_command(action, logs_dir, json_files=corpus.json_files),
+            )
+        where = [p for p in parsed if not isinstance(p, str)]
+
     if kind is ActionKind.SEARCH:
-        result = corpus.search(action.pattern, file=action.file)
+        result = corpus.search(action.pattern, file=action.file, where=where)
     elif kind is ActionKind.COUNT:
-        result = corpus.count(action.pattern, file=action.file)
+        result = corpus.count(action.pattern, file=action.file, where=where)
     elif kind is ActionKind.CONTEXT:
-        result = corpus.context(action.ref)
+        result = corpus.context(action.ref, where=where)
     elif kind is ActionKind.READ_LINES:
         hits = corpus.slice_lines(action.file, action.start_line, action.end_line)
         result = SearchResult(

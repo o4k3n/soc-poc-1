@@ -937,3 +937,120 @@ def test_json_key_display_is_capped_and_says_so() -> None:
     assert len(shown) == JSON_KEYS_SHOWN + 1 and shown[0] == "k0"
     assert shown[-1].startswith("+7 more")
     assert json_key_display(keys[:3]) == ["k0", "k1", "k2"]
+
+
+# --- where: order-independent field filter on the fetch verbs ---------------------------
+#
+# Pinned against the wmi-lsass runs where the commander wrote key-order-assuming regexes
+# like `"computer":"X".*"event_id":10` -> 0, burning ~3 steps/run. `where` filters by
+# parsed field, so key order does not matter.
+
+
+@pytest.fixture
+def win_events() -> Corpus:
+    lines = [
+        '{"ts":"2026-09-07T10:31:00Z","event_id":4624,"computer":"WKS-1","LogonType":3,'
+        '"IpAddress":"10.12.34.71","SubjectLogonId":"0xdead"}',
+        '{"event_id":10,"computer":"WKS-1","ts":"2026-09-07T10:31:03Z",'
+        '"SourceImage":"C:\\\\Windows\\\\rundll32.exe","GrantedAccess":"0x1010"}',
+        '{"computer":"WKS-2","event_id":10,"SourceImage":"C:\\\\Windows\\\\MsMpEng.exe",'
+        '"GrantedAccess":"0x1000","ts":"2026-09-07T10:32:00Z"}',
+    ]
+    return Corpus({"win.jsonl": lines, "dns.log": ["1700000000.000\t10.0.0.5\tq"]})
+
+
+def test_where_matches_json_fields_whatever_the_key_order(win_events: Corpus) -> None:
+    # event_id sits before computer on L2 and after it on L3 -- the filter does not care.
+    r = win_events.search("", file="win.jsonl",
+                          where=[("event_id", "=", "10"), ("computer", "=", "WKS-1")])
+    assert r.total_matches == 1 and r.returned[0].ref == "win.jsonl:L2"
+
+
+def test_where_regex_predicate_and_case_insensitive_key(win_events: Corpus) -> None:
+    r = win_events.search("", file="win.jsonl",
+                          where=[("sourceimage", "~", "rundll32")])  # lowercase key resolves
+    assert [h.ref for h in r.returned] == ["win.jsonl:L2"]
+
+
+def test_where_on_a_tsv_column() -> None:
+    zeek = Corpus({"dns.log": [
+        "#fields\tts\tid.orig_h\tquery\tqtype_name",
+        "1\t10.0.0.5\ta.example\tA",
+        "2\t10.0.0.5\tb.example\tNS",
+        "3\t10.0.0.6\tc.example\tNS",
+    ]})
+    r = zeek.search("", file="dns.log", where=[("qtype_name", "=", "NS")])
+    assert r.total_matches == 2 and {h.ref for h in r.returned} == {"dns.log:L3", "dns.log:L4"}
+
+
+def test_count_and_context_honour_where(win_events: Corpus) -> None:
+    assert win_events.count("", file="win.jsonl", where=[("event_id", "=", "10")]).total_matches == 2
+    ctx = win_events.context("win.jsonl:L1", before=5, after=5,
+                             where=[("event_id", "=", "10")])
+    assert {h.ref for h in ctx.returned} == {"win.jsonl:L2", "win.jsonl:L3"}
+
+
+def test_where_is_rejected_off_the_fetch_verbs_and_without_file() -> None:
+    off = validate_action(_action(ActionKind.TALLY, pattern="x", file="win.jsonl",
+                                  where=["event_id=10"]), known_files=["win.jsonl"])
+    assert any("apply only to search, count and context" in p.message for p in off)
+    nofile = validate_action(_action(ActionKind.SEARCH, where=["event_id=10"]),
+                             known_files=["win.jsonl"])
+    assert any(p.field == "file" for p in nofile)
+
+
+def test_where_makes_pattern_optional_on_search_but_not_tally() -> None:
+    ok = validate_action(_action(ActionKind.SEARCH, file="win.jsonl", where=["event_id=10"]),
+                         known_files=["win.jsonl"])
+    assert ok == []
+    needs = validate_action(_action(ActionKind.SEARCH), known_files=["win.jsonl"])
+    assert any(p.field == "pattern" for p in needs)
+
+
+def test_a_bad_where_predicate_is_a_step_error_not_a_crash(win_events: Corpus) -> None:
+    from soc_poc.actions import execute_readonly
+    step = execute_readonly(
+        _action(ActionKind.SEARCH, file="win.jsonl", where=["notapredicate"]),
+        win_events, index=1)
+    assert step.error and "notapredicate" in step.error
+
+
+def test_where_reproduce_uses_jq_or_awk_and_leaves_plain_search_untouched() -> None:
+    js = frozenset({"win.jsonl"})
+    j = reproduce_command(_action(ActionKind.SEARCH, file="win.jsonl",
+                                  where=["event_id=10", "computer=WKS-1"]), json_files=js)
+    assert j.startswith("jq -c") and "to_entries" in j and "ascii_downcase" in j
+    t = reproduce_command(_action(ActionKind.SEARCH, file="dns.log", where=["qtype_name=NS"]))
+    assert t.startswith("awk -F") and "tolower" in t
+    plain = reproduce_command(_action(ActionKind.SEARCH, pattern="10.0.0.5", file="dhcp.log"))
+    assert plain == "grep -niE 10.0.0.5 logs/dhcp.log"
+
+
+def test_where_is_part_of_the_repeat_identity() -> None:
+    from soc_poc.orchestrator import Orchestrator
+    a = _action(ActionKind.SEARCH, file="win.jsonl", where=["event_id=10"])
+    b = _action(ActionKind.SEARCH, file="win.jsonl", where=["event_id=4624"])
+    assert Orchestrator._identity(a) != Orchestrator._identity(b)
+
+
+def test_where_negation_operators(win_events: Corpus) -> None:
+    from soc_poc.schemas.action import parse_predicate
+    assert parse_predicate("computer!=WKS-3355") == ("computer", "!=", "WKS-3355")
+    assert parse_predicate("SourceImage!~MsMpEng") == ("SourceImage", "!~", "MsMpEng")
+    # != excludes the matching value; !~ excludes a regex match.
+    not_wks1 = win_events.search("", file="win.jsonl", where=[("computer", "!=", "WKS-1")])
+    assert {h.ref for h in not_wks1.returned} == {"win.jsonl:L3"}
+    lsass_not_av = win_events.search(
+        "", file="win.jsonl",
+        where=[("event_id", "=", "10"), ("SourceImage", "!~", "MsMpEng")])
+    assert [h.ref for h in lsass_not_av.returned] == ["win.jsonl:L2"]  # rundll32, not the AV
+
+
+def test_where_negation_reproduce_uses_the_negated_operator() -> None:
+    from soc_poc.actions import reproduce_command
+    j = reproduce_command(_action(ActionKind.SEARCH, file="win.jsonl",
+                                  where=["SourceImage!~MsMpEng"]),
+                          json_files=frozenset({"win.jsonl"}))
+    assert "|not)" in j                       # !~ negates the jq test
+    t = reproduce_command(_action(ActionKind.SEARCH, file="dns.log", where=["qtype_name!=NS"]))
+    assert "!=tolower" in t                    # != in the awk comparison

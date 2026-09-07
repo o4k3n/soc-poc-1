@@ -64,7 +64,8 @@ that survives being ported to Elixir/OTP are.
 **The six actions.** `search` (regex; exact total count plus up to 40 lines), `count`
 (the number alone — cheap, use it to test a guess), `context` (the lines around a
 reference), `read_lines` (a range verbatim), `close_read` (hand a bounded range to a
-worker with one question), `conclude` (stop and write the brief).
+worker with one question), `conclude` (stop and write the brief). `search`, `count` and
+`context` also take a `where` field filter (below).
 
 **The aggregation skills**, gated by `run.enabled_skills` so each can be trialled on its
 own graded runs: `tally` (distinct values of a regex with exact counts — a distribution
@@ -109,6 +110,28 @@ each JSON file's keys under it, the way a Zeek header's fields are shown, labell
 `stats`/`extremes` and a hex access mask like `0x1010` is ranked by its value, not its
 length. The reproduce command becomes a `jq` one-liner rather than `awk`, so a JSON
 aggregate is re-derivable by hand too.
+
+**The `where` filter on `search`, `count` and `context`.** A structured log invites a
+regex that lists `"key":"value"` pairs in sequence to pin one record — and on JSON that
+silently matches nothing, because the record may order its keys differently. Graded runs
+burned three steps each recovering from exactly that. `where=["event_id=10",
+"computer=WKS-3355"]` instead matches by *parsed field*, ANDed, order-independent: a JSON
+key (dotted for nesting) or a `#fields` column, resolved the same way `field=` resolves.
+Four operators — `=` (exact, case-insensitive), `!=`, `~` (regex on the value), `!~` — so
+`where=["event_id=10","TargetImage~lsass","SourceImage!~MsMpEng"]` isolates the credential
+dump from the antivirus's own lsass reads in one step. `pattern` stays an optional extra
+whole-line regex, and the reproduce command is a `jq -c 'select(...)'` (JSON) or a
+header-resolving `awk` (TSV) that re-derives the same lines by hand. In the first graded
+run to have it, the commander reached for `where` in 18 of 24 steps and the key-order wall
+disappeared entirely.
+
+**Shared identifiers in the synthesis recap.** The recap that lists every fetched line
+also scans their *values* (not their key names) for id-shaped tokens — a logon id, a GUID —
+that appear on two or more fetched lines, and names them: *"`0x00eea1ea` on
+security.jsonl:L1675, L1677, L1678"*. A distinctive value shared by lines the commander
+chose to fetch usually ties those events into one — a logon and the process it spawned —
+and this hands synthesis the join rather than trusting it to notice. It is evidence-only
+(no corpus scan), and IPs, hostnames and short process names fall out by shape.
 
 **The commander proposes; the orchestrator disposes.** An action is a JSON object the
 model emits and `actions.py` executes. The model never runs anything, and the set of

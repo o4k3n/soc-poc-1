@@ -207,9 +207,20 @@ class Corpus:
         return [name for name in self._files if name == file]
 
     def search(
-        self, pattern: str, *, file: str = "", max_results: int = MAX_RESULTS
+        self,
+        pattern: str,
+        *,
+        file: str = "",
+        max_results: int = MAX_RESULTS,
+        where: list[tuple[str, str, str]] | None = None,
     ) -> SearchResult:
-        """Regex search. Case-insensitive, because log data is not consistent about it."""
+        """Regex search, optionally narrowed by ANDed field predicates.
+
+        `pattern` is the whole-line regex (empty matches every line, so a `where`-only
+        search filters purely on fields). `where` is a list of (field, op, value) tuples
+        resolved against each line's PARSED fields -- JSON key or #fields column -- so the
+        order of keys in a record is irrelevant, unlike a regex that lists them in sequence.
+        """
         targets = self._targets(file)
         if file and not targets:
             return SearchResult(
@@ -225,24 +236,77 @@ class Corpus:
         total = 0
         cap = min(max_results, MAX_RESULTS)
         for name in targets:
+            # Resolve the file's parse mode once, not per line.
+            objects = self.json_objects(name) if where else None
+            fmap = self.field_map(name) if (where and objects is None) else {}
+            sep = self.separator(name) if (where and objects is None) else "\t"
             for number, text in enumerate(self._files[name], start=1):
-                if regex.search(text):
-                    total += 1
-                    if len(hits) < cap:
-                        hits.append(Hit(f"{name}:L{number}", text))
+                if not regex.search(text):
+                    continue
+                if where and not self._line_matches(
+                    number, text, where, fmap=fmap, sep=sep, objects=objects
+                ):
+                    continue
+                total += 1
+                if len(hits) < cap:
+                    hits.append(Hit(f"{name}:L{number}", text))
         return SearchResult(pattern, file, total, hits, targets)
 
-    def count(self, pattern: str, *, file: str = "") -> SearchResult:
+    def _line_matches(
+        self,
+        number: int,
+        text: str,
+        preds: list[tuple[str, str, str]],
+        *,
+        fmap: dict[str, int],
+        sep: str,
+        objects: list[dict | None] | None,
+    ) -> bool:
+        """Does one line satisfy every (field, op, value) predicate? Order-independent.
+
+        JSON: the field is a key resolved through `_json_value` on the line's parsed
+        object. TSV: the field is a #fields column resolved through `field_map`. A field
+        absent from the line fails the predicate; `=` is case-insensitive equality, `~` is
+        a case-insensitive regex over the field's value.
+        """
+        obj = objects[number - 1] if objects is not None else None
+        for field, op, value in preds:
+            if objects is not None:
+                got = _json_value(obj, field) if obj is not None else None
+            else:
+                index = _resolve_field(field, fmap)
+                columns = text.split(sep)
+                got = columns[index] if (index is not None and 0 <= index < len(columns)) else None
+            if got is None:
+                return False
+            negate = op.startswith("!")
+            if op in ("=", "!="):
+                if (got.lower() == value.lower()) == negate:
+                    return False
+            elif op in ("~", "!~"):
+                if bool(re.search(value, got, re.IGNORECASE)) == negate:
+                    return False
+        return True
+
+    def count(
+        self, pattern: str, *, file: str = "", where: list[tuple[str, str, str]] | None = None
+    ) -> SearchResult:
         """Match count with no lines returned -- the cheap way to test a hypothesis.
 
         This is the deterministic negative the sweep only pretended to give: zero here
         means the pattern does not occur, not that nobody noticed it.
         """
-        result = self.search(pattern, file=file, max_results=0)
-        return result
+        return self.search(pattern, file=file, max_results=0, where=where)
 
-    def context(self, ref: str, *, before: int = 5, after: int = 5) -> SearchResult:
-        """The lines around a reference -- for reading what surrounds a hit."""
+    def context(
+        self, ref: str, *, before: int = 5, after: int = 5,
+        where: list[tuple[str, str, str]] | None = None,
+    ) -> SearchResult:
+        """The lines around a reference -- for reading what surrounds a hit.
+
+        A `where` filter keeps only the neighbours that satisfy the predicates, which is
+        how the commander reads "the events in this window that are event_id 10".
+        """
         if ref not in self._by_ref:
             return SearchResult("", "", 0, [], [], error=f"no such line {ref!r}")
         name, _, number = ref.partition(":L")
@@ -252,6 +316,16 @@ class Corpus:
         start = max(1, centre - before)
         end = min(len(lines), start + span - 1)
         hits = [Hit(f"{name}:L{n}", lines[n - 1]) for n in range(start, end + 1)]
+        if where:
+            objects = self.json_objects(name)
+            fmap = self.field_map(name) if objects is None else {}
+            sep = self.separator(name) if objects is None else "\t"
+            hits = [
+                h for h in hits
+                if self._line_matches(
+                    int(h.ref.rpartition("L")[2]), h.text, where, fmap=fmap, sep=sep, objects=objects
+                )
+            ]
         return SearchResult(f"context around {ref}", name, len(hits), hits, [name])
 
     def format_header(self, file: str, max_lines: int = 12) -> list[str]:

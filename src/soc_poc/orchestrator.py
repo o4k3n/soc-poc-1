@@ -475,6 +475,7 @@ class Orchestrator:
                 "file": action.file,
                 "field": action.field,
                 "extract": action.extract,
+                "where": list(action.where),
                 "ref": action.ref,
                 "lines": f"{action.start_line}-{action.end_line}",
                 "question": action.question,
@@ -590,6 +591,9 @@ class Orchestrator:
             # and the second must not be dismissed as a repeat of the first.
             action.field,
             action.extract,
+            # A `where` filter is part of the question too: search /X/ where=[a] and
+            # where=[b] are different, and the second must not read as a repeat.
+            tuple(action.where),
             action.ref,
             action.start_line,
             action.end_line,
@@ -999,7 +1003,7 @@ def _action_line(action: InvestigativeAction) -> str:
     if kind in PATTERN_KINDS:
         return f"{kind.value} /{action.pattern}/{scope}{selector_suffix(action)}"
     if kind is ActionKind.CONTEXT:
-        return f"context around {action.ref}"
+        return f"context around {action.ref}{selector_suffix(action)}"
     if kind in (ActionKind.READ_LINES, ActionKind.CLOSE_READ):
         return f"{kind.value} {action.file}:L{action.start_line}-L{action.end_line}"
     return kind.value

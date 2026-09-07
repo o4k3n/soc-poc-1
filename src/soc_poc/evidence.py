@@ -163,13 +163,17 @@ class Evidence:
 
 
 def selector_suffix(action: InvestigativeAction) -> str:
-    """` field=x` / ` extract=ip` when set. Two aggregates over the same filter but
-    different columns are different questions and must read differently in the ledger."""
+    """` field=x` / ` extract=ip` / ` where=[...]` when set. Two actions over the same
+    filter but different columns or predicates are different questions and must read
+    differently in the ledger."""
+    out = ""
     if action.field:
-        return f" field={action.field}"
+        out += f" field={action.field}"
     if action.extract:
-        return f" extract={action.extract}"
-    return ""
+        out += f" extract={action.extract}"
+    if action.where:
+        out += " where=[" + ", ".join(action.where) + "]"
+    return out
 
 
 def _headline(step: Step) -> str:
@@ -180,7 +184,7 @@ def _headline(step: Step) -> str:
     if kind in PATTERN_KINDS:
         return f"{kind.value} /{action.pattern}/{scope}{selector_suffix(action)}"
     if kind is ActionKind.CONTEXT:
-        return f"context around {action.ref}"
+        return f"context around {action.ref}{selector_suffix(action)}"
     if kind in (ActionKind.READ_LINES, ActionKind.CLOSE_READ):
         span = f"{action.file}:L{action.start_line}-L{action.end_line}"
         if kind is ActionKind.CLOSE_READ:
