@@ -166,13 +166,18 @@ then narrow the pattern until the lines you fetch are the ones that settle the q
 A result reading "showing the first {MAX_RESULTS} of 700" means the question was too \
 broad -- aggregate the 700 down to the discriminating value, then fetch that.
   - On a structured log (JSON lines, or a #fields table), pin a record by FIELD, not by \
-key order. `where=["event_id=10","computer=WKS-3355"]` on search/count/context matches \
-those fields wherever they sit in the line; a regex that lists "key":"value" pairs in \
-sequence silently returns nothing when the record orders its keys differently. Name the \
-fields exactly as the record-type scope / keys line above spells them. Four operators: \
-`=` equals, `!=` not-equal, `~` the field's value matches this regex, `!~` it does not -- \
-so `where=["event_id=10","TargetImage~lsass","SourceImage!~MsMpEng"]` finds lsass access \
-that is NOT the antivirus, in one step.
+key order. `where=["event_id=10","computer=WKS-3355"]` matches those fields wherever they \
+sit in the line; a regex that lists "key":"value" pairs in sequence silently returns \
+nothing when the record orders its keys differently. Name the fields exactly as the \
+record-type scope / keys line above spells them. Four operators: `=` equals, `!=` \
+not-equal, `~` the field's value matches this regex, `!~` it does not -- so \
+`where=["event_id=10","TargetImage~lsass","SourceImage!~MsMpEng"]` finds lsass access \
+that is NOT the antivirus, in one step. `where` works on every verb that reads lines \
+through a pattern -- not only search/count/context but the aggregates too, so \
+`tally field="SubjectUserName" where=["event_id=4662"]` counts who touched the directory, \
+`decode field="CommandLine" where=["computer=WKS-3355","event_id=4688"]` decodes just that \
+host's command lines, and `timeline where=["SubjectUserName=svc_x"]` times one account -- \
+the way to isolate one signal from a flood of the same event.
   - The profile below is computed, not inferred: every number in it is arithmetic over \
 the corpus and can be re-derived with grep. Trust it and start from it. Read the record-type scope of each file first to learn its vocabulary. The rare shapes \
 and the entropy groups are there because they are where the answer usually is.

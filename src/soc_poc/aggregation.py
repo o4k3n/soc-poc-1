@@ -37,6 +37,7 @@ from soc_poc.profiling import (
     _IP,
     _LONG_TOKEN,
     BURST_GAP_FACTOR,
+    _entropy,
     _humanise,
     _timestamp,
     _to_epoch,
@@ -100,7 +101,13 @@ def _clip(value: str) -> str:
 
 
 def _selected_rows(
-    corpus: Corpus, pattern: str, file: str, *, field: str = "", extract: str = ""
+    corpus: Corpus,
+    pattern: str,
+    file: str,
+    *,
+    field: str = "",
+    extract: str = "",
+    where: list[tuple[str, str, str]] | None = None,
 ) -> tuple[list[tuple[str, Hit]], int, str] | tuple[None, int, str]:
     """Every selected value in corpus order, each paired with the line it came from, plus
     how many lines the pattern matched.
@@ -142,6 +149,12 @@ def _selected_rows(
         index = None
         separator = "\t"
         objects = corpus.json_objects(name) if field else None
+        # `where` predicates are resolved against the line's PARSED fields, the same way
+        # a search's are, and independently of the value selector -- so a tally/decode can
+        # be scoped to one record kind without a key-order regex.
+        where_objects = corpus.json_objects(name) if where else None
+        where_fmap = corpus.field_map(name) if (where and where_objects is None) else {}
+        where_sep = corpus.separator(name) if (where and where_objects is None) else "\t"
         if field and objects is not None:
             if field.strip().isdigit():
                 keys = ", ".join(k for k, _ in corpus.json_keys(name)[:12])
@@ -164,6 +177,10 @@ def _selected_rows(
             if selecting and text.startswith("#"):
                 continue
             if not regex.search(text):
+                continue
+            if where and not corpus._line_matches(
+                number, text, where, fmap=where_fmap, sep=where_sep, objects=where_objects
+            ):
                 continue
             matched_lines += 1
             hit = Hit(f"{name}:L{number}", text)
@@ -193,12 +210,18 @@ def _selected_rows(
 
 
 def _extract(
-    corpus: Corpus, pattern: str, file: str, *, field: str = "", extract: str = ""
+    corpus: Corpus,
+    pattern: str,
+    file: str,
+    *,
+    field: str = "",
+    extract: str = "",
+    where: list[tuple[str, str, str]] | None = None,
 ) -> tuple[list[str], int, str] | tuple[None, int, str]:
     """`_selected_rows` without the references: the values alone, for the verbs whose
     product is a number. Byte-for-byte the pre-extremes behaviour."""
     rows, matched_lines, error = _selected_rows(
-        corpus, pattern, file, field=field, extract=extract
+        corpus, pattern, file, field=field, extract=extract, where=where
     )
     if rows is None:
         return None, matched_lines, error
@@ -224,7 +247,13 @@ class Aggregate:
 
 
 def tally(
-    corpus: Corpus, pattern: str, *, file: str = "", field: str = "", extract: str = ""
+    corpus: Corpus,
+    pattern: str,
+    *,
+    file: str = "",
+    field: str = "",
+    extract: str = "",
+    where: list[tuple[str, str, str]] | None = None,
 ) -> Aggregate:
     """Distinct values of a pattern with exact counts: a distribution in one step.
 
@@ -233,7 +262,9 @@ def tally(
     one guessed value at a time. `field=` and `extract=` choose the value without a
     capture group -- see `_extract`.
     """
-    values, matched_lines, error = _extract(corpus, pattern, file, field=field, extract=extract)
+    values, matched_lines, error = _extract(
+        corpus, pattern, file, field=field, extract=extract, where=where
+    )
     if values is None:
         return Aggregate(headline=f"failed: {error}", error=error)
     scope = file or f"{len(corpus.file_names)} file(s)"
@@ -266,7 +297,13 @@ def tally(
     )
 
 
-def timeline(corpus: Corpus, pattern: str, *, file: str = "") -> Aggregate:
+def timeline(
+    corpus: Corpus,
+    pattern: str,
+    *,
+    file: str = "",
+    where: list[tuple[str, str, str]] | None = None,
+) -> Aggregate:
     """When a pattern's matches happen: span, gap statistics, session structure.
 
     Bursty and periodic are different signatures, and briefs have repeatedly described
@@ -285,12 +322,20 @@ def timeline(corpus: Corpus, pattern: str, *, file: str = "") -> Aggregate:
     stamps: list[str] = []
     matched_lines = 0
     for name in [file] if file else corpus.file_names:
-        for text in corpus.file_lines(name):
-            if regex.search(text):
-                matched_lines += 1
-                stamp = _timestamp(text)
-                if stamp is not None:
-                    stamps.append(stamp)
+        where_objects = corpus.json_objects(name) if where else None
+        where_fmap = corpus.field_map(name) if (where and where_objects is None) else {}
+        where_sep = corpus.separator(name) if (where and where_objects is None) else "\t"
+        for number, text in enumerate(corpus.file_lines(name), start=1):
+            if not regex.search(text):
+                continue
+            if where and not corpus._line_matches(
+                number, text, where, fmap=where_fmap, sep=where_sep, objects=where_objects
+            ):
+                continue
+            matched_lines += 1
+            stamp = _timestamp(text)
+            if stamp is not None:
+                stamps.append(stamp)
     scope = file or f"{len(corpus.file_names)} file(s)"
     if not matched_lines:
         return Aggregate(
@@ -351,7 +396,13 @@ def _humanise_epoch(value: float) -> str:
 
 
 def stats(
-    corpus: Corpus, pattern: str, *, file: str = "", field: str = "", extract: str = ""
+    corpus: Corpus,
+    pattern: str,
+    *,
+    file: str = "",
+    field: str = "",
+    extract: str = "",
+    where: list[tuple[str, str, str]] | None = None,
 ) -> Aggregate:
     """Size statistics over a pattern's selected values: "how big" without lines.
 
@@ -360,7 +411,9 @@ def stats(
     that answers "are these query labels abnormally long" for a tunnel. `field=` selects a
     numeric column directly (`field="response_body_len"`), which is the usual way in.
     """
-    values, matched_lines, error = _extract(corpus, pattern, file, field=field, extract=extract)
+    values, matched_lines, error = _extract(
+        corpus, pattern, file, field=field, extract=extract, where=where
+    )
     if values is None:
         return Aggregate(headline=f"failed: {error}", error=error)
     scope = file or f"{len(corpus.file_names)} file(s)"
@@ -403,7 +456,13 @@ def _rank_key(values: list[str]) -> tuple[str, bool]:
 
 
 def extremes(
-    corpus: Corpus, pattern: str, *, file: str = "", field: str = "", extract: str = ""
+    corpus: Corpus,
+    pattern: str,
+    *,
+    file: str = "",
+    field: str = "",
+    extract: str = "",
+    where: list[tuple[str, str, str]] | None = None,
 ) -> Aggregate:
     """The matching lines with the largest selected value, with references: the evidence
     behind a stats maximum or a tally's long tail, in one step.
@@ -420,7 +479,7 @@ def extremes(
     tail it fetched is a cliff or a slope without fetching more.
     """
     rows, matched_lines, error = _selected_rows(
-        corpus, pattern, file, field=field, extract=extract
+        corpus, pattern, file, field=field, extract=extract, where=where
     )
     if rows is None:
         return Aggregate(headline=f"failed: {error}", error=error)
@@ -483,6 +542,31 @@ _B64_RUN = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
 DECODE_SHOWN = 10
 
 
+def _looks_base64(run: str) -> bool:
+    """Does a run have base64's SHAPE, beyond merely being 16+ alphanumeric characters?
+
+    The `_B64_RUN` regex alone flags ordinary long tokens -- a task name like
+    `HealthTelemetryUpdater`, a Windows path segment, a CamelCase field -- and a graded run
+    then reported 233 such tokens as "looked base64 but did not validate", burying the one
+    genuine truncated-payload signal that phrase is meant to carry. Real base64 of
+    non-trivial bytes (a UTF-16LE PowerShell payload above all) is high-entropy and mixes
+    character classes: it carries digits or `+`/`/`, or at least varied case, and does not
+    read as an English/identifier word. A plain word has neither. This gate decides only
+    whether a NON-decoding run is worth flagging; it never blocks a run from being decoded.
+    """
+    if len(run) < 16:
+        return False
+    body = run.rstrip("=")
+    # The clean discriminator: real base64 of non-trivial bytes carries digits (or `+`/`/`)
+    # -- a UTF-16LE PowerShell payload above all, whose null high bytes and varied ASCII
+    # both encode to runs that include digits -- whereas an English word, a CamelCase
+    # field, or a Windows path segment does not, however long or mixed-case it is. A
+    # modest entropy floor then drops the degenerate case of a long digit-bearing run that
+    # is really just repetition.
+    has_digit_or_symbol = any(ch.isdigit() or ch in "+/" for ch in body)
+    return has_digit_or_symbol and _entropy(body) >= 3.0
+
+
 def _try_b64_decode(candidate: str) -> str | None:
     """Decode a base64 candidate to text, or None if it is not genuinely base64.
 
@@ -516,7 +600,13 @@ def _try_b64_decode(candidate: str) -> str | None:
 
 
 def decode(
-    corpus: Corpus, pattern: str, *, file: str = "", field: str = "", extract: str = ""
+    corpus: Corpus,
+    pattern: str,
+    *,
+    file: str = "",
+    field: str = "",
+    extract: str = "",
+    where: list[tuple[str, str, str]] | None = None,
 ) -> Aggregate:
     """Decode the base64 a pattern selects -- verified, never mangled.
 
@@ -527,7 +617,9 @@ def decode(
     a citable reference, instead of the commander decoding it in its head -- which is a
     guess, and a wrong guess about what a script does is the expensive kind.
     """
-    rows, matched_lines, error = _selected_rows(corpus, pattern, file, field=field, extract=extract)
+    rows, matched_lines, error = _selected_rows(
+        corpus, pattern, file, field=field, extract=extract, where=where
+    )
     if rows is None:
         return Aggregate(headline=f"failed: {error}", error=error)
     scope = file or f"{len(corpus.file_names)} file(s)"
@@ -539,12 +631,21 @@ def decode(
     not_base64 = 0
     for value, hit in rows:
         got = False
+        looked = False
         for match in _B64_RUN.finditer(value):
-            text = _try_b64_decode(match.group(0))
+            run = match.group(0)
+            text = _try_b64_decode(run)
             if text is not None:
                 decoded.append((hit, text))
                 got = True
-        if not got and _B64_RUN.search(value):
+            elif _looks_base64(run):
+                # A run that has base64's shape (mixed classes, high entropy) but does not
+                # decode is the real "looked base64 but did not validate" signal -- a
+                # truncated or mis-copied payload worth flagging. A plain long token
+                # (a task name, a path, a CamelCase field) is NOT that, and counting it
+                # buried the signal under dozens of false hits in a graded run.
+                looked = True
+        if not got and looked:
             not_base64 += 1
     if not decoded:
         note = f" ({not_base64} looked base64 but did not validate)" if not_base64 else ""

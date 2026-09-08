@@ -990,21 +990,35 @@ def test_count_and_context_honour_where(win_events: Corpus) -> None:
     assert {h.ref for h in ctx.returned} == {"win.jsonl:L2", "win.jsonl:L3"}
 
 
-def test_where_is_rejected_off_the_fetch_verbs_and_without_file() -> None:
-    off = validate_action(_action(ActionKind.TALLY, pattern="x", file="win.jsonl",
-                                  where=["event_id=10"]), known_files=["win.jsonl"])
-    assert any("apply only to search, count and context" in p.message for p in off)
+def test_where_is_allowed_on_the_selectors_but_not_read_verbs_and_needs_file() -> None:
+    # where now scopes the aggregates too, so a tally/decode with where is accepted.
+    for kind in (ActionKind.TALLY, ActionKind.DECODE, ActionKind.TIMELINE, ActionKind.STATS,
+                 ActionKind.EXTREMES):
+        ok = validate_action(_action(kind, pattern="x", file="win.jsonl",
+                                     where=["event_id=10"]), known_files=["win.jsonl"])
+        assert ok == [], (kind, ok)
+    # but not on the verbs that do not read lines through a pattern.
+    off = validate_action(_action(ActionKind.READ_LINES, file="win.jsonl", start_line=1,
+                                  end_line=2, where=["event_id=10"]), known_files=["win.jsonl"])
+    assert any(p.field == "where" for p in off)
     nofile = validate_action(_action(ActionKind.SEARCH, where=["event_id=10"]),
                              known_files=["win.jsonl"])
     assert any(p.field == "file" for p in nofile)
 
 
-def test_where_makes_pattern_optional_on_search_but_not_tally() -> None:
-    ok = validate_action(_action(ActionKind.SEARCH, file="win.jsonl", where=["event_id=10"]),
-                         known_files=["win.jsonl"])
-    assert ok == []
-    needs = validate_action(_action(ActionKind.SEARCH), known_files=["win.jsonl"])
+def test_where_makes_pattern_optional_except_on_timeline() -> None:
+    # A where-only search/tally is a complete question; timeline's subject is the pattern.
+    for kind in (ActionKind.SEARCH, ActionKind.COUNT, ActionKind.TALLY, ActionKind.DECODE):
+        ok = validate_action(_action(kind, file="win.jsonl", where=["event_id=10"],
+                                     field="TargetUserName" if kind in
+                                     (ActionKind.TALLY, ActionKind.DECODE) else ""),
+                             known_files=["win.jsonl"])
+        assert not any(p.field == "pattern" for p in ok), (kind, ok)
+    needs = validate_action(_action(ActionKind.TIMELINE, file="win.jsonl", where=["event_id=10"]),
+                            known_files=["win.jsonl"])
     assert any(p.field == "pattern" for p in needs)
+    needs2 = validate_action(_action(ActionKind.SEARCH), known_files=["win.jsonl"])
+    assert any(p.field == "pattern" for p in needs2)
 
 
 def test_a_bad_where_predicate_is_a_step_error_not_a_crash(win_events: Corpus) -> None:
@@ -1056,6 +1070,74 @@ def test_where_negation_reproduce_uses_the_negated_operator() -> None:
     assert "!=tolower" in t                    # != in the awk comparison
 
 
+def test_where_scopes_the_selectors(win_events: Corpus) -> None:
+    # tally: where narrows the lines the aggregate runs over.
+    both = execute_readonly(
+        _action(ActionKind.TALLY, field="GrantedAccess", file="win.jsonl",
+                where=["event_id=10"]), win_events, index=1)
+    assert both.total_matches == 2 and "0x1010" in both.table and "0x1000" in both.table
+    one = execute_readonly(
+        _action(ActionKind.TALLY, field="GrantedAccess", file="win.jsonl",
+                where=["event_id=10", "computer=WKS-1"]), win_events, index=1)
+    assert one.total_matches == 1 and "0x1010" in one.table and "0x1000" not in one.table
+    # extremes: the negated predicate drops the AV read, leaving the dumper's 0x1010.
+    ext = execute_readonly(
+        _action(ActionKind.EXTREMES, pattern="", field="GrantedAccess", file="win.jsonl",
+                where=["event_id=10", "SourceImage!~MsMpEng"]), win_events, index=1)
+    assert ext.total_matches == 1 and any(h.ref == "win.jsonl:L2" for h in ext.lines)
+    # timeline: a where-scoped subject counts only its own lines.
+    tl = execute_readonly(
+        _action(ActionKind.TIMELINE, pattern="event_id", file="win.jsonl",
+                where=["computer=WKS-2"]), win_events, index=1)
+    assert tl.total_matches == 1
+    # decode: where scopes which lines are searched for base64 (none here -> clean zero).
+    dec = execute_readonly(
+        _action(ActionKind.DECODE, pattern="", field="SourceImage", file="win.jsonl",
+                where=["computer=WKS-2"]), win_events, index=1)
+    assert dec.total_matches == 1 and dec.lines == ()
+
+
+def test_zero_note_respects_the_where_filter(win_events: Corpus) -> None:
+    from soc_poc.actions import zero_result_hint
+    # 'rundll32' (>= the 8-char literal floor) sits only on L2 (WKS-1); the regex
+    # 'rundll32[0-9]' matches no line. Within computer=WKS-2 the literal is absent, so the
+    # where-filtered zero must NOT be diagnosed as a pattern mistake.
+    excluded = zero_result_hint("rundll32[0-9]", "win.jsonl", win_events,
+                                [("computer", "=", "WKS-2")])
+    assert excluded == ""
+    # Without the where, the literal IS in the file, so a real pattern-mismatch zero still
+    # gets the diagnostic.
+    present = zero_result_hint("rundll32[0-9]", "win.jsonl", win_events, None)
+    assert "about your PATTERN" in present
+    # end to end: the step summary for the excluded case reads as a clean absence.
+    step = execute_readonly(
+        _action(ActionKind.SEARCH, pattern="rundll32[0-9]", file="win.jsonl",
+                where=["computer=WKS-2"]), win_events, index=1)
+    assert step.total_matches == 0 and "about your PATTERN" not in step.summary
+
+
+def test_where_selector_reproduce_matches_the_verb() -> None:
+    # JSON: a where-filtered tally reproduces through jq select; extremes weaves the
+    # predicate into the one jq -rR pass (so line numbers stay the file's own).
+    j_tally = reproduce_command(
+        _action(ActionKind.TALLY, field="GrantedAccess", file="win.jsonl",
+                where=["event_id=10"]), json_files=frozenset({"win.jsonl"}))
+    assert "jq -c" in j_tally and "select(" in j_tally and "uniq -c" in j_tally
+    j_ext = reproduce_command(
+        _action(ActionKind.EXTREMES, pattern="lsass", field="GrantedAccess", file="win.jsonl",
+                where=["computer=WKS-1"]), json_files=frozenset({"win.jsonl"}))
+    assert "select($o |" in j_ext and "input_line_number" in j_ext
+    # TSV: the predicate columns resolve from the #fields header in the same awk pass.
+    t_tally = reproduce_command(
+        _action(ActionKind.TALLY, field="query", file="dns.log", where=["qtype_name=NS"]))
+    assert "awk" in t_tally and "#fields" in t_tally and "wc" in t_tally
+    # a no-where selector reproduce is unchanged (no jq select spliced in).
+    plain = reproduce_command(
+        _action(ActionKind.TALLY, field="GrantedAccess", file="win.jsonl"),
+        json_files=frozenset({"win.jsonl"}))
+    assert "select(" not in plain
+
+
 def test_synthesis_prompt_requires_asserting_shared_identifiers() -> None:
     from soc_poc.prompting.investigate import SYNTHESIS_SYSTEM_PROMPT
     assert "SHARED IDENTIFIER" in SYNTHESIS_SYSTEM_PROMPT
@@ -1085,9 +1167,25 @@ def test_decode_never_mangles_non_base64() -> None:
     from soc_poc.aggregation import decode, _try_b64_decode
     assert _try_b64_decode("thisisplaintextnotb64") is None
     assert _try_b64_decode("q83vEjRWeJCrze8SNFZ4kA==") is None
-    corpus = Corpus({"s.jsonl": ['{"CommandLine":"run AAAABBBBCCCCDDDDEEEEFFFF now"}']})
+    # A base64-SHAPED run (mixed classes, digits) that does not decode to text is the real
+    # "did not validate" signal -- flagged, but not decoded or cited.
+    corpus = Corpus({"s.jsonl": ['{"CommandLine":"run q83vEjRWeJCrze8SNFZ4kAB1c9dE now"}']})
     r = decode(corpus, "run", file="s.jsonl", field="CommandLine")
     assert "did NOT validate" in r.headline or "did not validate" in r.headline
+    assert r.hits == ()
+
+
+def test_decode_does_not_flag_plain_long_tokens_as_base64() -> None:
+    # The noise fix: a task name / path / CamelCase field is 16+ alnum but is NOT base64,
+    # so it must not be counted as "looked base64" (233 such false hits in a graded run).
+    from soc_poc.aggregation import decode, _looks_base64
+    assert not _looks_base64("HealthTelemetryUpdater")
+    assert not _looks_base64("ConfigMgrClientHealthEvaluation")
+    corpus = Corpus({"s.jsonl": [
+        '{"TaskName":"\\\\Microsoft\\\\Windows\\\\Servicing\\\\HealthTelemetryUpdater"}',
+    ]})
+    r = decode(corpus, "HealthTelemetryUpdater", file="s.jsonl", field="TaskName")
+    assert "looked base64" not in r.headline
     assert r.hits == ()
 
 

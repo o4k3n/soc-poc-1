@@ -74,7 +74,8 @@ OPTIONAL_SKILLS = frozenset({
 # The verbs that take the `field=`/`extract=` value selectors. timeline works off
 # timestamps and takes none.
 SELECTOR_KINDS = (ActionKind.TALLY, ActionKind.STATS, ActionKind.EXTREMES, ActionKind.DECODE)
-# The verbs that accept `where` field predicates: the ones that fetch or count lines.
+# The fetch verbs whose `where`-filtered reproduce is a jq/awk field match (search/count
+# render lines, context a window). The selectors below build their own reproduce.
 FILTER_KINDS = (ActionKind.SEARCH, ActionKind.COUNT, ActionKind.CONTEXT)
 
 
@@ -118,6 +119,11 @@ PATTERN_KINDS = (
     ActionKind.DECODE,
 )
 
+# Every verb that reads lines through a pattern accepts `where` too, so the model can scope
+# a tally/decode/timeline to one record kind the same way it scopes a search -- context is
+# included (its window is anchored on a ref, but the ref's line still honours predicates).
+WHERE_KINDS = PATTERN_KINDS + (ActionKind.CONTEXT,)
+
 # Entity types `extract=` accepts. Kept in lockstep with aggregation.ENTITY_PATTERNS by a
 # test, rather than imported, so the schema module stays free of runtime dependencies.
 _EXTRACT_TYPES = frozenset({"ip", "domain", "hash", "email"})
@@ -151,12 +157,14 @@ class InvestigativeAction(BaseModel):
     where: list[str] = Field(
         default_factory=list,
         description=(
-            "For search/count/context: field predicates, ANDed, order-independent. Each is "
-            "'<field><op><value>' with op '=' (exact, case-insensitive) or '~' (regex on the "
-            "field's value). 'field' is a JSON key (dotted, e.g. 'Details.User') or a #fields "
-            "column name. Use this to pin a record on a structured log instead of a regex that "
-            "lists \"key\":\"value\" pairs in order -- the order of keys in the record does "
-            "not matter here. Requires 'file'. Empty otherwise, e.g. [\"event_id=10\", "
+            "Field predicates, ANDed, order-independent -- for any verb that reads lines "
+            "through a pattern (search/count/context and tally/timeline/stats/extremes/"
+            "decode), so an aggregate can be scoped to one record kind too. Each is "
+            "'<field><op><value>' with op '=' (exact, case-insensitive), '!=', '~' (regex on "
+            "the field's value) or '!~'. 'field' is a JSON key (dotted, e.g. 'Details.User') "
+            "or a #fields column name. Use this to pin a record on a structured log instead "
+            "of a regex that lists \"key\":\"value\" pairs in order -- key order does not "
+            "matter here. Requires 'file'. Empty otherwise, e.g. [\"event_id=10\", "
             "\"computer=WKS-3355\"]."
         ),
     )
@@ -287,21 +295,24 @@ def validate_action(
         if not value:
             problems.append(ActionProblem(field=field, message=message))
 
-    # A search/count normally needs a regex, but a `where`-only filter is a complete
-    # question on its own, so the pattern is optional then.
+    # A pattern verb normally needs a regex, but a `where`-only filter is a complete
+    # question on its own -- for any verb that accepts `where` -- so the pattern is
+    # optional then (a where-only tally counts a record kind; a where-only search fetches
+    # it). timeline is the exception: its subject IS the pattern, so it always needs one.
     if kind in PATTERN_KINDS and not (
-        kind in (ActionKind.SEARCH, ActionKind.COUNT) and action.where
+        kind is not ActionKind.TIMELINE and action.where
     ):
         require(action.pattern, "pattern", f"{kind.value} needs a regex in 'pattern'.")
 
     if action.where:
-        if kind not in FILTER_KINDS:
+        if kind not in WHERE_KINDS:
             problems.append(
                 ActionProblem(
                     field="where",
                     message=(
-                        "'where' filters apply only to search, count and context; leave it "
-                        "empty for this action."
+                        "'where' filters apply only to the verbs that read lines through a "
+                        "pattern (search, count, context, tally, timeline, stats, extremes, "
+                        "decode); leave it empty for this action."
                     ),
                 )
             )

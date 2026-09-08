@@ -413,7 +413,7 @@ future cloud frontier judge; nothing reads it yet.
 
 ## The cases
 
-`analyze.py` runs any case folder; the four seeded generators write *graded* cases, each
+`analyze.py` runs any case folder; the five seeded generators write *graded* cases, each
 with a `GROUND_TRUTH.md` at the case root (which `analyze.py` never reads) and a rubric in
 `scripts/grade.py`. Each case is built to be a different *timing signature* and to carry
 benign decoys that defeat the obvious heuristic, so a brief is judged on evidence-driven
@@ -447,6 +447,21 @@ model was never shown cannot be cited, so it lands in `uncited_claims`).
   killer decoy is the fleet of benign scheduled tasks (GoogleUpdate, Edge, SCCM) that
   register and fire on every host, so the discriminator is the task's *action*, not that a
   task exists. The `decode` skill turns its `-Enc` payload into the command it runs.
+- **`cases/full-chain`** (`make_full_chain_case.py`, `make case-full-chain`) — the largest
+  case (>10 MB, ~28k events across six workstations, a management server and a DC), a
+  **five-stage intrusion** stitched from four public EVTX samples with every identifier
+  re-seeded: an encoded-PowerShell foothold on WKS-A → an LSASS dump (comsvcs MiniDump,
+  0x1010) that yields the account `svc_backup` → WMI lateral movement to WKS-B as that
+  account → a scheduled task (4698) that fires ~an hour later → a **DCSync** against the DC
+  (4662 with the DS-Replication-Get-Changes GUID by a non-DC account). The timing signature
+  is **the alert lands in the middle of the chain**: it fires on the shallow
+  `WmiPrvSE.exe → cmd.exe` tip (the same shape as `wmi-lsass`), and the brief has to extend
+  that one line *backward* (foothold, LSASS dump) and *forward* (persistence, DCSync). The
+  thread through all three machines is the stolen account and the per-hop source IPs; each
+  stage has a benign lookalike decoy (SCCM WMI, Defender lsass reads, vendor scheduled
+  tasks, SCCM `-EncodedCommand`, and — the sharpest — legitimate DC-to-DC replication
+  carrying the *same* replication GUID, so the discriminator is the requesting principal,
+  not the GUID).
 
 The Windows cases need the `cases` extra (`pip install -e ".[cases]"`, which adds
 `python-evtx`). `make grade RUN=out/<id> CASE=cases/<name>` selects the rubric; the default

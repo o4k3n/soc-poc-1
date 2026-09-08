@@ -74,6 +74,58 @@ def _is_json_target(action: InvestigativeAction, json_files: frozenset[str]) -> 
     return bool(action.field) and action.file in json_files
 
 
+def _action_predicates(action: InvestigativeAction) -> list[tuple[str, str, str]]:
+    """The action's `where`, parsed and error-free -- the same list the executor runs."""
+    return [p for p in (parse_predicate(e) for e in action.where) if not isinstance(p, str)]
+
+
+def _json_where(preds: list[tuple[str, str, str]], *, as_select: bool = True) -> str:
+    """A jq program applying ANDed field predicates case-insensitively.
+
+    `g` looks a key up case-insensitively (jq's `.key` is case-sensitive, and the model may
+    type any case, as the Python filter tolerates); a dotted path chains it. With
+    `as_select` it is a `select(...)` over the current object; otherwise a bare boolean,
+    for evaluation against an object bound elsewhere (extremes binds `$o`). Shared by the
+    fetch-verb filter and the aggregate reproduces, so both honour key order the way the
+    code does."""
+    prelude = "def g(k): (to_entries[]|select((.key|ascii_downcase)==(k|ascii_downcase)).value);"
+    clauses = []
+    for field, op, value in preds:
+        getter = "|".join(f"g({json.dumps(seg.strip())})" for seg in field.split("."))
+        base = f"({getter})|tostring"
+        if op == "=":
+            clauses.append(f"({base}|ascii_downcase=={json.dumps(value.lower())})")
+        elif op == "!=":
+            clauses.append(f"({base}|ascii_downcase!={json.dumps(value.lower())})")
+        elif op == "~":
+            clauses.append(f'({base}|test({json.dumps(value)};"i"))')
+        else:  # !~
+            clauses.append(f'(({base}|test({json.dumps(value)};"i"))|not)')
+    cond = " and ".join(clauses)
+    return f"{prelude} select({cond})" if as_select else f"{prelude} ({cond})"
+
+
+_AWK_WHERE_OP = {"=": "==", "!=": "!=", "~": "~", "!~": "!~"}
+
+
+def _tsv_where(preds: list[tuple[str, str, str]]) -> tuple[str, str, str]:
+    """(-v setup args, #fields-resolve snippet, guard test expr) for where on a TSV file.
+
+    Each field resolves to a data column via the header, case-insensitively as the code
+    does. The variable names (wv/wc) are namespaced so this can be fused into an awk that
+    also selects a value column without a clash."""
+    setup = " ".join(f"-v wv{i}={shlex.quote(v)}" for i, (_f, _o, v) in enumerate(preds))
+    resolve = "".join(
+        f'for(i=2;i<=NF;i++)if(tolower($i)==tolower({json.dumps(f)}))wc{i}=i-1; '
+        for i, (f, _o, _v) in enumerate(preds)
+    )
+    tests = " && ".join(
+        f"tolower($wc{i}){_AWK_WHERE_OP[o]}tolower(wv{i})"
+        for i, (_f, o, _v) in enumerate(preds)
+    )
+    return setup, resolve, tests
+
+
 def _value_stream(
     action: InvestigativeAction, target: str, json_files: frozenset[str] = frozenset()
 ) -> str:
@@ -85,7 +137,13 @@ def _value_stream(
                a JSON-lines file, jq the key instead (`// empty` also drops false/null,
                a small divergence from the code, which counts them as words).
     * capture group / whole match: the original grep -o (+ sed for the group).
+
+    A `where` filter routes to `_value_stream_where`, which applies the predicates first;
+    with no `where` this is byte-for-byte the original, so the pinned reproduces are safe.
     """
+    preds = _action_predicates(action)
+    if preds:
+        return _value_stream_where(action, target, json_files, preds)
     matching = f"grep -hE -e {shlex.quote(action.pattern)} {target}"
     if action.extract:
         entity = _EXTRACT_GREP.get(action.extract, r"\S+")
@@ -109,6 +167,60 @@ def _value_stream(
     stream = f"grep -hoiE {shlex.quote(action.pattern)} {target}"
     if _has_group(action.pattern):
         stream += f" | sed -E {shlex.quote(f's/{action.pattern}/\\1/I')}"
+    return stream
+
+
+def _value_stream_where(
+    action: InvestigativeAction,
+    target: str,
+    json_files: frozenset[str],
+    preds: list[tuple[str, str, str]],
+) -> str:
+    """`_value_stream` with the `where` predicates applied before the value is selected.
+
+    JSON: the matching lines pass through `jq -c select(...)` (key order irrelevant, as in
+    the code), then the value is pulled as usual. TSV: one awk pass over the file keeps the
+    #fields header in scope, so the where columns and -- for field-by-name -- the value
+    column resolve in the same pass, and the header is never stripped from under the
+    resolver."""
+    pat = action.pattern
+    if action.file in json_files:
+        base = f"grep -hE -e {shlex.quote(pat)} {target}" if pat else f"cat {target}"
+        base += f" | jq -c {shlex.quote(_json_where(preds))}"
+        if action.extract:
+            entity = _EXTRACT_GREP.get(action.extract, r"\S+")
+            return f"{base} | grep -oE {shlex.quote(entity)}"
+        if action.field:
+            return f"{base} | jq -r {shlex.quote(_jq_path(action.field) + ' // empty')}"
+        stream = f"{base} | grep -hoiE {shlex.quote(pat)}"
+        if _has_group(pat):
+            stream += f" | sed -E {shlex.quote(f's/{pat}/\\1/I')}"
+        return stream
+    # TSV: fuse where (and, for a named field, the value column) into one header-aware awk.
+    setup, resolve, tests = _tsv_where(preds)
+    patv = _awk_var(pat) if pat else None
+    guard = "$0~pat&&" if pat else ""
+    patarg = f"-v pat={patv} " if pat else ""
+    if action.field and not action.field.strip().isdigit():
+        prog = (
+            f"/^#fields/{{{resolve}for(i=2;i<=NF;i++)if(tolower($i)==tolower(name))vc=i-1}} "
+            f"!/^#/&&{guard}({tests}){{print $vc}}"
+        )
+        return (
+            f"awk -F'\\t' {setup} -v name={shlex.quote(action.field.strip())} {patarg}"
+            f"{shlex.quote(prog)} {target}"
+        )
+    if action.field:
+        prog = f"/^#fields/{{{resolve}}} !/^#/&&{guard}({tests}){{print ${int(action.field)}}}"
+        return f"awk -F'\\t' {setup} {patarg}{shlex.quote(prog)} {target}"
+    prog = f"/^#fields/{{{resolve}}} !/^#/&&{guard}({tests}){{print}}"
+    lines = f"awk -F'\\t' {setup} {patarg}{shlex.quote(prog)} {target}"
+    if action.extract:
+        entity = _EXTRACT_GREP.get(action.extract, r"\S+")
+        return f"{lines} | grep -oE {shlex.quote(entity)}"
+    stream = f"{lines} | grep -hoiE {shlex.quote(pat)}"
+    if _has_group(pat):
+        stream += f" | sed -E {shlex.quote(f's/{pat}/\\1/I')}"
     return stream
 
 
@@ -144,6 +256,9 @@ def _extremes_command(
     keeps one row per line. On a JSON-lines file the pass is jq in raw mode (`-R`), which
     matches the raw line case-insensitively like the code and numbers lines from 1.
     """
+    preds = _action_predicates(action)
+    if preds:
+        return _extremes_command_where(action, target, json_files, preds)
     head = f"| sort -rn | head -{aggregation.EXTREMES_SHOWN}"
     if _is_json_target(action, json_files):
         prog = (
@@ -184,6 +299,66 @@ def _extremes_command(
     else:
         prog = f"match($0,pat){{v=substr($0,RSTART,RLENGTH);{_AWK_KEY};{_AWK_EMIT}}}"
     return f"awk -v pat={pat} {shlex.quote(prog)} {target} {head}"
+
+
+def _extremes_command_where(
+    action: InvestigativeAction,
+    target: str,
+    json_files: frozenset[str],
+    preds: list[tuple[str, str, str]],
+) -> str:
+    """`_extremes_command` with the `where` predicates applied. Kept as one pass so the
+    line numbers in the refs stay the file's own: JSON weaves an `$o`-scoped predicate into
+    the same `jq -rR` (a prefilter would renumber the lines and mis-cite them); TSV fuses
+    the header-resolved predicate columns into the ranking awk."""
+    head = f"| sort -rn | head -{aggregation.EXTREMES_SHOWN}"
+    if _is_json_target(action, json_files):
+        prog = (
+            'select(test($pat;"i")) | (fromjson? // empty) as $o | '
+            f'select($o | {_json_where(preds, as_select=False)}) | '
+            f'($o | {_jq_path(action.field)} | tostring) as $v | {_JQ_KEY} as $k | '
+            '"\\($k)\\t\\(input_filename):L\\(input_line_number)\\t\\(.)"'
+        )
+        return (
+            f"jq -rR --arg pat {shlex.quote(action.pattern)} {shlex.quote(prog)} "
+            f"{target} {head}"
+        )
+    setup, resolve, tests = _tsv_where(preds)
+    pat = _awk_var(action.pattern) if action.pattern else None
+    guard = "$0~pat&&" if pat else ""
+    patarg = f"-v pat={pat} " if pat else ""
+    if action.field and not action.field.strip().isdigit():
+        prog = (
+            f"/^#fields/{{{resolve}for(i=2;i<=NF;i++)if($i==name)c=i-1}} "
+            f"!/^#/&&{guard}({tests}){{v=$c;{_AWK_KEY};{_AWK_EMIT}}}"
+        )
+        return (
+            f"awk -F'\\t' {setup} -v name={shlex.quote(action.field.strip())} {patarg}"
+            f"{shlex.quote(prog)} {target} {head}"
+        )
+    if action.field:
+        prog = (
+            f"/^#fields/{{{resolve}}} !/^#/&&{guard}({tests})"
+            f"{{v=${int(action.field)};{_AWK_KEY};{_AWK_EMIT}}}"
+        )
+        return f"awk -F'\\t' {setup} {patarg}{shlex.quote(prog)} {target} {head}"
+    if action.extract:
+        entity = _EXTRACT_GREP.get(action.extract, r"\S+")
+        prog = (
+            f"/^#fields/{{{resolve}}} !/^#/&&{guard}({tests}){{s=$0;while(match(s,ent))"
+            f"{{v=substr(s,RSTART,RLENGTH);{_AWK_KEY};{_AWK_EMIT};s=substr(s,RSTART+RLENGTH)}}}}"
+        )
+        return (
+            f"awk -F'\\t' {setup} {patarg}-v ent={_awk_var(entity)} "
+            f"{shlex.quote(prog)} {target} {head}"
+        )
+    matchexpr = "match($0,pat,m)" if _has_group(action.pattern) else "match($0,pat)"
+    value = "m[1]" if _has_group(action.pattern) else "substr($0,RSTART,RLENGTH)"
+    prog = (
+        f"/^#fields/{{{resolve}}} !/^#/&&({tests})&&{matchexpr}"
+        f"{{v={value};{_AWK_KEY};{_AWK_EMIT}}}"
+    )
+    return f"awk -F'\\t' {setup} -v pat={pat} {shlex.quote(prog)} {target} {head}"
 
 
 def _filter_command(
@@ -271,6 +446,21 @@ def reproduce_command(
         )
     if action.action is ActionKind.TIMELINE:
         # Stamp frequencies at native granularity; the burst arithmetic is over these.
+        preds = _action_predicates(action)
+        if preds:
+            if action.file in json_files:
+                lines = (
+                    f"grep -hE -e {shlex.quote(action.pattern)} {target} "
+                    f"| jq -c {shlex.quote(_json_where(preds))}"
+                )
+            else:
+                setup, resolve, tests = _tsv_where(preds)
+                prog = f"/^#fields/{{{resolve}}} !/^#/&&$0~pat&&({tests}){{print}}"
+                lines = (
+                    f"awk -F'\\t' {setup} -v pat={_awk_var(action.pattern)} "
+                    f"{shlex.quote(prog)} {target}"
+                )
+            return f"{lines} | grep -oE {shlex.quote(_TS_ANY)} | sort | uniq -c"
         return (
             f"grep -hiE {shlex.quote(action.pattern)} {target} "
             f"| grep -oE {shlex.quote(_TS_ANY)} | sort | uniq -c"
@@ -343,19 +533,33 @@ def longest_literal(pattern: str) -> str:
 _MIN_ANCHOR = 3
 
 
-def _co_occurrence(anchors: list[str], file: str, corpus: Corpus) -> tuple[int, int]:
+def _co_occurrence(
+    anchors: list[str],
+    file: str,
+    corpus: Corpus,
+    where: list[tuple[str, str, str]] | None = None,
+) -> tuple[int, int]:
     """(lines containing every anchor, lines containing them in pattern order).
 
     Substring containment, case-insensitive -- deliberately looser than the regex whose
     zero we are diagnosing, because the question is "is the data there at all, and in
-    what order", not "does the pattern match".
+    what order", not "does the pattern match". A `where` filter is applied first, so the
+    probe counts only inside the same slice the verb searched -- a zero the `where`
+    excludes stays a genuine zero, not a spurious "your pattern is wrong".
     """
     lows = [anchor.lower() for anchor in anchors]
     together = ordered = 0
     for name in [file] if file else corpus.file_names:
-        for text in corpus.file_lines(name):
+        objects = corpus.json_objects(name) if where else None
+        fmap = corpus.field_map(name) if (where and objects is None) else {}
+        sep = corpus.separator(name) if (where and objects is None) else "\t"
+        for number, text in enumerate(corpus.file_lines(name), start=1):
             low = text.lower()
             if not all(anchor in low for anchor in lows):
+                continue
+            if where and not corpus._line_matches(
+                number, text, where, fmap=fmap, sep=sep, objects=objects
+            ):
                 continue
             together += 1
             position = -1
@@ -368,7 +572,12 @@ def _co_occurrence(anchors: list[str], file: str, corpus: Corpus) -> tuple[int, 
     return together, ordered
 
 
-def zero_result_hint(pattern: str, file: str, corpus: Corpus) -> str:
+def zero_result_hint(
+    pattern: str,
+    file: str,
+    corpus: Corpus,
+    where: list[tuple[str, str, str]] | None = None,
+) -> str:
     r"""Distinguish "the data does not contain this" from "your pattern is wrong".
 
     This exists because of a graded run. The commander searched
@@ -395,7 +604,7 @@ def zero_result_hint(pattern: str, file: str, corpus: Corpus) -> str:
     # zeroes `together`, which keeps a genuine absence silent.
     anchors = [run for run in dict.fromkeys(_literal_runs(pattern)) if len(run) >= _MIN_ANCHOR]
     if len(anchors) >= 2:
-        together, ordered = _co_occurrence(anchors, file, corpus)
+        together, ordered = _co_occurrence(anchors, file, corpus, where)
         named = " and ".join(repr(anchor) for anchor in anchors[:3])
         if together and ordered * 4 < together:
             return (
@@ -414,13 +623,14 @@ def zero_result_hint(pattern: str, file: str, corpus: Corpus) -> str:
     literal = longest_literal(pattern)
     if not literal:
         return ""
-    probe = corpus.count(re.escape(literal), file=file)
+    probe = corpus.count(re.escape(literal), file=file, where=where)
     if probe.total_matches == 0:
         return ""
+    where_note = " (within your where filter)" if where else ""
     return (
         f" NOTE: the literal {literal!r} on its own occurs {probe.total_matches} time(s) "
-        f"here, so this zero is about your PATTERN, not about the data. Check field order "
-        f"and separators before treating it as absence."
+        f"here{where_note}, so this zero is about your PATTERN, not about the data. Check "
+        f"field order and separators before treating it as absence."
     )
 
 
@@ -429,7 +639,13 @@ def zero_result_hint(pattern: str, file: str, corpus: Corpus) -> str:
 OVER_ANCHORED_MARKER = "the pattern is over-anchored"
 
 
-def coverage_hint(pattern: str, file: str, corpus: Corpus, matched_lines: int) -> str:
+def coverage_hint(
+    pattern: str,
+    file: str,
+    corpus: Corpus,
+    matched_lines: int,
+    where: list[tuple[str, str, str]] | None = None,
+) -> str:
     """The aggregate-verb generalisation of zero_result_hint: partial coverage is a
     result that must carry its own refutation.
 
@@ -445,11 +661,11 @@ def coverage_hint(pattern: str, file: str, corpus: Corpus, matched_lines: int) -
     stays silent, because a warning printed on every narrowing is a warning nobody reads.
     """
     if matched_lines == 0:
-        return zero_result_hint(pattern, file, corpus)
+        return zero_result_hint(pattern, file, corpus, where)
     literal = longest_literal(pattern)
     if not literal:
         return ""
-    probe = corpus.count(re.escape(literal), file=file)
+    probe = corpus.count(re.escape(literal), file=file, where=where)
     if matched_lines * 4 >= probe.total_matches:
         return ""
     return (
@@ -504,19 +720,39 @@ def execute_readonly(
 ) -> Step:
     """Run one deterministic action. Never raises: a bad request becomes a Step with an error."""
     kind = action.action
+    # `where` is parsed once, up front, because both the aggregates and the fetch verbs
+    # now honour it. A bad predicate becomes a Step error, exactly as a bad regex does.
+    where: list[tuple[str, str, str]] | None = None
+    if action.where:
+        parsed = [parse_predicate(entry) for entry in action.where]
+        bad = next((p for p in parsed if isinstance(p, str)), None)
+        if bad is not None:
+            return Step(
+                index=index,
+                action=action,
+                summary=f"failed: {bad}",
+                error=bad,
+                reproduce=reproduce_command(action, logs_dir, json_files=corpus.json_files),
+            )
+        where = [p for p in parsed if not isinstance(p, str)]
+
     if kind in _AGGREGATES:
         # timeline works off timestamps, so it takes no value selector; the others do.
-        # validate_action has already rejected field/extract on anything else.
+        # validate_action has already rejected field/extract on anything else. Every
+        # aggregate honours `where`, so the model can scope a tally/decode/timeline to a
+        # slice the same way a search does.
         selectors = (
             {"field": action.field, "extract": action.extract}
             if kind in SELECTOR_KINDS
             else {}
         )
-        outcome = _AGGREGATES[kind](corpus, action.pattern, file=action.file, **selectors)
+        outcome = _AGGREGATES[kind](
+            corpus, action.pattern, file=action.file, where=where, **selectors
+        )
         summary = outcome.headline
         if not outcome.error:
             summary += coverage_hint(
-                action.pattern, action.file, corpus, outcome.matched_lines
+                action.pattern, action.file, corpus, outcome.matched_lines, where
             )
         return Step(
             index=index,
@@ -537,19 +773,6 @@ def execute_readonly(
             error=outcome.error,
             reproduce=reproduce_command(action, logs_dir, json_files=corpus.json_files),
         )
-    where = None
-    if action.where:
-        parsed = [parse_predicate(entry) for entry in action.where]
-        errors = [p for p in parsed if isinstance(p, str)]
-        if errors:
-            return Step(
-                index=index,
-                action=action,
-                summary=f"failed: {errors[0]}",
-                error=errors[0],
-                reproduce=reproduce_command(action, logs_dir, json_files=corpus.json_files),
-            )
-        where = [p for p in parsed if not isinstance(p, str)]
 
     if kind is ActionKind.SEARCH:
         result = corpus.search(action.pattern, file=action.file, where=where)
@@ -576,7 +799,7 @@ def execute_readonly(
         else f"{len(result.returned)} line(s) returned"
     )
     if result.total_matches == 0 and not result.error and action.pattern:
-        summary += zero_result_hint(action.pattern, action.file, corpus)
+        summary += zero_result_hint(action.pattern, action.file, corpus, where)
     return Step(
         index=index,
         action=action,
