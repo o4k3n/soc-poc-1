@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch the two EVTX attack samples the wmi-lsass generator derives from.
+# Fetch the EVTX attack samples the Windows case generators derive from.
 #
 # They come from sbousseaden/EVTX-ATTACK-SAMPLES (GPL-3.0). They are NOT committed:
 # cases/ is gitignored, and the generator re-seeds every identifier so the built case
@@ -28,5 +28,7 @@ fetch "Lateral%20Movement/LM_ScheduledTask_ATSVC_target_host.evtx" \
       "LM_ScheduledTask_ATSVC_target_host.evtx"
 fetch "Lateral%20Movement/LM_sysmon_remote_task_src_powershell.evtx" \
       "LM_sysmon_remote_task_src_powershell.evtx"
+fetch "Credential%20Access/CA_DCSync_4662.evtx" \
+      "CA_DCSync_4662.evtx"
 
 echo "samples in $DEST/ (source: sbousseaden/EVTX-ATTACK-SAMPLES, GPL-3.0)"

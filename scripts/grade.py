@@ -304,6 +304,95 @@ CASES: dict[str, dict] = {
             "backup service": r"SRV-FS01|10\.12\.34\.10\b",
         },
     },
+    # A five-stage intrusion across two workstations and the DC. The alert fires on the
+    # MIDDLE (WmiPrvSE->cmd on WKS-5590); the brief has to extend it backward (foothold +
+    # LSASS dump on WKS-5581 that produced svc_backup) and forward (scheduled task + DCSync).
+    # svc_backup is the thread through all three machines.
+    "full-chain": {
+        "checks": [
+            {
+                "name": "names the source of the lateral logon (10.12.34.81 / WKS-5581)",
+                "needles": [r"10\.12\.34\.81", r"WKS-5581"],
+                "refs": ["dhcp.log:L4"],
+                "ref_lines": {"file": "security.jsonl",
+                              "pattern": r'"computer":"WKS-5590".*"IpAddress":"10\.12\.34\.81"'},
+            },
+            {
+                # The single thread: the stolen account drives the lateral hop, the task and
+                # the DC access across all three machines. Credit naming it as the pivot, or
+                # the cross-host linkage phrasing (same account on WKS-5590 and the DC).
+                "name": "names svc_backup as the account threading the three machines",
+                "needles": [
+                    r"svc[_-]?backup",
+                    r"(same|one) (account|credential|user)[^.]{0,80}(WKS-5590|WKS-5581|dc|domain controller|SRV-DC01)",
+                ],
+                "refs": [],
+                "ref_lines": {"file": "security.jsonl", "pattern": r'"TargetUserName":"svc_backup"'},
+            },
+            {
+                # Backward stage 1: the encoded-PowerShell foothold on WKS-5581.
+                "name": "identifies the encoded-PowerShell foothold on WKS-5581 (OUTLOOK -> powershell -Enc)",
+                "needles": [
+                    r"(outlook|office|document|phish)[^.]{0,80}(powershell|-enc|encod)",
+                    r"(powershell|-enc|encod)[^.]{0,80}(outlook|office|foothold|beacon)",
+                    r"foothold|initial access|encoded (powershell|command)",
+                ],
+                "refs": [],
+                "ref_lines": {"file": "security.jsonl",
+                              "pattern": r'OUTLOOK\.EXE".*powershell\.exe -NoP -W Hidden -Enc'},
+            },
+            {
+                # Backward stage 2: the LSASS dump that produced svc_backup.
+                "name": "identifies the LSASS dump on WKS-5581 (comsvcs MiniDump, 0x1010)",
+                "needles": [
+                    r"comsvcs|MiniDump",
+                    r"lsass[^.]{0,60}(0x1010|dump|granted|memory)",
+                    r"(0x1010|dump|credential)[^.]{0,60}lsass",
+                ],
+                "refs": [],
+                "ref_lines": {"file": "security.jsonl", "pattern": r"comsvcs\.dll, MiniDump"},
+            },
+            {
+                # Forward stage 4: the scheduled task, and that it fires later with the same payload.
+                "name": "identifies the scheduled task on WKS-5590 and that it fires later (same payload)",
+                "needles": [
+                    r"HealthTelemetryUpdater",
+                    r"(4698|scheduled task|task regist|persist)[^.]{0,90}(powershell|encod|-enc|base64|payload)",
+                    r"(same (payload|base64|command))",
+                    r"(task|regist|install)[^.]{0,90}(later|then|fired|ran|execut|hour)",
+                ],
+                "refs": [],
+                "ref_lines": {"file": "security.jsonl",
+                              "pattern": r'"event_id":4698.*HealthTelemetryUpdater.*-Enc'},
+            },
+            {
+                # Forward stage 5: the DCSync against the DC.
+                "name": "identifies the DCSync against SRV-DC01 (4662, replication rights by a non-DC account)",
+                "needles": [
+                    r"dcsync|dc[- ]?sync",
+                    r"(4662|replicat|ds-replication|directory replicat)[^.]{0,80}(svc[_-]?backup|non-dc|workstation|not a dc)",
+                    r"(replicat|4662)[^.]{0,60}(get-changes|control access|1131f6aa)",
+                ],
+                "refs": [],
+                "ref_lines": {"file": "security.jsonl",
+                              "pattern": r'"event_id":4662.*"SubjectUserName":"svc_backup".*1131f6aa'},
+            },
+            {
+                "name": "records what it could not determine (coverage gaps)",
+                "needles": [],  # structural
+                "refs": [],
+            },
+        ],
+        "decoys": {
+            # Killer decoy first: benign WMI (WmiPrvSE->cmd), the exact shape the alert fired on.
+            "benign WMI (SCCM)": r"triggerschedule|gpupdate|CcmExec|svc_sccm",
+            "benign LSASS reads (AV)": r"MsMpEng|Windows Defender|0x1000",
+            "benign scheduled tasks": r"GoogleUpdate|EdgeUpdate|ccmeval|ScheduledDefrag|usoclient",
+            "benign encoded PowerShell": r"EncodedCommand|CcmExec",
+            "benign DC replication": r"SRV-DC02",
+            "admin RDP": r"SRV-JUMP01|10\.12\.34\.9\b|t\.admin",
+        },
+    },
 }
 
 

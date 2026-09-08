@@ -15,7 +15,7 @@ COMPOSE := HF_CACHE_DIR=$(HF_CACHE_DIR) docker compose \
 
 VLLM_IMAGE := nvcr.io/nvidia/vllm:26.07-py3
 
-.PHONY: setup weights weights-qwen38 weights-qwen38-int4 up down logs ps restart restart-grunt restart-commander health demo demo-offline abort grade test clean case-wmi-lsass case-schtask-persist
+.PHONY: setup weights weights-qwen38 weights-qwen38-int4 up down logs ps restart restart-grunt restart-commander health demo demo-offline abort grade test clean case-wmi-lsass case-schtask-persist case-full-chain
 
 setup:              ## create venv and install the package (editable) + dev deps
 	python3 -m venv .venv
@@ -177,6 +177,10 @@ case-wmi-lsass:     ## fetch the EVTX samples and (re)generate cases/wmi-lsass (
 case-schtask-persist: ## fetch the EVTX samples and (re)generate cases/schtask-persist (needs the 'cases' extra)
 	bash scripts/fetch_evtx_samples.sh
 	$(PY) scripts/make_schtask_case.py
+
+case-full-chain:    ## fetch the EVTX samples and (re)generate cases/full-chain (>10 MB; needs the 'cases' extra)
+	bash scripts/fetch_evtx_samples.sh
+	$(PY) scripts/make_full_chain_case.py
 
 clean:
 	rm -rf out/*
