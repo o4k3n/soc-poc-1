@@ -1,0 +1,951 @@
+diff --git a/src/soc_poc/actions.py b/src/soc_poc/actions.py
+index 30b1097..5c66af9 100644
+--- a/src/soc_poc/actions.py
++++ b/src/soc_poc/actions.py
+@@ -74,6 +74,58 @@ def _is_json_target(action: InvestigativeAction, json_files: frozenset[str]) ->
+     return bool(action.field) and action.file in json_files
+ 
+ 
++def _action_predicates(action: InvestigativeAction) -> list[tuple[str, str, str]]:
++    """The action's `where`, parsed and error-free -- the same list the executor runs."""
++    return [p for p in (parse_predicate(e) for e in action.where) if not isinstance(p, str)]
++
++
++def _json_where(preds: list[tuple[str, str, str]], *, as_select: bool = True) -> str:
++    """A jq program applying ANDed field predicates case-insensitively.
++
++    `g` looks a key up case-insensitively (jq's `.key` is case-sensitive, and the model may
++    type any case, as the Python filter tolerates); a dotted path chains it. With
++    `as_select` it is a `select(...)` over the current object; otherwise a bare boolean,
++    for evaluation against an object bound elsewhere (extremes binds `$o`). Shared by the
++    fetch-verb filter and the aggregate reproduces, so both honour key order the way the
++    code does."""
++    prelude = "def g(k): (to_entries[]|select((.key|ascii_downcase)==(k|ascii_downcase)).value);"
++    clauses = []
++    for field, op, value in preds:
++        getter = "|".join(f"g({json.dumps(seg.strip())})" for seg in field.split("."))
++        base = f"({getter})|tostring"
++        if op == "=":
++            clauses.append(f"({base}|ascii_downcase=={json.dumps(value.lower())})")
++        elif op == "!=":
++            clauses.append(f"({base}|ascii_downcase!={json.dumps(value.lower())})")
++        elif op == "~":
++            clauses.append(f'({base}|test({json.dumps(value)};"i"))')
++        else:  # !~
++            clauses.append(f'(({base}|test({json.dumps(value)};"i"))|not)')
++    cond = " and ".join(clauses)
++    return f"{prelude} select({cond})" if as_select else f"{prelude} ({cond})"
++
++
++_AWK_WHERE_OP = {"=": "==", "!=": "!=", "~": "~", "!~": "!~"}
++
++
++def _tsv_where(preds: list[tuple[str, str, str]]) -> tuple[str, str, str]:
++    """(-v setup args, #fields-resolve snippet, guard test expr) for where on a TSV file.
++
++    Each field resolves to a data column via the header, case-insensitively as the code
++    does. The variable names (wv/wc) are namespaced so this can be fused into an awk that
++    also selects a value column without a clash."""
++    setup = " ".join(f"-v wv{i}={shlex.quote(v)}" for i, (_f, _o, v) in enumerate(preds))
++    resolve = "".join(
++        f'for(i=2;i<=NF;i++)if(tolower($i)==tolower({json.dumps(f)}))wc{i}=i-1; '
++        for i, (f, _o, _v) in enumerate(preds)
++    )
++    tests = " && ".join(
++        f"tolower($wc{i}){_AWK_WHERE_OP[o]}tolower(wv{i})"
++        for i, (_f, o, _v) in enumerate(preds)
++    )
++    return setup, resolve, tests
++
++
+ def _value_stream(
+     action: InvestigativeAction, target: str, json_files: frozenset[str] = frozenset()
+ ) -> str:
+@@ -85,7 +137,13 @@ def _value_stream(
+                a JSON-lines file, jq the key instead (`// empty` also drops false/null,
+                a small divergence from the code, which counts them as words).
+     * capture group / whole match: the original grep -o (+ sed for the group).
++
++    A `where` filter routes to `_value_stream_where`, which applies the predicates first;
++    with no `where` this is byte-for-byte the original, so the pinned reproduces are safe.
+     """
++    preds = _action_predicates(action)
++    if preds:
++        return _value_stream_where(action, target, json_files, preds)
+     matching = f"grep -hE -e {shlex.quote(action.pattern)} {target}"
+     if action.extract:
+         entity = _EXTRACT_GREP.get(action.extract, r"\S+")
+@@ -112,6 +170,60 @@ def _value_stream(
+     return stream
+ 
+ 
++def _value_stream_where(
++    action: InvestigativeAction,
++    target: str,
++    json_files: frozenset[str],
++    preds: list[tuple[str, str, str]],
++) -> str:
++    """`_value_stream` with the `where` predicates applied before the value is selected.
++
++    JSON: the matching lines pass through `jq -c select(...)` (key order irrelevant, as in
++    the code), then the value is pulled as usual. TSV: one awk pass over the file keeps the
++    #fields header in scope, so the where columns and -- for field-by-name -- the value
++    column resolve in the same pass, and the header is never stripped from under the
++    resolver."""
++    pat = action.pattern
++    if action.file in json_files:
++        base = f"grep -hE -e {shlex.quote(pat)} {target}" if pat else f"cat {target}"
++        base += f" | jq -c {shlex.quote(_json_where(preds))}"
++        if action.extract:
++            entity = _EXTRACT_GREP.get(action.extract, r"\S+")
++            return f"{base} | grep -oE {shlex.quote(entity)}"
++        if action.field:
++            return f"{base} | jq -r {shlex.quote(_jq_path(action.field) + ' // empty')}"
++        stream = f"{base} | grep -hoiE {shlex.quote(pat)}"
++        if _has_group(pat):
++            stream += f" | sed -E {shlex.quote(f's/{pat}/\\1/I')}"
++        return stream
++    # TSV: fuse where (and, for a named field, the value column) into one header-aware awk.
++    setup, resolve, tests = _tsv_where(preds)
++    patv = _awk_var(pat) if pat else None
++    guard = "$0~pat&&" if pat else ""
++    patarg = f"-v pat={patv} " if pat else ""
++    if action.field and not action.field.strip().isdigit():
++        prog = (
++            f"/^#fields/{{{resolve}for(i=2;i<=NF;i++)if(tolower($i)==tolower(name))vc=i-1}} "
++            f"!/^#/&&{guard}({tests}){{print $vc}}"
++        )
++        return (
++            f"awk -F'\\t' {setup} -v name={shlex.quote(action.field.strip())} {patarg}"
++            f"{shlex.quote(prog)} {target}"
++        )
++    if action.field:
++        prog = f"/^#fields/{{{resolve}}} !/^#/&&{guard}({tests}){{print ${int(action.field)}}}"
++        return f"awk -F'\\t' {setup} {patarg}{shlex.quote(prog)} {target}"
++    prog = f"/^#fields/{{{resolve}}} !/^#/&&{guard}({tests}){{print}}"
++    lines = f"awk -F'\\t' {setup} {patarg}{shlex.quote(prog)} {target}"
++    if action.extract:
++        entity = _EXTRACT_GREP.get(action.extract, r"\S+")
++        return f"{lines} | grep -oE {shlex.quote(entity)}"
++    stream = f"{lines} | grep -hoiE {shlex.quote(pat)}"
++    if _has_group(pat):
++        stream += f" | sed -E {shlex.quote(f's/{pat}/\\1/I')}"
++    return stream
++
++
+ # awk's numeric test for extremes. Stricter than /^[0-9.]+$/ on purpose so an IP like
+ # 1.2.3.4 ranks by length, as aggregation._NUMERIC does; the mode is decided at run time
+ # from the data, so the shell equivalent has to decide it per value.
+@@ -144,6 +256,9 @@ def _extremes_command(
+     keeps one row per line. On a JSON-lines file the pass is jq in raw mode (`-R`), which
+     matches the raw line case-insensitively like the code and numbers lines from 1.
+     """
++    preds = _action_predicates(action)
++    if preds:
++        return _extremes_command_where(action, target, json_files, preds)
+     head = f"| sort -rn | head -{aggregation.EXTREMES_SHOWN}"
+     if _is_json_target(action, json_files):
+         prog = (
+@@ -186,6 +301,66 @@ def _extremes_command(
+     return f"awk -v pat={pat} {shlex.quote(prog)} {target} {head}"
+ 
+ 
++def _extremes_command_where(
++    action: InvestigativeAction,
++    target: str,
++    json_files: frozenset[str],
++    preds: list[tuple[str, str, str]],
++) -> str:
++    """`_extremes_command` with the `where` predicates applied. Kept as one pass so the
++    line numbers in the refs stay the file's own: JSON weaves an `$o`-scoped predicate into
++    the same `jq -rR` (a prefilter would renumber the lines and mis-cite them); TSV fuses
++    the header-resolved predicate columns into the ranking awk."""
++    head = f"| sort -rn | head -{aggregation.EXTREMES_SHOWN}"
++    if _is_json_target(action, json_files):
++        prog = (
++            'select(test($pat;"i")) | (fromjson? // empty) as $o | '
++            f'select($o | {_json_where(preds, as_select=False)}) | '
++            f'($o | {_jq_path(action.field)} | tostring) as $v | {_JQ_KEY} as $k | '
++            '"\\($k)\\t\\(input_filename):L\\(input_line_number)\\t\\(.)"'
++        )
++        return (
++            f"jq -rR --arg pat {shlex.quote(action.pattern)} {shlex.quote(prog)} "
++            f"{target} {head}"
++        )
++    setup, resolve, tests = _tsv_where(preds)
++    pat = _awk_var(action.pattern) if action.pattern else None
++    guard = "$0~pat&&" if pat else ""
++    patarg = f"-v pat={pat} " if pat else ""
++    if action.field and not action.field.strip().isdigit():
++        prog = (
++            f"/^#fields/{{{resolve}for(i=2;i<=NF;i++)if($i==name)c=i-1}} "
++            f"!/^#/&&{guard}({tests}){{v=$c;{_AWK_KEY};{_AWK_EMIT}}}"
++        )
++        return (
++            f"awk -F'\\t' {setup} -v name={shlex.quote(action.field.strip())} {patarg}"
++            f"{shlex.quote(prog)} {target} {head}"
++        )
++    if action.field:
++        prog = (
++            f"/^#fields/{{{resolve}}} !/^#/&&{guard}({tests})"
++            f"{{v=${int(action.field)};{_AWK_KEY};{_AWK_EMIT}}}"
++        )
++        return f"awk -F'\\t' {setup} {patarg}{shlex.quote(prog)} {target} {head}"
++    if action.extract:
++        entity = _EXTRACT_GREP.get(action.extract, r"\S+")
++        prog = (
++            f"/^#fields/{{{resolve}}} !/^#/&&{guard}({tests}){{s=$0;while(match(s,ent))"
++            f"{{v=substr(s,RSTART,RLENGTH);{_AWK_KEY};{_AWK_EMIT};s=substr(s,RSTART+RLENGTH)}}}}"
++        )
++        return (
++            f"awk -F'\\t' {setup} {patarg}-v ent={_awk_var(entity)} "
++            f"{shlex.quote(prog)} {target} {head}"
++        )
++    matchexpr = "match($0,pat,m)" if _has_group(action.pattern) else "match($0,pat)"
++    value = "m[1]" if _has_group(action.pattern) else "substr($0,RSTART,RLENGTH)"
++    prog = (
++        f"/^#fields/{{{resolve}}} !/^#/&&({tests})&&{matchexpr}"
++        f"{{v={value};{_AWK_KEY};{_AWK_EMIT}}}"
++    )
++    return f"awk -F'\\t' {setup} -v pat={pat} {shlex.quote(prog)} {target} {head}"
++
++
+ def _filter_command(
+     action: InvestigativeAction, target: str, json_files: frozenset[str], *, count: bool
+ ) -> str:
+@@ -271,6 +446,21 @@ def reproduce_command(
+         )
+     if action.action is ActionKind.TIMELINE:
+         # Stamp frequencies at native granularity; the burst arithmetic is over these.
++        preds = _action_predicates(action)
++        if preds:
++            if action.file in json_files:
++                lines = (
++                    f"grep -hE -e {shlex.quote(action.pattern)} {target} "
++                    f"| jq -c {shlex.quote(_json_where(preds))}"
++                )
++            else:
++                setup, resolve, tests = _tsv_where(preds)
++                prog = f"/^#fields/{{{resolve}}} !/^#/&&$0~pat&&({tests}){{print}}"
++                lines = (
++                    f"awk -F'\\t' {setup} -v pat={_awk_var(action.pattern)} "
++                    f"{shlex.quote(prog)} {target}"
++                )
++            return f"{lines} | grep -oE {shlex.quote(_TS_ANY)} | sort | uniq -c"
+         return (
+             f"grep -hiE {shlex.quote(action.pattern)} {target} "
+             f"| grep -oE {shlex.quote(_TS_ANY)} | sort | uniq -c"
+@@ -343,20 +533,34 @@ def longest_literal(pattern: str) -> str:
+ _MIN_ANCHOR = 3
+ 
+ 
+-def _co_occurrence(anchors: list[str], file: str, corpus: Corpus) -> tuple[int, int]:
++def _co_occurrence(
++    anchors: list[str],
++    file: str,
++    corpus: Corpus,
++    where: list[tuple[str, str, str]] | None = None,
++) -> tuple[int, int]:
+     """(lines containing every anchor, lines containing them in pattern order).
+ 
+     Substring containment, case-insensitive -- deliberately looser than the regex whose
+     zero we are diagnosing, because the question is "is the data there at all, and in
+-    what order", not "does the pattern match".
++    what order", not "does the pattern match". A `where` filter is applied first, so the
++    probe counts only inside the same slice the verb searched -- a zero the `where`
++    excludes stays a genuine zero, not a spurious "your pattern is wrong".
+     """
+     lows = [anchor.lower() for anchor in anchors]
+     together = ordered = 0
+     for name in [file] if file else corpus.file_names:
+-        for text in corpus.file_lines(name):
++        objects = corpus.json_objects(name) if where else None
++        fmap = corpus.field_map(name) if (where and objects is None) else {}
++        sep = corpus.separator(name) if (where and objects is None) else "\t"
++        for number, text in enumerate(corpus.file_lines(name), start=1):
+             low = text.lower()
+             if not all(anchor in low for anchor in lows):
+                 continue
++            if where and not corpus._line_matches(
++                number, text, where, fmap=fmap, sep=sep, objects=objects
++            ):
++                continue
+             together += 1
+             position = -1
+             for anchor in lows:
+@@ -368,7 +572,12 @@ def _co_occurrence(anchors: list[str], file: str, corpus: Corpus) -> tuple[int,
+     return together, ordered
+ 
+ 
+-def zero_result_hint(pattern: str, file: str, corpus: Corpus) -> str:
++def zero_result_hint(
++    pattern: str,
++    file: str,
++    corpus: Corpus,
++    where: list[tuple[str, str, str]] | None = None,
++) -> str:
+     r"""Distinguish "the data does not contain this" from "your pattern is wrong".
+ 
+     This exists because of a graded run. The commander searched
+@@ -395,7 +604,7 @@ def zero_result_hint(pattern: str, file: str, corpus: Corpus) -> str:
+     # zeroes `together`, which keeps a genuine absence silent.
+     anchors = [run for run in dict.fromkeys(_literal_runs(pattern)) if len(run) >= _MIN_ANCHOR]
+     if len(anchors) >= 2:
+-        together, ordered = _co_occurrence(anchors, file, corpus)
++        together, ordered = _co_occurrence(anchors, file, corpus, where)
+         named = " and ".join(repr(anchor) for anchor in anchors[:3])
+         if together and ordered * 4 < together:
+             return (
+@@ -414,13 +623,14 @@ def zero_result_hint(pattern: str, file: str, corpus: Corpus) -> str:
+     literal = longest_literal(pattern)
+     if not literal:
+         return ""
+-    probe = corpus.count(re.escape(literal), file=file)
++    probe = corpus.count(re.escape(literal), file=file, where=where)
+     if probe.total_matches == 0:
+         return ""
++    where_note = " (within your where filter)" if where else ""
+     return (
+         f" NOTE: the literal {literal!r} on its own occurs {probe.total_matches} time(s) "
+-        f"here, so this zero is about your PATTERN, not about the data. Check field order "
+-        f"and separators before treating it as absence."
++        f"here{where_note}, so this zero is about your PATTERN, not about the data. Check "
++        f"field order and separators before treating it as absence."
+     )
+ 
+ 
+@@ -429,7 +639,13 @@ def zero_result_hint(pattern: str, file: str, corpus: Corpus) -> str:
+ OVER_ANCHORED_MARKER = "the pattern is over-anchored"
+ 
+ 
+-def coverage_hint(pattern: str, file: str, corpus: Corpus, matched_lines: int) -> str:
++def coverage_hint(
++    pattern: str,
++    file: str,
++    corpus: Corpus,
++    matched_lines: int,
++    where: list[tuple[str, str, str]] | None = None,
++) -> str:
+     """The aggregate-verb generalisation of zero_result_hint: partial coverage is a
+     result that must carry its own refutation.
+ 
+@@ -445,11 +661,11 @@ def coverage_hint(pattern: str, file: str, corpus: Corpus, matched_lines: int) -
+     stays silent, because a warning printed on every narrowing is a warning nobody reads.
+     """
+     if matched_lines == 0:
+-        return zero_result_hint(pattern, file, corpus)
++        return zero_result_hint(pattern, file, corpus, where)
+     literal = longest_literal(pattern)
+     if not literal:
+         return ""
+-    probe = corpus.count(re.escape(literal), file=file)
++    probe = corpus.count(re.escape(literal), file=file, where=where)
+     if matched_lines * 4 >= probe.total_matches:
+         return ""
+     return (
+@@ -504,19 +720,39 @@ def execute_readonly(
+ ) -> Step:
+     """Run one deterministic action. Never raises: a bad request becomes a Step with an error."""
+     kind = action.action
++    # `where` is parsed once, up front, because both the aggregates and the fetch verbs
++    # now honour it. A bad predicate becomes a Step error, exactly as a bad regex does.
++    where: list[tuple[str, str, str]] | None = None
++    if action.where:
++        parsed = [parse_predicate(entry) for entry in action.where]
++        bad = next((p for p in parsed if isinstance(p, str)), None)
++        if bad is not None:
++            return Step(
++                index=index,
++                action=action,
++                summary=f"failed: {bad}",
++                error=bad,
++                reproduce=reproduce_command(action, logs_dir, json_files=corpus.json_files),
++            )
++        where = [p for p in parsed if not isinstance(p, str)]
++
+     if kind in _AGGREGATES:
+         # timeline works off timestamps, so it takes no value selector; the others do.
+-        # validate_action has already rejected field/extract on anything else.
++        # validate_action has already rejected field/extract on anything else. Every
++        # aggregate honours `where`, so the model can scope a tally/decode/timeline to a
++        # slice the same way a search does.
+         selectors = (
+             {"field": action.field, "extract": action.extract}
+             if kind in SELECTOR_KINDS
+             else {}
+         )
+-        outcome = _AGGREGATES[kind](corpus, action.pattern, file=action.file, **selectors)
++        outcome = _AGGREGATES[kind](
++            corpus, action.pattern, file=action.file, where=where, **selectors
++        )
+         summary = outcome.headline
+         if not outcome.error:
+             summary += coverage_hint(
+-                action.pattern, action.file, corpus, outcome.matched_lines
++                action.pattern, action.file, corpus, outcome.matched_lines, where
+             )
+         return Step(
+             index=index,
+@@ -537,19 +773,6 @@ def execute_readonly(
+             error=outcome.error,
+             reproduce=reproduce_command(action, logs_dir, json_files=corpus.json_files),
+         )
+-    where = None
+-    if action.where:
+-        parsed = [parse_predicate(entry) for entry in action.where]
+-        errors = [p for p in parsed if isinstance(p, str)]
+-        if errors:
+-            return Step(
+-                index=index,
+-                action=action,
+-                summary=f"failed: {errors[0]}",
+-                error=errors[0],
+-                reproduce=reproduce_command(action, logs_dir, json_files=corpus.json_files),
+-            )
+-        where = [p for p in parsed if not isinstance(p, str)]
+ 
+     if kind is ActionKind.SEARCH:
+         result = corpus.search(action.pattern, file=action.file, where=where)
+@@ -576,7 +799,7 @@ def execute_readonly(
+         else f"{len(result.returned)} line(s) returned"
+     )
+     if result.total_matches == 0 and not result.error and action.pattern:
+-        summary += zero_result_hint(action.pattern, action.file, corpus)
++        summary += zero_result_hint(action.pattern, action.file, corpus, where)
+     return Step(
+         index=index,
+         action=action,
+diff --git a/src/soc_poc/aggregation.py b/src/soc_poc/aggregation.py
+index e1ce660..4a7f7fa 100644
+--- a/src/soc_poc/aggregation.py
++++ b/src/soc_poc/aggregation.py
+@@ -37,6 +37,7 @@ from soc_poc.profiling import (
+     _IP,
+     _LONG_TOKEN,
+     BURST_GAP_FACTOR,
++    _entropy,
+     _humanise,
+     _timestamp,
+     _to_epoch,
+@@ -100,7 +101,13 @@ def _clip(value: str) -> str:
+ 
+ 
+ def _selected_rows(
+-    corpus: Corpus, pattern: str, file: str, *, field: str = "", extract: str = ""
++    corpus: Corpus,
++    pattern: str,
++    file: str,
++    *,
++    field: str = "",
++    extract: str = "",
++    where: list[tuple[str, str, str]] | None = None,
+ ) -> tuple[list[tuple[str, Hit]], int, str] | tuple[None, int, str]:
+     """Every selected value in corpus order, each paired with the line it came from, plus
+     how many lines the pattern matched.
+@@ -142,6 +149,12 @@ def _selected_rows(
+         index = None
+         separator = "\t"
+         objects = corpus.json_objects(name) if field else None
++        # `where` predicates are resolved against the line's PARSED fields, the same way
++        # a search's are, and independently of the value selector -- so a tally/decode can
++        # be scoped to one record kind without a key-order regex.
++        where_objects = corpus.json_objects(name) if where else None
++        where_fmap = corpus.field_map(name) if (where and where_objects is None) else {}
++        where_sep = corpus.separator(name) if (where and where_objects is None) else "\t"
+         if field and objects is not None:
+             if field.strip().isdigit():
+                 keys = ", ".join(k for k, _ in corpus.json_keys(name)[:12])
+@@ -165,6 +178,10 @@ def _selected_rows(
+                 continue
+             if not regex.search(text):
+                 continue
++            if where and not corpus._line_matches(
++                number, text, where, fmap=where_fmap, sep=where_sep, objects=where_objects
++            ):
++                continue
+             matched_lines += 1
+             hit = Hit(f"{name}:L{number}", text)
+             if extract:
+@@ -193,12 +210,18 @@ def _selected_rows(
+ 
+ 
+ def _extract(
+-    corpus: Corpus, pattern: str, file: str, *, field: str = "", extract: str = ""
++    corpus: Corpus,
++    pattern: str,
++    file: str,
++    *,
++    field: str = "",
++    extract: str = "",
++    where: list[tuple[str, str, str]] | None = None,
+ ) -> tuple[list[str], int, str] | tuple[None, int, str]:
+     """`_selected_rows` without the references: the values alone, for the verbs whose
+     product is a number. Byte-for-byte the pre-extremes behaviour."""
+     rows, matched_lines, error = _selected_rows(
+-        corpus, pattern, file, field=field, extract=extract
++        corpus, pattern, file, field=field, extract=extract, where=where
+     )
+     if rows is None:
+         return None, matched_lines, error
+@@ -224,7 +247,13 @@ class Aggregate:
+ 
+ 
+ def tally(
+-    corpus: Corpus, pattern: str, *, file: str = "", field: str = "", extract: str = ""
++    corpus: Corpus,
++    pattern: str,
++    *,
++    file: str = "",
++    field: str = "",
++    extract: str = "",
++    where: list[tuple[str, str, str]] | None = None,
+ ) -> Aggregate:
+     """Distinct values of a pattern with exact counts: a distribution in one step.
+ 
+@@ -233,7 +262,9 @@ def tally(
+     one guessed value at a time. `field=` and `extract=` choose the value without a
+     capture group -- see `_extract`.
+     """
+-    values, matched_lines, error = _extract(corpus, pattern, file, field=field, extract=extract)
++    values, matched_lines, error = _extract(
++        corpus, pattern, file, field=field, extract=extract, where=where
++    )
+     if values is None:
+         return Aggregate(headline=f"failed: {error}", error=error)
+     scope = file or f"{len(corpus.file_names)} file(s)"
+@@ -266,7 +297,13 @@ def tally(
+     )
+ 
+ 
+-def timeline(corpus: Corpus, pattern: str, *, file: str = "") -> Aggregate:
++def timeline(
++    corpus: Corpus,
++    pattern: str,
++    *,
++    file: str = "",
++    where: list[tuple[str, str, str]] | None = None,
++) -> Aggregate:
+     """When a pattern's matches happen: span, gap statistics, session structure.
+ 
+     Bursty and periodic are different signatures, and briefs have repeatedly described
+@@ -285,12 +322,20 @@ def timeline(corpus: Corpus, pattern: str, *, file: str = "") -> Aggregate:
+     stamps: list[str] = []
+     matched_lines = 0
+     for name in [file] if file else corpus.file_names:
+-        for text in corpus.file_lines(name):
+-            if regex.search(text):
+-                matched_lines += 1
+-                stamp = _timestamp(text)
+-                if stamp is not None:
+-                    stamps.append(stamp)
++        where_objects = corpus.json_objects(name) if where else None
++        where_fmap = corpus.field_map(name) if (where and where_objects is None) else {}
++        where_sep = corpus.separator(name) if (where and where_objects is None) else "\t"
++        for number, text in enumerate(corpus.file_lines(name), start=1):
++            if not regex.search(text):
++                continue
++            if where and not corpus._line_matches(
++                number, text, where, fmap=where_fmap, sep=where_sep, objects=where_objects
++            ):
++                continue
++            matched_lines += 1
++            stamp = _timestamp(text)
++            if stamp is not None:
++                stamps.append(stamp)
+     scope = file or f"{len(corpus.file_names)} file(s)"
+     if not matched_lines:
+         return Aggregate(
+@@ -351,7 +396,13 @@ def _humanise_epoch(value: float) -> str:
+ 
+ 
+ def stats(
+-    corpus: Corpus, pattern: str, *, file: str = "", field: str = "", extract: str = ""
++    corpus: Corpus,
++    pattern: str,
++    *,
++    file: str = "",
++    field: str = "",
++    extract: str = "",
++    where: list[tuple[str, str, str]] | None = None,
+ ) -> Aggregate:
+     """Size statistics over a pattern's selected values: "how big" without lines.
+ 
+@@ -360,7 +411,9 @@ def stats(
+     that answers "are these query labels abnormally long" for a tunnel. `field=` selects a
+     numeric column directly (`field="response_body_len"`), which is the usual way in.
+     """
+-    values, matched_lines, error = _extract(corpus, pattern, file, field=field, extract=extract)
++    values, matched_lines, error = _extract(
++        corpus, pattern, file, field=field, extract=extract, where=where
++    )
+     if values is None:
+         return Aggregate(headline=f"failed: {error}", error=error)
+     scope = file or f"{len(corpus.file_names)} file(s)"
+@@ -403,7 +456,13 @@ def _rank_key(values: list[str]) -> tuple[str, bool]:
+ 
+ 
+ def extremes(
+-    corpus: Corpus, pattern: str, *, file: str = "", field: str = "", extract: str = ""
++    corpus: Corpus,
++    pattern: str,
++    *,
++    file: str = "",
++    field: str = "",
++    extract: str = "",
++    where: list[tuple[str, str, str]] | None = None,
+ ) -> Aggregate:
+     """The matching lines with the largest selected value, with references: the evidence
+     behind a stats maximum or a tally's long tail, in one step.
+@@ -420,7 +479,7 @@ def extremes(
+     tail it fetched is a cliff or a slope without fetching more.
+     """
+     rows, matched_lines, error = _selected_rows(
+-        corpus, pattern, file, field=field, extract=extract
++        corpus, pattern, file, field=field, extract=extract, where=where
+     )
+     if rows is None:
+         return Aggregate(headline=f"failed: {error}", error=error)
+@@ -483,6 +542,31 @@ _B64_RUN = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+ DECODE_SHOWN = 10
+ 
+ 
++def _looks_base64(run: str) -> bool:
++    """Does a run have base64's SHAPE, beyond merely being 16+ alphanumeric characters?
++
++    The `_B64_RUN` regex alone flags ordinary long tokens -- a task name like
++    `HealthTelemetryUpdater`, a Windows path segment, a CamelCase field -- and a graded run
++    then reported 233 such tokens as "looked base64 but did not validate", burying the one
++    genuine truncated-payload signal that phrase is meant to carry. Real base64 of
++    non-trivial bytes (a UTF-16LE PowerShell payload above all) is high-entropy and mixes
++    character classes: it carries digits or `+`/`/`, or at least varied case, and does not
++    read as an English/identifier word. A plain word has neither. This gate decides only
++    whether a NON-decoding run is worth flagging; it never blocks a run from being decoded.
++    """
++    if len(run) < 16:
++        return False
++    body = run.rstrip("=")
++    # The clean discriminator: real base64 of non-trivial bytes carries digits (or `+`/`/`)
++    # -- a UTF-16LE PowerShell payload above all, whose null high bytes and varied ASCII
++    # both encode to runs that include digits -- whereas an English word, a CamelCase
++    # field, or a Windows path segment does not, however long or mixed-case it is. A
++    # modest entropy floor then drops the degenerate case of a long digit-bearing run that
++    # is really just repetition.
++    has_digit_or_symbol = any(ch.isdigit() or ch in "+/" for ch in body)
++    return has_digit_or_symbol and _entropy(body) >= 3.0
++
++
+ def _try_b64_decode(candidate: str) -> str | None:
+     """Decode a base64 candidate to text, or None if it is not genuinely base64.
+ 
+@@ -516,7 +600,13 @@ def _try_b64_decode(candidate: str) -> str | None:
+ 
+ 
+ def decode(
+-    corpus: Corpus, pattern: str, *, file: str = "", field: str = "", extract: str = ""
++    corpus: Corpus,
++    pattern: str,
++    *,
++    file: str = "",
++    field: str = "",
++    extract: str = "",
++    where: list[tuple[str, str, str]] | None = None,
+ ) -> Aggregate:
+     """Decode the base64 a pattern selects -- verified, never mangled.
+ 
+@@ -527,7 +617,9 @@ def decode(
+     a citable reference, instead of the commander decoding it in its head -- which is a
+     guess, and a wrong guess about what a script does is the expensive kind.
+     """
+-    rows, matched_lines, error = _selected_rows(corpus, pattern, file, field=field, extract=extract)
++    rows, matched_lines, error = _selected_rows(
++        corpus, pattern, file, field=field, extract=extract, where=where
++    )
+     if rows is None:
+         return Aggregate(headline=f"failed: {error}", error=error)
+     scope = file or f"{len(corpus.file_names)} file(s)"
+@@ -539,12 +631,21 @@ def decode(
+     not_base64 = 0
+     for value, hit in rows:
+         got = False
++        looked = False
+         for match in _B64_RUN.finditer(value):
+-            text = _try_b64_decode(match.group(0))
++            run = match.group(0)
++            text = _try_b64_decode(run)
+             if text is not None:
+                 decoded.append((hit, text))
+                 got = True
+-        if not got and _B64_RUN.search(value):
++            elif _looks_base64(run):
++                # A run that has base64's shape (mixed classes, high entropy) but does not
++                # decode is the real "looked base64 but did not validate" signal -- a
++                # truncated or mis-copied payload worth flagging. A plain long token
++                # (a task name, a path, a CamelCase field) is NOT that, and counting it
++                # buried the signal under dozens of false hits in a graded run.
++                looked = True
++        if not got and looked:
+             not_base64 += 1
+     if not decoded:
+         note = f" ({not_base64} looked base64 but did not validate)" if not_base64 else ""
+diff --git a/src/soc_poc/schemas/action.py b/src/soc_poc/schemas/action.py
+index c5f988d..f36f6ba 100644
+--- a/src/soc_poc/schemas/action.py
++++ b/src/soc_poc/schemas/action.py
+@@ -74,7 +74,8 @@ OPTIONAL_SKILLS = frozenset({
+ # The verbs that take the `field=`/`extract=` value selectors. timeline works off
+ # timestamps and takes none.
+ SELECTOR_KINDS = (ActionKind.TALLY, ActionKind.STATS, ActionKind.EXTREMES, ActionKind.DECODE)
+-# The verbs that accept `where` field predicates: the ones that fetch or count lines.
++# The fetch verbs whose `where`-filtered reproduce is a jq/awk field match (search/count
++# render lines, context a window). The selectors below build their own reproduce.
+ FILTER_KINDS = (ActionKind.SEARCH, ActionKind.COUNT, ActionKind.CONTEXT)
+ 
+ 
+@@ -118,6 +119,11 @@ PATTERN_KINDS = (
+     ActionKind.DECODE,
+ )
+ 
++# Every verb that reads lines through a pattern accepts `where` too, so the model can scope
++# a tally/decode/timeline to one record kind the same way it scopes a search -- context is
++# included (its window is anchored on a ref, but the ref's line still honours predicates).
++WHERE_KINDS = PATTERN_KINDS + (ActionKind.CONTEXT,)
++
+ # Entity types `extract=` accepts. Kept in lockstep with aggregation.ENTITY_PATTERNS by a
+ # test, rather than imported, so the schema module stays free of runtime dependencies.
+ _EXTRACT_TYPES = frozenset({"ip", "domain", "hash", "email"})
+@@ -151,12 +157,14 @@ class InvestigativeAction(BaseModel):
+     where: list[str] = Field(
+         default_factory=list,
+         description=(
+-            "For search/count/context: field predicates, ANDed, order-independent. Each is "
+-            "'<field><op><value>' with op '=' (exact, case-insensitive) or '~' (regex on the "
+-            "field's value). 'field' is a JSON key (dotted, e.g. 'Details.User') or a #fields "
+-            "column name. Use this to pin a record on a structured log instead of a regex that "
+-            "lists \"key\":\"value\" pairs in order -- the order of keys in the record does "
+-            "not matter here. Requires 'file'. Empty otherwise, e.g. [\"event_id=10\", "
++            "Field predicates, ANDed, order-independent -- for any verb that reads lines "
++            "through a pattern (search/count/context and tally/timeline/stats/extremes/"
++            "decode), so an aggregate can be scoped to one record kind too. Each is "
++            "'<field><op><value>' with op '=' (exact, case-insensitive), '!=', '~' (regex on "
++            "the field's value) or '!~'. 'field' is a JSON key (dotted, e.g. 'Details.User') "
++            "or a #fields column name. Use this to pin a record on a structured log instead "
++            "of a regex that lists \"key\":\"value\" pairs in order -- key order does not "
++            "matter here. Requires 'file'. Empty otherwise, e.g. [\"event_id=10\", "
+             "\"computer=WKS-3355\"]."
+         ),
+     )
+@@ -287,21 +295,24 @@ def validate_action(
+         if not value:
+             problems.append(ActionProblem(field=field, message=message))
+ 
+-    # A search/count normally needs a regex, but a `where`-only filter is a complete
+-    # question on its own, so the pattern is optional then.
++    # A pattern verb normally needs a regex, but a `where`-only filter is a complete
++    # question on its own -- for any verb that accepts `where` -- so the pattern is
++    # optional then (a where-only tally counts a record kind; a where-only search fetches
++    # it). timeline is the exception: its subject IS the pattern, so it always needs one.
+     if kind in PATTERN_KINDS and not (
+-        kind in (ActionKind.SEARCH, ActionKind.COUNT) and action.where
++        kind is not ActionKind.TIMELINE and action.where
+     ):
+         require(action.pattern, "pattern", f"{kind.value} needs a regex in 'pattern'.")
+ 
+     if action.where:
+-        if kind not in FILTER_KINDS:
++        if kind not in WHERE_KINDS:
+             problems.append(
+                 ActionProblem(
+                     field="where",
+                     message=(
+-                        "'where' filters apply only to search, count and context; leave it "
+-                        "empty for this action."
++                        "'where' filters apply only to the verbs that read lines through a "
++                        "pattern (search, count, context, tally, timeline, stats, extremes, "
++                        "decode); leave it empty for this action."
+                     ),
+                 )
+             )
+diff --git a/src/soc_poc/prompting/investigate.py b/src/soc_poc/prompting/investigate.py
+index 3e476ce..00f3c91 100644
+--- a/src/soc_poc/prompting/investigate.py
++++ b/src/soc_poc/prompting/investigate.py
+@@ -166,13 +166,18 @@ then narrow the pattern until the lines you fetch are the ones that settle the q
+ A result reading "showing the first {MAX_RESULTS} of 700" means the question was too \
+ broad -- aggregate the 700 down to the discriminating value, then fetch that.
+   - On a structured log (JSON lines, or a #fields table), pin a record by FIELD, not by \
+-key order. `where=["event_id=10","computer=WKS-3355"]` on search/count/context matches \
+-those fields wherever they sit in the line; a regex that lists "key":"value" pairs in \
+-sequence silently returns nothing when the record orders its keys differently. Name the \
+-fields exactly as the record-type scope / keys line above spells them. Four operators: \
+-`=` equals, `!=` not-equal, `~` the field's value matches this regex, `!~` it does not -- \
+-so `where=["event_id=10","TargetImage~lsass","SourceImage!~MsMpEng"]` finds lsass access \
+-that is NOT the antivirus, in one step.
++key order. `where=["event_id=10","computer=WKS-3355"]` matches those fields wherever they \
++sit in the line; a regex that lists "key":"value" pairs in sequence silently returns \
++nothing when the record orders its keys differently. Name the fields exactly as the \
++record-type scope / keys line above spells them. Four operators: `=` equals, `!=` \
++not-equal, `~` the field's value matches this regex, `!~` it does not -- so \
++`where=["event_id=10","TargetImage~lsass","SourceImage!~MsMpEng"]` finds lsass access \
++that is NOT the antivirus, in one step. `where` works on every verb that reads lines \
++through a pattern -- not only search/count/context but the aggregates too, so \
++`tally field="SubjectUserName" where=["event_id=4662"]` counts who touched the directory, \
++`decode field="CommandLine" where=["computer=WKS-3355","event_id=4688"]` decodes just that \
++host's command lines, and `timeline where=["SubjectUserName=svc_x"]` times one account -- \
++the way to isolate one signal from a flood of the same event.
+   - The profile below is computed, not inferred: every number in it is arithmetic over \
+ the corpus and can be re-derived with grep. Trust it and start from it. Read the record-type scope of each file first to learn its vocabulary. The rare shapes \
+ and the entropy groups are there because they are where the answer usually is.
+diff --git a/tests/test_aggregation.py b/tests/test_aggregation.py
+index d9c00ea..1d44c3c 100644
+--- a/tests/test_aggregation.py
++++ b/tests/test_aggregation.py
+@@ -990,21 +990,35 @@ def test_count_and_context_honour_where(win_events: Corpus) -> None:
+     assert {h.ref for h in ctx.returned} == {"win.jsonl:L2", "win.jsonl:L3"}
+ 
+ 
+-def test_where_is_rejected_off_the_fetch_verbs_and_without_file() -> None:
+-    off = validate_action(_action(ActionKind.TALLY, pattern="x", file="win.jsonl",
+-                                  where=["event_id=10"]), known_files=["win.jsonl"])
+-    assert any("apply only to search, count and context" in p.message for p in off)
++def test_where_is_allowed_on_the_selectors_but_not_read_verbs_and_needs_file() -> None:
++    # where now scopes the aggregates too, so a tally/decode with where is accepted.
++    for kind in (ActionKind.TALLY, ActionKind.DECODE, ActionKind.TIMELINE, ActionKind.STATS,
++                 ActionKind.EXTREMES):
++        ok = validate_action(_action(kind, pattern="x", file="win.jsonl",
++                                     where=["event_id=10"]), known_files=["win.jsonl"])
++        assert ok == [], (kind, ok)
++    # but not on the verbs that do not read lines through a pattern.
++    off = validate_action(_action(ActionKind.READ_LINES, file="win.jsonl", start_line=1,
++                                  end_line=2, where=["event_id=10"]), known_files=["win.jsonl"])
++    assert any(p.field == "where" for p in off)
+     nofile = validate_action(_action(ActionKind.SEARCH, where=["event_id=10"]),
+                              known_files=["win.jsonl"])
+     assert any(p.field == "file" for p in nofile)
+ 
+ 
+-def test_where_makes_pattern_optional_on_search_but_not_tally() -> None:
+-    ok = validate_action(_action(ActionKind.SEARCH, file="win.jsonl", where=["event_id=10"]),
+-                         known_files=["win.jsonl"])
+-    assert ok == []
+-    needs = validate_action(_action(ActionKind.SEARCH), known_files=["win.jsonl"])
++def test_where_makes_pattern_optional_except_on_timeline() -> None:
++    # A where-only search/tally is a complete question; timeline's subject is the pattern.
++    for kind in (ActionKind.SEARCH, ActionKind.COUNT, ActionKind.TALLY, ActionKind.DECODE):
++        ok = validate_action(_action(kind, file="win.jsonl", where=["event_id=10"],
++                                     field="TargetUserName" if kind in
++                                     (ActionKind.TALLY, ActionKind.DECODE) else ""),
++                             known_files=["win.jsonl"])
++        assert not any(p.field == "pattern" for p in ok), (kind, ok)
++    needs = validate_action(_action(ActionKind.TIMELINE, file="win.jsonl", where=["event_id=10"]),
++                            known_files=["win.jsonl"])
+     assert any(p.field == "pattern" for p in needs)
++    needs2 = validate_action(_action(ActionKind.SEARCH), known_files=["win.jsonl"])
++    assert any(p.field == "pattern" for p in needs2)
+ 
+ 
+ def test_a_bad_where_predicate_is_a_step_error_not_a_crash(win_events: Corpus) -> None:
+@@ -1056,6 +1070,74 @@ def test_where_negation_reproduce_uses_the_negated_operator() -> None:
+     assert "!=tolower" in t                    # != in the awk comparison
+ 
+ 
++def test_where_scopes_the_selectors(win_events: Corpus) -> None:
++    # tally: where narrows the lines the aggregate runs over.
++    both = execute_readonly(
++        _action(ActionKind.TALLY, field="GrantedAccess", file="win.jsonl",
++                where=["event_id=10"]), win_events, index=1)
++    assert both.total_matches == 2 and "0x1010" in both.table and "0x1000" in both.table
++    one = execute_readonly(
++        _action(ActionKind.TALLY, field="GrantedAccess", file="win.jsonl",
++                where=["event_id=10", "computer=WKS-1"]), win_events, index=1)
++    assert one.total_matches == 1 and "0x1010" in one.table and "0x1000" not in one.table
++    # extremes: the negated predicate drops the AV read, leaving the dumper's 0x1010.
++    ext = execute_readonly(
++        _action(ActionKind.EXTREMES, pattern="", field="GrantedAccess", file="win.jsonl",
++                where=["event_id=10", "SourceImage!~MsMpEng"]), win_events, index=1)
++    assert ext.total_matches == 1 and any(h.ref == "win.jsonl:L2" for h in ext.lines)
++    # timeline: a where-scoped subject counts only its own lines.
++    tl = execute_readonly(
++        _action(ActionKind.TIMELINE, pattern="event_id", file="win.jsonl",
++                where=["computer=WKS-2"]), win_events, index=1)
++    assert tl.total_matches == 1
++    # decode: where scopes which lines are searched for base64 (none here -> clean zero).
++    dec = execute_readonly(
++        _action(ActionKind.DECODE, pattern="", field="SourceImage", file="win.jsonl",
++                where=["computer=WKS-2"]), win_events, index=1)
++    assert dec.total_matches == 1 and dec.lines == ()
++
++
++def test_zero_note_respects_the_where_filter(win_events: Corpus) -> None:
++    from soc_poc.actions import zero_result_hint
++    # 'rundll32' (>= the 8-char literal floor) sits only on L2 (WKS-1); the regex
++    # 'rundll32[0-9]' matches no line. Within computer=WKS-2 the literal is absent, so the
++    # where-filtered zero must NOT be diagnosed as a pattern mistake.
++    excluded = zero_result_hint("rundll32[0-9]", "win.jsonl", win_events,
++                                [("computer", "=", "WKS-2")])
++    assert excluded == ""
++    # Without the where, the literal IS in the file, so a real pattern-mismatch zero still
++    # gets the diagnostic.
++    present = zero_result_hint("rundll32[0-9]", "win.jsonl", win_events, None)
++    assert "about your PATTERN" in present
++    # end to end: the step summary for the excluded case reads as a clean absence.
++    step = execute_readonly(
++        _action(ActionKind.SEARCH, pattern="rundll32[0-9]", file="win.jsonl",
++                where=["computer=WKS-2"]), win_events, index=1)
++    assert step.total_matches == 0 and "about your PATTERN" not in step.summary
++
++
++def test_where_selector_reproduce_matches_the_verb() -> None:
++    # JSON: a where-filtered tally reproduces through jq select; extremes weaves the
++    # predicate into the one jq -rR pass (so line numbers stay the file's own).
++    j_tally = reproduce_command(
++        _action(ActionKind.TALLY, field="GrantedAccess", file="win.jsonl",
++                where=["event_id=10"]), json_files=frozenset({"win.jsonl"}))
++    assert "jq -c" in j_tally and "select(" in j_tally and "uniq -c" in j_tally
++    j_ext = reproduce_command(
++        _action(ActionKind.EXTREMES, pattern="lsass", field="GrantedAccess", file="win.jsonl",
++                where=["computer=WKS-1"]), json_files=frozenset({"win.jsonl"}))
++    assert "select($o |" in j_ext and "input_line_number" in j_ext
++    # TSV: the predicate columns resolve from the #fields header in the same awk pass.
++    t_tally = reproduce_command(
++        _action(ActionKind.TALLY, field="query", file="dns.log", where=["qtype_name=NS"]))
++    assert "awk" in t_tally and "#fields" in t_tally and "wc" in t_tally
++    # a no-where selector reproduce is unchanged (no jq select spliced in).
++    plain = reproduce_command(
++        _action(ActionKind.TALLY, field="GrantedAccess", file="win.jsonl"),
++        json_files=frozenset({"win.jsonl"}))
++    assert "select(" not in plain
++
++
+ def test_synthesis_prompt_requires_asserting_shared_identifiers() -> None:
+     from soc_poc.prompting.investigate import SYNTHESIS_SYSTEM_PROMPT
+     assert "SHARED IDENTIFIER" in SYNTHESIS_SYSTEM_PROMPT
+@@ -1085,12 +1167,28 @@ def test_decode_never_mangles_non_base64() -> None:
+     from soc_poc.aggregation import decode, _try_b64_decode
+     assert _try_b64_decode("thisisplaintextnotb64") is None
+     assert _try_b64_decode("q83vEjRWeJCrze8SNFZ4kA==") is None
+-    corpus = Corpus({"s.jsonl": ['{"CommandLine":"run AAAABBBBCCCCDDDDEEEEFFFF now"}']})
++    # A base64-SHAPED run (mixed classes, digits) that does not decode to text is the real
++    # "did not validate" signal -- flagged, but not decoded or cited.
++    corpus = Corpus({"s.jsonl": ['{"CommandLine":"run q83vEjRWeJCrze8SNFZ4kAB1c9dE now"}']})
+     r = decode(corpus, "run", file="s.jsonl", field="CommandLine")
+     assert "did NOT validate" in r.headline or "did not validate" in r.headline
+     assert r.hits == ()
+ 
+ 
++def test_decode_does_not_flag_plain_long_tokens_as_base64() -> None:
++    # The noise fix: a task name / path / CamelCase field is 16+ alnum but is NOT base64,
++    # so it must not be counted as "looked base64" (233 such false hits in a graded run).
++    from soc_poc.aggregation import decode, _looks_base64
++    assert not _looks_base64("HealthTelemetryUpdater")
++    assert not _looks_base64("ConfigMgrClientHealthEvaluation")
++    corpus = Corpus({"s.jsonl": [
++        '{"TaskName":"\\\\Microsoft\\\\Windows\\\\Servicing\\\\HealthTelemetryUpdater"}',
++    ]})
++    r = decode(corpus, "HealthTelemetryUpdater", file="s.jsonl", field="TaskName")
++    assert "looked base64" not in r.headline
++    assert r.hits == ()
++
++
+ def test_decode_is_gated_and_reproduce_uses_base64() -> None:
+     dis = validate_action(_action(ActionKind.DECODE, pattern="x", file="s.jsonl"),
+                           known_files=["s.jsonl"], enabled_skills=frozenset({"tally"}))
