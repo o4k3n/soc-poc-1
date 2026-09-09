@@ -1116,6 +1116,42 @@ def test_zero_note_respects_the_where_filter(win_events: Corpus) -> None:
     assert step.total_matches == 0 and "about your PATTERN" not in step.summary
 
 
+def test_where_zero_reports_the_slice_shape() -> None:
+    # The pinned-host lever: a where-scoped zero says what the slice DOES hold, so "no
+    # match" reads as "the records are here; the pattern is not the way in" -- not "clean".
+    # (A dedicated corpus large enough that event_id qualifies as a record-type axis.)
+    corpus = Corpus({"w.jsonl": [
+        '{"event_id":4624,"computer":"H1","user":"a"}',
+        '{"event_id":10,"computer":"H1","SourceImage":"C:\\\\Windows\\\\rundll32.exe"}',
+        '{"event_id":10,"computer":"H1","SourceImage":"C:\\\\PF\\\\MsMpEng.exe"}',
+        '{"event_id":10,"computer":"H1","SourceImage":"C:\\\\PF\\\\MsMpEng.exe"}',
+        '{"event_id":4624,"computer":"H1","user":"b"}',
+        '{"event_id":10,"computer":"H2","SourceImage":"C:\\\\PF\\\\MsMpEng.exe"}',
+    ]})
+    busy = execute_readonly(
+        _action(ActionKind.SEARCH, pattern="nosuchaccounthere", file="w.jsonl",
+                where=["computer=H1"]), corpus, index=1)
+    assert busy.total_matches == 0
+    assert "5 line(s)" in busy.summary and "record kind is present" in busy.summary
+    assert "event_id" in busy.summary and "10 (3)" in busy.summary  # the slice distribution
+    # An empty slice (the where itself matches nothing) is diagnosed as the FILTER, not a
+    # false absence -- distinct message.
+    empty = execute_readonly(
+        _action(ActionKind.SEARCH, pattern="x", file="w.jsonl",
+                where=["computer=H404"]), corpus, index=1)
+    assert "where filter itself matches no line" in empty.summary
+    # A plain (no-where) zero is untouched: no slice shape bolted onto ordinary absence.
+    plain = execute_readonly(
+        _action(ActionKind.SEARCH, pattern="nosuchthing", file="w.jsonl"), corpus, index=1)
+    assert "record kind is present" not in plain.summary and "where filter" not in plain.summary
+    # A where zero whose literal IS in the slice still gets the pattern diagnosis, not the
+    # shape (absence_note prefers the sharper message).
+    wrong = execute_readonly(
+        _action(ActionKind.SEARCH, pattern="rundll32[0-9]", file="w.jsonl",
+                where=["computer=H1"]), corpus, index=1)
+    assert "about your PATTERN" in wrong.summary and "record kind is present" not in wrong.summary
+
+
 def test_where_selector_reproduce_matches_the_verb() -> None:
     # JSON: a where-filtered tally reproduces through jq select; extremes weaves the
     # predicate into the one jq -rR pass (so line numbers stay the file's own).

@@ -17,8 +17,10 @@ import re
 import json
 import shlex
 
+from collections import Counter
+
 from soc_poc import aggregation
-from soc_poc.corpus import Corpus, SearchResult
+from soc_poc.corpus import Corpus, SearchResult, _json_value, _resolve_field
 from soc_poc.evidence import Step
 from soc_poc.schemas.action import (
     SELECTOR_KINDS,
@@ -634,6 +636,93 @@ def zero_result_hint(
     )
 
 
+# How many of the slice's record kinds to name before a "+N more" tail. A zero should
+# reorient, not dump the whole distribution.
+_SLICE_SHOWN = 6
+
+
+def where_slice_shape(
+    where: list[tuple[str, str, str]] | None, file: str, corpus: Corpus
+) -> str:
+    """When a where-scoped fetch comes up empty, describe what the where slice DOES hold.
+
+    A graded run pinned the origin host with `where=[computer=WKS-5581]`, searched it for
+    the account it was tracking, got zero, and read that as "the host is clean" -- when the
+    host was busy under a different account, and held the credential dump the whole
+    investigation was missing. `where` is now honoured, so that zero is trustworthy; this
+    makes it INFORMATIVE. It states the slice's size and its record-type distribution on the
+    file's own categorical axis, so "no match" reads as "the records are here; the pattern
+    is not the way in" rather than absence. Within-file only, by design -- it describes the
+    slice the commander already chose, and points at nothing new.
+    """
+    if not where or not file or file not in corpus.file_names:
+        return ""
+    objects = corpus.json_objects(file)
+    fmap = corpus.field_map(file) if objects is None else {}
+    sep = corpus.separator(file) if objects is None else "\t"
+    axes = corpus.categorical_fields(file)
+    axis = axes[0][0] if axes else ""
+    axis_index = _resolve_field(axis, fmap) if (axis and objects is None) else None
+    slice_count = 0
+    counts: Counter[str] = Counter()
+    for number, text in enumerate(corpus.file_lines(file), start=1):
+        if not corpus._line_matches(number, text, where, fmap=fmap, sep=sep, objects=objects):
+            continue
+        slice_count += 1
+        if not axis:
+            continue
+        if objects is not None:
+            obj = objects[number - 1]
+            value = _json_value(obj, axis) if obj is not None else None
+        elif axis_index is not None:
+            columns = text.split(sep)
+            value = columns[axis_index] if 0 <= axis_index < len(columns) else None
+        else:
+            value = None
+        if value is not None:
+            counts[value] += 1
+    if slice_count == 0:
+        return (
+            " NOTE: the where filter itself matches no line in this file -- the zero is the "
+            "filter, not the pattern. Check the field names and values in your where, or "
+            "drop it and search the file to see whether the pinned value is here at all."
+        )
+    if not counts:
+        return (
+            f" NOTE: your where filter selects {slice_count} line(s) here that this pattern "
+            f"does not match -- the records are present; the pattern is not the way into "
+            f"them. Read one, or aggregate the slice on a discriminating field."
+        )
+    top = counts.most_common(_SLICE_SHOWN)
+    more = len(counts) - len(top)
+    dist = ", ".join(f"{value} ({n})" for value, n in top) + (f", +{more} more" if more else "")
+    return (
+        f" NOTE: your where filter selects {slice_count} line(s) here that this pattern does "
+        f"not match. By {axis} they are: {dist}. The record kind is present; the pattern is "
+        f"not the way in -- aggregate this slice (tally/timeline/decode with the same where) "
+        f"or read one of these lines to see what account or image it carries."
+    )
+
+
+def absence_note(
+    pattern: str,
+    file: str,
+    corpus: Corpus,
+    where: list[tuple[str, str, str]] | None,
+) -> str:
+    """What to append when a fetch or aggregate came up empty. First the pattern-vs-data
+    diagnosis (a zero from a wrong pattern is not absence); failing that, if a `where`
+    filter is in play, the shape of the slice it selected -- so a where-scoped zero says
+    what IS in that slice instead of reading as 'nothing here'."""
+    if pattern:
+        note = zero_result_hint(pattern, file, corpus, where)
+        if note:
+            return note
+    if where:
+        return where_slice_shape(where, file, corpus)
+    return ""
+
+
 # The marker orchestrator.py greps a summary for to know the partial-coverage hint
 # fired. A shared constant, so the producer and the consumer cannot drift apart.
 OVER_ANCHORED_MARKER = "the pattern is over-anchored"
@@ -661,7 +750,7 @@ def coverage_hint(
     stays silent, because a warning printed on every narrowing is a warning nobody reads.
     """
     if matched_lines == 0:
-        return zero_result_hint(pattern, file, corpus, where)
+        return absence_note(pattern, file, corpus, where)
     literal = longest_literal(pattern)
     if not literal:
         return ""
@@ -798,8 +887,8 @@ def execute_readonly(
         if kind is not ActionKind.READ_LINES
         else f"{len(result.returned)} line(s) returned"
     )
-    if result.total_matches == 0 and not result.error and action.pattern:
-        summary += zero_result_hint(action.pattern, action.file, corpus, where)
+    if result.total_matches == 0 and not result.error and (action.pattern or where):
+        summary += absence_note(action.pattern, action.file, corpus, where)
     return Step(
         index=index,
         action=action,
